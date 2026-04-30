@@ -1,0 +1,300 @@
+utilities:
+  compilers:
+    # C / C++
+    - as
+    - cc
+    - clang
+    - clang++
+    - clang-3.8
+    - clang-3.9
+    - clang-4.0
+    - clang-5.0
+    - clang-6.0
+    - clang-7
+    - clang-8
+    - clang-9
+    - clang-10
+    - clang-11
+    - clang-12
+    - clang-13
+    - clang-14
+    - clang-15
+    - clang-16
+    - clang++-3.8
+    - clang++-3.9
+    - clang++-4.0
+    - clang++-5.0
+    - clang++-6.0
+    - clang++-7
+    - clang++-8
+    - clang++-9
+    - clang++-10
+    - clang++-11
+    - clang++-12
+    - clang++-13
+    - clang++-14
+    - clang++-15
+    - clang++-16
+    - g++
+    - gcc
+    - gcc-4.8
+    - gcc-4.9
+    - gcc-5
+    - gcc-6
+    - gcc-7
+    - gcc-8
+    - gcc-9
+    - gcc-10
+    - gcc-11
+    - gcc-12
+    - gcc-13
+    - g++-4.8
+    - g++-4.9
+    - g++-5
+    - g++-6
+    - g++-7
+    - g++-8
+    - g++-9
+    - g++-10
+    - g++-11
+    - g++-12
+    - g++-13
+    - xgcc
+    - xg++
+    - cc1
+    - cc1plus
+    # Cross-compilers (arm, aarch64, mips, riscv, powerpc, x86 и др.)
+    - arm-linux-gnueabi-gcc
+    - arm-linux-gnueabi-g++
+    - arm-linux-gnueabihf-gcc
+    - arm-linux-gnueabihf-g++
+    - aarch64-linux-gnu-gcc
+    - aarch64-linux-gnu-g++
+    - mips-linux-gnu-gcc
+    - mips-linux-gnu-g++
+    - mipsel-linux-gnu-gcc
+    - mipsel-linux-gnu-g++
+    - mips64-linux-gnuabi64-gcc
+    - mips64el-linux-gnuabi64-gcc
+    - powerpc-linux-gnu-gcc
+    - powerpc-linux-gnu-g++
+    - powerpc64-linux-gnu-gcc
+    - powerpc64le-linux-gnu-gcc
+    - riscv64-linux-gnu-gcc
+    - riscv64-linux-gnu-g++
+    - s390x-linux-gnu-gcc
+    - s390x-linux-gnu-g++
+    - x86_64-linux-gnu-gcc
+    - x86_64-linux-gnu-g++
+    - i686-linux-gnu-gcc
+    - i686-linux-gnu-g++
+    - sparc64-linux-gnu-gcc
+    - alpha-linux-gnu-gcc
+    - hppa-linux-gnu-gcc
+    - m68k-linux-gnu-gcc
+    - sh4-linux-gnu-gcc
+    # Rust
+    - rustc
+    # Java / JVM
+    - javac
+    - java
+    - kotlinc
+    - kotlinc-jvm
+    - kotlinc-js
+    - scalac
+    - groovyc
+    - ecj          # Eclipse Compiler for Java
+    # Go
+    - go
+    - gccgo
+    # C# / .NET
+    - csc
+    - mcs
+    - dotnet
+    - csc.exe
+    # Swift
+    - swiftc
+    # D
+    - dmd
+    - ldc
+    - ldc2
+    - gdc
+    # Nim
+    - nim
+    # Zig
+    - zig
+    # OCaml
+    - ocamlc
+    - ocamlopt
+    # Haskell
+    - ghc
+    # Erlang
+    - erlc
+    # Fortran
+    - gfortran
+    - gfortran-7
+    - gfortran-8
+    - gfortran-9
+    - gfortran-10
+    - gfortran-11
+    - gfortran-12
+    - ifort         # Intel Fortran
+    - flang         # LLVM Fortran
+    # Pascal
+    - fpc           # Free Pascal
+    # Ada
+    - gnatmake
+    - gnatcompile
+    # CUDA
+    - nvcc
+    # OpenCL
+    - ioc64
+    # Assemblers
+    - nasm
+    - yasm
+    - fasm
+    - masm
+    # Newly added from unknown utilities
+    - c++           # C++ compiler (often a symlink to g++ or clang++)
+
+  preprocessors:
+    - cpp
+    - gcc           # иногда используется как препроцессор
+    # Newly added from unknown utilities (Qt code generators)
+    - moc           # Qt Meta-Object Compiler
+    - uic           # Qt User Interface Compiler
+    - rcc           # Qt Resource Compiler
+    - sip           # Python/C++ bindings generator for Qt
+    # Newly added from another project
+    - flatc-linux-x86_64-1.9.0.exe   # FlatBuffers compiler (code generator)
+    - javadoc       # Java documentation generator
+    - javah         # JNI header generator
+
+  linkers:
+    - collect2
+    - ld
+    - ld.bfd
+    - ld.gold
+    - ld.lld
+    - lld
+    - link          # MSVC linker
+    - link.exe
+
+  interpreters:
+    - bash
+    - sh
+    - dash
+    - zsh
+    - ksh
+    - csh
+    - tcsh
+    - make
+    - gmake
+    - perl
+    - python
+    - python2
+    - python2.7
+    - python3
+    - python3.5
+    - ruby
+    - node
+    - nodejs
+
+  other:
+    - ar
+    - cp
+    - file
+    - gawk
+    - awk
+    - genchecksum
+    - git
+    - install
+    - mv
+    - nm
+    - objdump
+    - od
+    - ranlib
+    - readelf
+    - strip
+    - tar
+    - touch
+    - objcopy
+    - size
+    - strings
+    - addr2line
+    - dwp
+    - llvm-ar
+    - llvm-nm
+    - llvm-objcopy
+    - llvm-objdump
+    - llvm-ranlib
+    - llvm-readelf
+    - llvm-strip
+    # Newly added from unknown utilities (first batch)
+    # Package management tools
+    - apt-cache
+    - apt-config
+    - apt-extracttemplates
+    - apt-ftparchive
+    - apt-get
+    - dpkg
+    - dpkg-deb
+    - dpkg-divert
+    - dpkg-query
+    - dpkg-split
+    # System utilities and shell commands
+    - cat
+    - chmod
+    - cut
+    - env
+    - find
+    - flock
+    - getopt
+    - grep
+    - ln
+    - mktemp
+    - readlink
+    - rm
+    - sed
+    - sort
+    - stty
+    - uname
+    # Compression and archiving
+    - gzip
+    # System configuration and services
+    - ldconfig
+    - locale
+    - mandb
+    - sysctl
+    - systemctl
+    # Build and packaging tools
+    - cmake
+    - cpack
+    - pkg-config
+    - nproc
+    - copy          # possibly a wrapper around cp or a specific utility
+    # GPG / encryption
+    - gpg
+    - gpg-connect-agent
+    - gpgconf
+    - gpgv
+    # Other specific tools (first batch)
+    - astra-interpreters-lock   # Astra Linux specific
+    - faked-sysv                # fakeroot (emulate root privileges)
+    - store                     # possibly a proprietary utility (needs verification)
+    # Newly added from another project
+    - basename
+    - chown
+    - date
+    - dirname
+    - getconf
+    - jar           # Java archive tool
+    - ls
+    - man
+    - md5sum
+    - mkdir
+    - pwd
+    - tail
+    - true
+    - unxz
+    - xargs
