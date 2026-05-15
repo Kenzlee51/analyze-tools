@@ -805,25 +805,21 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
 
 def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds):
     """
-    Классифицирует интерпретируемые файлы из signatures на четыре категории:
-      - executed:   только Python-файлы, которые были входными для команд интерпретаторов
-                    (добавляется поле "commands" со списком полных команд)
-      - compiled:   выходные файлы интерпретаторов + входные любых языков, чьи выходы попали в bin
-      - copied:     файлы, присутствующие в bin.json, но не вошедшие в executed/compiled
-      - izb:        остальные (избыточные)
-    Возвращает кортеж (executed, compiled, copied, izb).
+    Классифицирует интерпретируемые файлы из signatures на категории.
+    Новый порядок приоритетов:
+      1. copied – файл непосредственно присутствует в bin.json.
+      2. compiled_used / compiled_unused – участвовал в интерпретации/компиляции с результатом или без.
+      3. executed – Python-файл, запускавшийся интерпретатором (но не попавший в предыдущие).
+      4. izb – избыточные.
     """
-    # Множества для быстрой проверки
     bin_hashes_set = set(bin_hashes)
     bin_paths_set = set(bin_paths)
 
-    # Строим множества входных и выходных файлов (хеши и нормализованные пути)
     input_hashes = {inp['hash'] for inp in input_files if inp.get('hash')}
     input_paths_norm = {inp['path_norm'] for inp in input_files if inp.get('path_norm')}
     output_hashes = {out['hash'] for out in output_files if out.get('hash')}
     output_paths_norm = {out['path_norm'] for out in output_files if out.get('path_norm')}
 
-    # Словари для быстрого получения индексов команд по хешу/пути
     input_by_hash = {}
     input_by_path = {}
     for inp in input_files:
@@ -844,7 +840,6 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
         if p:
             output_by_path.setdefault(p, set()).add(out['cmd_index'])
 
-    # Для каждой команды запомним, есть ли у неё выходы в bin
     cmd_has_bin_output = [False] * len(raw_cmds)
     for cmd_idx, cmd in enumerate(raw_cmds):
         outputs = cmd.get('output', {})
@@ -867,14 +862,12 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
                     cmd_has_bin_output[cmd_idx] = True
                     break
 
-    # Преобразуем команды в строки для вывода
     cmd_idx_to_command = {}
     for idx, cmd in enumerate(raw_cmds):
         cmd_list = cmd.get('command', [])
         if cmd_list:
             cmd_idx_to_command[idx] = ' '.join(cmd_list)
 
-    # Предварительная фильтрация интерпретируемых сигнатур
     interpreted_entries = [s for s in signatures if is_interpreted_extension(s.get('path', ''))]
     total_interp = len(interpreted_entries)
     print("  [INFO] Pass 3: classifying {} interpreted files...".format(total_interp))
@@ -886,26 +879,50 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
     izb = []
     added_compiled_paths = set()
 
-    # Цикл по интерпретируемым файлам
     for i, entry in enumerate(interpreted_entries):
         progress_log("Pass 3 classifying", i + 1, total_interp)
         path = entry['path']
         h = entry.get('hash', '')
         p_norm = entry.get('path_norm', '')
 
-        # --- Проверка на executed (только Python) ---
-        if is_python_extension(path):
-            was_executed = False
-            if h and h in input_hashes:
-                was_executed = True
-            elif p_norm and p_norm in input_paths_norm:
-                was_executed = True
+        # --- 1. Проверка на copied (файл присутствует в bin.json напрямую) ---
+        in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
+        if in_bin:
+            copied.append({'path': path, 'hash': h})
+            continue
 
+        # --- 2. Проверка на выходной файл интерпретатора ---
+        is_output = (h and h in output_hashes) or (p_norm and p_norm in output_paths_norm)
+        if is_output:
+            # Файл сгенерирован интерпретатором, но самого файла нет в bin (уже проверили)
+            compiled_unused.append({'path': path, 'hash': h})
+            added_compiled_paths.add(p_norm)
+            continue
+
+        # --- 3. Проверка на входной файл, чей выход попал в bin (leads_to_bin) ---
+        leads_to_bin = False
+        cmd_indices = set()
+        if h and h in input_hashes:
+            cmd_indices = input_by_hash.get(h, set())
+        elif p_norm and p_norm in input_paths_norm:
+            cmd_indices = input_by_path.get(p_norm, set())
+        if cmd_indices:
+            for cmd_idx in cmd_indices:
+                if cmd_has_bin_output[cmd_idx]:
+                    leads_to_bin = True
+                    break
+        if leads_to_bin:
+            compiled_used.append({'path': path, 'hash': h})
+            added_compiled_paths.add(p_norm)
+            continue
+
+        # --- 4. Проверка на executed (только Python, был входным) ---
+        if is_python_extension(path):
+            was_executed = (h and h in input_hashes) or (p_norm and p_norm in input_paths_norm)
             if was_executed:
-                # Собираем команды
-                cmd_indices = input_by_hash.get(h, set()) if h else input_by_path.get(p_norm, set())
+                cmd_indices_exec = input_by_hash.get(h, set()) if h else input_by_path.get(p_norm, set())
                 commands = []
-                for idx in cmd_indices:
+                for idx in cmd_indices_exec:
                     cmd_str = cmd_idx_to_command.get(idx)
                     if cmd_str and cmd_str not in commands:
                         commands.append(cmd_str)
@@ -916,72 +933,22 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
                 })
                 continue
 
-        # --- Проверка на выходной файл интерпретатора ---
-        is_output = False
-        if h and h in output_hashes:
-            is_output = True
-        elif p_norm and p_norm in output_paths_norm:
-            is_output = True
+        # --- 5. Остальное — избыточное ---
+        izb.append({'path': path, 'hash': h})
 
-        if is_output:
-            # Проверяем попал ли сам этот файл в дистрибутив
-            in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
-            if in_bin:
-                compiled_used.append({'path': path, 'hash': h})
-            else:
-                compiled_unused.append({'path': path, 'hash': h})
-            added_compiled_paths.add(p_norm)
-            continue
-
-        # --- Проверка на leads_to_bin (входной файл, чей выход попал в bin) ---
-        leads_to_bin = False
-        was_input = False
-        if h and h in input_hashes:
-            was_input = True
-            cmd_indices = input_by_hash.get(h, set())
-        elif p_norm and p_norm in input_paths_norm:
-            was_input = True
-            cmd_indices = input_by_path.get(p_norm, set())
-        else:
-            cmd_indices = set()
-
-        if was_input:
-            for cmd_idx in cmd_indices:
-                if cmd_has_bin_output[cmd_idx]:
-                    leads_to_bin = True
-                    break
-
-        if leads_to_bin:
-            compiled_used.append({'path': path, 'hash': h})
-            added_compiled_paths.add(p_norm)
-            continue
-
-        # --- Проверка наличия в дистрибутиве (copied) ---
-        in_bin = False
-        if h and h in bin_hashes_set:
-            in_bin = True
-        elif p_norm and p_norm in bin_paths_set:
-            in_bin = True
-
-        if in_bin:
-            copied.append({'path': path, 'hash': h})
-        else:
-            izb.append({'path': path, 'hash': h})
-
-    # Добавляем выходные файлы интерпретатора которых нет в signatures
+    # Добавляем выходные файлы интерпретатора, которых нет в signatures
     for out in output_files:
         path = out.get('path', '')
         p_norm = out.get('path_norm', '')
-        if not p_norm:
+        if not p_norm or p_norm in added_compiled_paths:
             continue
-        if p_norm not in added_compiled_paths:
-            h = out.get('hash', '')
-            in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
-            if in_bin:
-                compiled_used.append({'path': path, 'hash': h})
-            else:
-                compiled_unused.append({'path': path, 'hash': h})
-            added_compiled_paths.add(p_norm)
+        h = out.get('hash', '')
+        in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
+        if in_bin:
+            compiled_used.append({'path': path, 'hash': h})
+        else:
+            compiled_unused.append({'path': path, 'hash': h})
+        added_compiled_paths.add(p_norm)
 
     return executed, compiled_used, compiled_unused, copied, izb
 
