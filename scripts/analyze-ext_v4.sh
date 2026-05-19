@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # =============================================================================
-# analyze-expr.sh — Скрипт анализа расширений и исполняемых файлов
+# analyze-ext.sh — Скрипт анализа расширений и исполняемых файлов
 # =============================================================================
 #
 # ОПИСАНИЕ:
@@ -9,43 +9,44 @@
 #     - подсчитывает количество файлов по расширениям (включая архивы)
 #     - находит исполняемые файлы в src (по магическим байтам через file)
 #     - находит бинарные файлы в src (по расширению из BINARY_EXTENSIONS)
-#     - записывает результаты в results/PROJ/expr/
-#     - обновляет глобальный агрегированный файл result-expr.json
+#     - записывает результаты в results/PROJ/ext/
+#     - обновляет глобальный агрегированный файл result-ext.json
 #
 # ИСПОЛЬЗОВАНИЕ:
-#   ./analyze-expr.sh [OPTIONS]
+#   ./analyze-ext.sh [OPTIONS]
 #
 # ОПЦИИ:
 #   --single-project NAME   Обработать только один указанный проект
-#   --no-rewrite            Пропустить проект если он уже есть в result-expr.json
+#   --no-rewrite            Пропустить проект если он уже есть в result-ext.json
 #   -j, --parallel N        Количество параллельных проектов (default: 4)
 #   -h, --help              Показать справку
 #
 # ПРИМЕРЫ:
-#   ./analyze-expr.sh
-#   ./analyze-expr.sh --single-project PROJ1
-#   ./analyze-expr.sh --no-rewrite
-#   ./analyze-expr.sh -j 2 --single-project PROJ1
+#   ./analyze-ext.sh
+#   ./analyze-ext.sh --single-project PROJ1
+#   ./analyze-ext.sh --no-rewrite
+#   ./analyze-ext.sh -j 2 --single-project PROJ1
 #
 # ОЖИДАЕМАЯ СТРУКТУРА:
 #   BASE_DIR/
 #   ├── scripts/
-#   │   └── analyze-expr.sh
+#   │   └── analyze-ext.sh
 #   ├── unpacked/
 #   │   └── PROJ1/
 #   │       ├── src/
 #   │       └── bin/
 #   ├── logs/
-#   │   └── analyze-expr/
+#   │   └── analyze-ext/
 #   ├── results/
 #   │   └── PROJ1/
-#   │       └── expr/
+#   │       └── ext/
 #   │           ├── extensions_src.txt
 #   │           ├── extensions_bin.txt
 #   │           ├── extensions_src.json
 #   │           ├── extensions_bin.json
-#   │           └── binaries_in_src.txt
-#   └── result-expr.json
+#   │           ├── binaries_in_src.txt
+#   │           └── binaries_in_bin.txt
+#   └── result-ext.json
 #
 # ЗАВИСИМОСТИ:
 #   bash, find, file, sort, awk, python3 (для JSON)
@@ -59,8 +60,8 @@ set -uo pipefail
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 UNPACKED_DIR="$BASE_DIR/unpacked"
 RESULTS_DIR="$BASE_DIR/results"
-LOG_DIR="$BASE_DIR/logs/analyze-expr"
-GLOBAL_JSON="$BASE_DIR/result-expr.json"
+LOG_DIR="$BASE_DIR/logs/analyze-ext"
+GLOBAL_JSON="$BASE_DIR/result-ext.json"
 # =============================================================================
 
 # =============================================================================
@@ -94,7 +95,7 @@ declare -A BINARY_EXTENSIONS=(
 # =============================================================================
 
 # Размер батча для вызова file(1) — сколько файлов за раз
-FILE_BATCH_SIZE=400
+FILE_BATCH_SIZE=2000
 
 # --- Параметры по умолчанию ---
 SINGLE_PROJECT=""
@@ -308,7 +309,7 @@ PYEOF
 }
 
 # =============================================================================
-# Обновляет глобальный result-expr.json.
+# Обновляет глобальный result-ext.json.
 # =============================================================================
 update_global_json() {
     local project_name="$1"
@@ -384,7 +385,7 @@ PYEOF
 }
 
 # =============================================================================
-# Проверяет есть ли проект в result-expr.json
+# Проверяет есть ли проект в result-ext.json
 # =============================================================================
 project_exists_in_global() {
     local project_name="$1"
@@ -538,15 +539,15 @@ process_project() {
 
     if [[ "$NO_REWRITE" == true ]]; then
         if project_exists_in_global "$project_name"; then
-            log "[$project_name] [INFO] Already in result-expr.json, skipping (--no-rewrite)"
+            log "[$project_name] [INFO] Already in result-ext.json, skipping (--no-rewrite)"
             return 0
         fi
     fi
 
     local src_dir="$project_dir/src"
     local bin_dir="$project_dir/bin"
-    local expr_dir="$RESULTS_DIR/$project_name/expr"
-    mkdir -p "$expr_dir"
+    local ext_dir="$RESULTS_DIR/$project_name/ext"
+    mkdir -p "$ext_dir"
 
     local analyzed_at
     analyzed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -569,21 +570,21 @@ process_project() {
 
         log "[$project_name] [INFO] src total files: $src_total"
 
-        write_extensions_txt "$expr_dir/extensions_src.txt" \
+        write_extensions_txt "$ext_dir/extensions_src.txt" \
             "${src_counts[@]+"${src_counts[@]}"}"
         log "[$project_name] [INFO] Written: extensions_src.txt"
 
         write_extensions_json \
-            "$expr_dir/extensions_src.json" \
+            "$ext_dir/extensions_src.json" \
             "$project_name" "src" "$src_dir" \
             "$src_total" "$analyzed_at" \
             "${src_counts[@]+"${src_counts[@]}"}"
         log "[$project_name] [INFO] Written: extensions_src.json"
     else
         log "[$project_name] [WARN] src directory not found: $src_dir"
-        echo -e "COUNT      EXTENSION\n---------- ---------" > "$expr_dir/extensions_src.txt"
+        echo -e "COUNT      EXTENSION\n---------- ---------" > "$ext_dir/extensions_src.txt"
         echo '{"project":"'"$project_name"'","subdir":"src","path":"'"$src_dir"'","analyzed_at":"'"$analyzed_at"'","total_files":0,"extensions":{}}' \
-            > "$expr_dir/extensions_src.json"
+            > "$ext_dir/extensions_src.json"
     fi
 
     # =========================================================================
@@ -604,52 +605,69 @@ process_project() {
 
         log "[$project_name] [INFO] bin total files: $bin_total"
 
-        write_extensions_txt "$expr_dir/extensions_bin.txt" \
+        write_extensions_txt "$ext_dir/extensions_bin.txt" \
             "${bin_counts[@]+"${bin_counts[@]}"}"
         log "[$project_name] [INFO] Written: extensions_bin.txt"
 
         write_extensions_json \
-            "$expr_dir/extensions_bin.json" \
+            "$ext_dir/extensions_bin.json" \
             "$project_name" "bin" "$bin_dir" \
             "$bin_total" "$analyzed_at" \
             "${bin_counts[@]+"${bin_counts[@]}"}"
         log "[$project_name] [INFO] Written: extensions_bin.json"
     else
         log "[$project_name] [WARN] bin directory not found: $bin_dir"
-        echo -e "COUNT      EXTENSION\n---------- ---------" > "$expr_dir/extensions_bin.txt"
+        echo -e "COUNT      EXTENSION\n---------- ---------" > "$ext_dir/extensions_bin.txt"
         echo '{"project":"'"$project_name"'","subdir":"bin","path":"'"$bin_dir"'","analyzed_at":"'"$analyzed_at"'","total_files":0,"extensions":{}}' \
-            > "$expr_dir/extensions_bin.json"
+            > "$ext_dir/extensions_bin.json"
     fi
 
     # =========================================================================
     # SRC — поиск исполняемых и бинарных файлов
     # =========================================================================
-    local binaries_file="$expr_dir/binaries_in_src.txt"
+    local binaries_src_file="$ext_dir/binaries_in_src.txt"
     local bin_count=0
 
     if [[ -d "$src_dir" ]]; then
         log "[$project_name] [INFO] Searching for executables and binaries in src..."
-        bin_count=$(find_executables "$src_dir" "$project_dir" "$binaries_file")
+        bin_count=$(find_executables "$src_dir" "$project_dir" "$binaries_src_file")
         log "[$project_name] [INFO] Executables/binaries found in src: $bin_count"
         log "[$project_name] [INFO] Written: binaries_in_src.txt"
     else
         printf "%-12s  %s\n%-12s  %s\n" "TYPE" "PATH" "------------" "----" \
-            > "$binaries_file"
+            > "$binaries_src_file"
         log "[$project_name] [WARN] src not found, binaries_in_src.txt is empty"
     fi
 
     # =========================================================================
-    # Обновляем глобальный result-expr.json
+    # BIN — поиск настоящих бинарей (ELF/PE) в дистрибутиве
     # =========================================================================
-    log "[$project_name] [INFO] Updating result-expr.json..."
+    local binaries_bin_file="$ext_dir/binaries_in_bin.txt"
+    local bin_bin_count=0
+
+    if [[ -d "$bin_dir" ]]; then
+        log "[$project_name] [INFO] Searching for executables and binaries in bin..."
+        bin_bin_count=$(find_executables "$bin_dir" "$project_dir" "$binaries_bin_file")
+        log "[$project_name] [INFO] Executables/binaries found in bin: $bin_bin_count"
+        log "[$project_name] [INFO] Written: binaries_in_bin.txt"
+    else
+        printf "%-12s  %s\n%-12s  %s\n" "TYPE" "PATH" "------------" "----" \
+            > "$binaries_bin_file"
+        log "[$project_name] [WARN] bin not found, binaries_in_bin.txt is empty"
+    fi
+
+    # =========================================================================
+    # Обновляем глобальный result-ext.json
+    # =========================================================================
+    log "[$project_name] [INFO] Updating result-ext.json..."
     update_global_json \
         "$project_name" \
         "$project_dir" \
         "$analyzed_at" \
         "$src_total" \
         "$bin_total" \
-        "$expr_dir/extensions_src.json" \
-        "$expr_dir/extensions_bin.json"
+        "$ext_dir/extensions_src.json" \
+        "$ext_dir/extensions_bin.json"
 
     log "=== Done: $project_name ==="
 }
