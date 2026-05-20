@@ -42,7 +42,7 @@ sq-analyze.py — Скрипт анализа проектов через SonarQ
     │       └── src/              ← анализируемые исходники
     ├── results/
     │   └── PROJ1/
-    │       └── expr/
+    │       └── ext/
     │           └── extensions_src.json   ← языки проекта
     ├── logs/
     │   └── SQ-analyze/
@@ -78,7 +78,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SONARQUBE_URL     = "http://192.168.25.85:9000"
 SONARQUBE_TOKEN   = "squ_2ea978eff3573e01550db66c6959968b8cd498b4"
-SONAR_SCANNER_BIN = "sonar-scanner"
+SONAR_SCANNER_BIN = "/usr/local/bin/sonar-scanner"
 SONAR_SCANNER_MEMORY = "-Xmx2048m -Xms512m"
 SYMLINK_BASE_DIR  = "/tmp/sq"
 
@@ -371,7 +371,7 @@ def remove_symlink(link_path, log):
 # ОПРЕДЕЛЕНИЕ ЯЗЫКОВ
 # =============================================================================
 def get_languages_from_extensions(project_name, log):
-    extensions_file = os.path.join(RESULTS_DIR, project_name, "expr", "extensions_src.json")
+    extensions_file = os.path.join(RESULTS_DIR, project_name, "ext", "extensions_src.json")
 
     if not os.path.exists(extensions_file):
         log.warn("extensions_src.json not found: {}".format(extensions_file))

@@ -25,7 +25,13 @@ analyze-json.py - Скрипт анализа избыточных файлов 
 РЕЗУЛЬТИРУЮЩИЕ ФАЙЛЫ (results/{project}/izb/)
 =============================================================================
 
-  --- Проход 1: анализ хешей исходников ---
+Файлы разбиты по папкам по проходам:
+  results/{project}/izb/pass1/  — анализ хешей исходников
+  results/{project}/izb/pass2/  — компилируемые языки
+  results/{project}/izb/pass3/  — интерпретируемые языки
+  results/{project}/izb/pass4/  — происхождение бинарей дистрибутива
+
+  --- Проход 1 (pass1/): анализ хешей исходников ---
 
   {project}_direct.json
       Исходные файлы, чей хеш напрямую найден в buildography.
@@ -40,7 +46,7 @@ analyze-json.py - Скрипт анализа избыточных файлов 
       Включает файлы из not_compiled (перемещаются сюда в Проходе 2).
       Поля: path, hash
 
-  --- Проход 2: компилируемые языки ---
+  --- Проход 2 (pass2/): компилируемые языки ---
 
   {project}_not_compiled.json
       Подмножество redundant: файлы компилируемых языков (.c, .cpp, .rs, .go и др.),
@@ -51,7 +57,7 @@ analyze-json.py - Скрипт анализа избыточных файлов 
       Объединение redundant.json + not_compiled.json (без дублей).
       Формат: путь<TAB>хеш. Заголовок содержит алгоритм хеширования.
 
-  --- Проход 3: интерпретируемые языки ---
+  --- Проход 3 (pass3/): интерпретируемые языки ---
 
   {project}_interpreted_executed.json
       Python-файлы, которые были входными для команд интерпретаторов.
@@ -75,69 +81,75 @@ analyze-json.py - Скрипт анализа избыточных файлов 
       Текстовый вариант interpreted_compiled_unused.json.
       Формат: путь<TAB>хеш
 
-  {project}_interpreted_copied.json
-      Интерпретируемые файлы, присутствующие в bin.json напрямую,
+  {project}_interpreted_copied.json / .txt
+      Интерпретируемые файлы присутствующие в дистрибутиве напрямую,
       но не вошедшие в executed/compiled_used. Поля: path, hash
-      (TXT не создаётся)
 
-  {project}_interpreted_izb.json
-      Остальные избыточные интерпретируемые файлы —
-      не запускались, не компилировались, не в дистрибутиве. Поля: path, hash
-
-  {project}_interpreted_izb.txt
-      Текстовый вариант interpreted_izb.json.
-      Формат: путь<TAB>хеш
-
-  --- Проход 4: проверка происхождения файлов дистрибутива ---
-
-  {project}_pass4_untraced.json
-      Файлы дистрибутива (bin.json), чей хеш вообще не встречается
-      в трассировщике — ни в output, ни в dependencies.
-      Происхождение неизвестно. Поля: path, hash
-
-  {project}_pass4_untraced.txt
-      Текстовый вариант pass4_untraced.json.
-      Формат: путь<TAB>хеш
-
-  {project}_pass4_external_unbuilt.json
-      Файлы дистрибутива, которые присутствуют в dependencies
-      трассировщика, но НЕ в output ни одной команды — то есть
-      не были собраны в этой сборке, пришли готовыми извне.
+  {project}_not_used.json / .txt
+      Интерпретируемые файлы которые не используются нигде —
+      не запускались, не компилировались, не в дистрибутиве.
       Поля: path, hash
 
-  {project}_pass4_external_unbuilt.txt
-      Текстовый вариант pass4_external_unbuilt.json.
-      Формат: путь<TAB>хеш
+  --- Проход 4 (pass4/): проверка происхождения бинарей дистрибутива ---
+  Анализируются только реальные бинари из binaries_in_bin.txt.
+  Системные пути в дистрибутиве выделяются отдельно.
 
-  {project}_pass4_external_sources.json
-      Файлы дистрибутива, которые есть в output трассировщика
-      (т.е. были собраны), но в цепочке их зависимостей (транзитивно)
-      обнаружены файлы, отсутствующие в src.json — чужие исходники.
-      Поля: path, hash, external_deps (список {path, hash} чужих исходников)
+  {project}_compiled_from_src.json / .txt
+      Бинарь собран в этой сборке, все исходники подтверждены в src.json.
+      Чисто. Поля: path, hash
 
-  {project}_pass4_external_sources.txt
-      Текстовый вариант pass4_external_sources.json.
-      Формат: путь<TAB>хеш (только сам файл дистрибутива, без external_deps)
-
-  {project}_pass4_traced.json
-      Файлы дистрибутива с полностью подтверждённым происхождением:
-      собраны в этой сборке и все исходники в цепочке из src.json.
+  {project}_binaries_from_src.json / .txt
+      Хеш бинаря найден в src.json — бинарь лежал в исходниках и скопирован
+      в дистрибутив. Учтён, но факт бинаря в исходниках требует внимания.
       Поля: path, hash
 
-  {project}_pass4_traced.txt
-      Текстовый вариант pass4_traced.json.
-      Формат: путь<TAB>хеш
+  {project}_untraced_from_src.json / .txt
+      Хеш в src.json, но трассировщик не видит попадание в дистрибутив.
+      Возможно скопирован напрямую минуя трассировщик. Поля: path, hash
+
+  {project}_external_built.json / .txt
+      Бинарь собран (трассировщик видит), но зависимости не из src.json.
+      Скомпилирован из внешних исходников. Подозрительно.
+      Поля: path, hash, external_deps
+
+  {project}_external_prebuilt.json / .txt
+      Трассировщик видит бинарь как зависимость, но он не собирался —
+      пришёл готовым извне (apt download, wget, pip). Подозрительно.
+      Поля: path, hash
+
+  {project}_untraced_external.json / .txt
+      Не в src.json, трассировщик не видит. Полностью неизвестное
+      происхождение. Очень подозрительно. Поля: path, hash
+
+  {project}_system_binaries.json / .txt
+      Бинарь находится в системном пути дистрибутива (usr/lib, lib и т.д.).
+      Анализируется отдельно — системные библиотеки поставляемые дистрибутивом.
+      Поля: path, hash
 
 =============================================================================
 """
 
+import array
+import bisect
+import gc
+import sqlite3
 import json
 import sys
 import os
 import argparse
 import glob
+import time
 from pathlib import Path
 from datetime import datetime
+
+# Глобальный таймер — время старта скрипта
+_SCRIPT_START = time.monotonic()
+
+
+def _ts():
+    """Возвращает строку [MM:SS] от начала запуска."""
+    elapsed = int(time.monotonic() - _SCRIPT_START)
+    return "[{:02d}:{:02d}]".format(elapsed // 60, elapsed % 60)
 
 # =============================================================================
 # НАСТРАИВАЕМЫЕ ПУТИ
@@ -156,9 +168,9 @@ GENERATE_JSON_SCRIPT = os.path.join(BASE_DIR, "scripts", "generate_json_v2_test.
 def read_hash_cmd(script_path):
     """Читает значение HASH_CMD из bash скрипта."""
     if not os.path.exists(script_path):
-        print("  [INFO] redundant.txt: generate script not found: {}".format(
+        print(_ts() + "   redundant.txt: generate script not found: {}".format(
             os.path.basename(script_path)))
-        print("  [INFO] redundant.txt: hash_algorithm field will be empty")
+        print(_ts() + "   redundant.txt: hash_algorithm field will be empty")
         return ''
     try:
         import re
@@ -174,14 +186,14 @@ def read_hash_cmd(script_path):
                     value = re.sub(r'\s*#.*$', '', value)
                     value = value.strip('"\'')
                     if value:
-                        print("  [INFO] redundant.txt: HASH_CMD={} (from {})".format(
+                        print(_ts() + "   redundant.txt: HASH_CMD={} (from {})".format(
                             value, os.path.basename(script_path)))
                         return value
-        print("  [INFO] redundant.txt: HASH_CMD not found in {}".format(
+        print(_ts() + "   redundant.txt: HASH_CMD not found in {}".format(
             os.path.basename(script_path)))
         return ''
     except Exception as e:
-        print("  [WARN] redundant.txt: failed to read HASH_CMD: {}".format(e))
+        print(_ts() + "   redundant.txt: failed to read HASH_CMD: {}".format(e))
         return ''
 
 
@@ -266,7 +278,7 @@ def load_utilities_lists(utilities_path):
     compilers = set()
     interpreters = set()
     if not os.path.exists(utilities_path):
-        print("[WARN] utilities.yaml not found: {}".format(utilities_path))
+        print(_ts() + " utilities.yaml not found: {}".format(utilities_path))
         return compilers, interpreters
     try:
         import yaml
@@ -275,7 +287,7 @@ def load_utilities_lists(utilities_path):
         utilities = data.get('utilities', {})
         compilers = set(utilities.get('compilers', []))
         interpreters = set(utilities.get('interpreters', []))
-        print("[INFO] Loaded {} compilers, {} interpreters".format(len(compilers), len(interpreters)))
+        print(_ts() + " Loaded {} compilers, {} interpreters".format(len(compilers), len(interpreters)))
         return compilers, interpreters
     except ImportError:
         # fallback: простой парсер
@@ -310,10 +322,10 @@ def load_utilities_lists(utilities_path):
                         val = stripped.strip()
                         if val.startswith('- '):
                             interpreters.append(val[2:].strip())
-            print("[INFO] Loaded {} compilers, {} interpreters (fallback)".format(len(compilers), len(interpreters)))
+            print(_ts() + " Loaded {} compilers, {} interpreters (fallback)".format(len(compilers), len(interpreters)))
             return set(compilers), set(interpreters)
         except Exception as e:
-            print("[WARN] Failed to parse utilities.yaml: {}".format(e))
+            print(_ts() + " Failed to parse utilities.yaml: {}".format(e))
             return set(), set()
 
 
@@ -374,7 +386,7 @@ def progress_log(label, current, total, step_pct=10):
     step = max(1, total * step_pct // 100)
     if current % step == 0 or current == total:
         pct = current * 100 // total
-        print("  [INFO]   {} {}/{} ({}%)".format(label, current, total, pct))
+        print(_ts() + "     {} {}/{} ({}%)".format(label, current, total, pct))
 
 
 # =============================================================================
@@ -383,25 +395,25 @@ def progress_log(label, current, total, step_pct=10):
 def load_signatures(paths):
     all_signatures = []
     for path in paths:
-        print("  [INFO] Loading signatures: {}".format(os.path.basename(path)))
+        print(_ts() + "   Loading signatures: {}".format(os.path.basename(path)))
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             data = json.load(f)
         sigs = data.get('signatures', [])
         for s in sigs:
             # Добавляем нормализованный путь
             s['path_norm'] = os.path.normpath(s.get('path', ''))
-        print("  [INFO] Signatures in {}: {}".format(os.path.basename(path), len(sigs)))
+        print(_ts() + "   Signatures in {}: {}".format(os.path.basename(path), len(sigs)))
         all_signatures.extend(sigs)
-    print("  [INFO] Total signatures (merged): {}".format(len(all_signatures)))
+    print(_ts() + "   Total signatures (merged): {}".format(len(all_signatures)))
     return all_signatures
 
 
 def load_bin_signatures(project_name):
     bin_path = os.path.join(RESULTS_DIR, project_name, "sources", "{}_bin.json".format(project_name))
     if not os.path.exists(bin_path):
-        print("  [WARN] bin.json not found: {}".format(bin_path))
+        print(_ts() + "   bin.json not found: {}".format(bin_path))
         return set(), set()
-    print("  [INFO] Loading bin signatures: {}".format(os.path.basename(bin_path)))
+    print(_ts() + "   Loading bin signatures: {}".format(os.path.basename(bin_path)))
     with open(bin_path, 'r', encoding='utf-8', errors='replace') as f:
         data = json.load(f)
     sigs = data.get('signatures', [])
@@ -421,7 +433,7 @@ def load_buildography_data(paths):
     hashes = set()
     raw_cmds = []
     for path in paths:
-        print("  [INFO] Loading buildography: {}".format(os.path.basename(path)))
+        print(_ts() + "   Loading buildography: {}".format(os.path.basename(path)))
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             data = json.load(f, strict=False)
         before = len(hashes)
@@ -451,9 +463,9 @@ def load_buildography_data(paths):
                     if h:
                         hashes.add(h)
         added = len(hashes) - before
-        print("  [INFO] Hashes from {}: {} (total pool: {})".format(
+        print(_ts() + "   Hashes from {}: {} (total pool: {})".format(
             os.path.basename(path), added, len(hashes)))
-    print("  [INFO] Total buildography hashes (merged): {}".format(len(hashes)))
+    print(_ts() + "   Total buildography hashes (merged): {}".format(len(hashes)))
     return hashes, raw_cmds
 
 
@@ -486,7 +498,7 @@ def build_transitive_good_commands(raw_cmds, bin_hashes, bin_paths):
     out_hash_to_consumers  = {}   # hash      -> set(idx)
 
     total_cmds = len(raw_cmds)
-    print("  [INFO] Pass 2: indexing {} commands...".format(total_cmds))
+    print(_ts() + "   Pass 2: indexing {} commands...".format(total_cmds))
 
     for idx, cmd in enumerate(raw_cmds):
         progress_log("Pass 2 indexing commands", idx + 1, total_cmds)
@@ -575,21 +587,21 @@ def build_transitive_good_commands(raw_cmds, bin_hashes, bin_paths):
     good_cmds = set()
     queue = deque()
 
-    print("  [INFO] Pass 2: seeding BFS from bin outputs...")
+    print(_ts() + "   Pass 2: seeding BFS from bin outputs...")
     for idx in range(total_cmds):
         if (any(p in bin_paths_set  for p in cmd_output_paths[idx]) or
             any(h in bin_hashes_set for h in cmd_output_hashes[idx])):
             good_cmds.add(idx)
             queue.append(idx)
 
-    print("  [INFO] Pass 2: BFS start — seed size: {}".format(len(good_cmds)))
+    print(_ts() + "   Pass 2: BFS start — seed size: {}".format(len(good_cmds)))
 
     processed = 0
     while queue:
         idx = queue.popleft()
         processed += 1
         if processed % 10000 == 0:
-            print("  [INFO] Pass 2: BFS processed {}, good so far: {}, queue: {}".format(
+            print(_ts() + "   Pass 2: BFS processed {}, good so far: {}, queue: {}".format(
                 processed, len(good_cmds), len(queue)))
 
         # Для каждого входа команды idx ищем поставщиков (команды чей выход = этот вход)
@@ -605,7 +617,13 @@ def build_transitive_good_commands(raw_cmds, bin_hashes, bin_paths):
                     good_cmds.add(producer_idx)
                     queue.append(producer_idx)
 
-    print("  [INFO] Pass 2: BFS done — total good commands: {}".format(len(good_cmds)))
+    print(_ts() + "   Pass 2: BFS done — total good commands: {}".format(len(good_cmds)))
+
+    # Освобождаем крупные индексы — они больше не нужны
+    del cmd_output_paths, cmd_output_hashes, cmd_input_paths, cmd_input_hashes
+    del out_path_to_producer, out_hash_to_producer, in_path_to_cmd, in_hash_to_cmd
+    gc.collect()
+
     return good_cmds
 
 
@@ -701,7 +719,7 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys):
                 continue
         parent_out.append(entry)
 
-    print("  [INFO] Pass 2 done: moved to not_compiled={}".format(moved_count))
+    print(_ts() + "   Pass 2 done: moved to not_compiled={}".format(moved_count))
     return direct_out, parent_out, redundant, not_compiled
 
 
@@ -719,7 +737,7 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
     seen_output = set()
 
     total_cmds = len(raw_cmds)
-    print("  [INFO] Pass 3: scanning {} commands for interpreter calls...".format(total_cmds))
+    print(_ts() + "   Pass 3: scanning {} commands for interpreter calls...".format(total_cmds))
     for cmd_idx, cmd in enumerate(raw_cmds):
         progress_log("Pass 3 scanning commands", cmd_idx + 1, total_cmds)
         cmd_list = cmd.get('command', [])
@@ -805,21 +823,25 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
 
 def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds):
     """
-    Классифицирует интерпретируемые файлы из signatures на категории.
-    Новый порядок приоритетов:
-      1. copied – файл непосредственно присутствует в bin.json.
-      2. compiled_used / compiled_unused – участвовал в интерпретации/компиляции с результатом или без.
-      3. executed – Python-файл, запускавшийся интерпретатором (но не попавший в предыдущие).
-      4. izb – избыточные.
+    Классифицирует интерпретируемые файлы из signatures на четыре категории:
+      - executed:   только Python-файлы, которые были входными для команд интерпретаторов
+                    (добавляется поле "commands" со списком полных команд)
+      - compiled:   выходные файлы интерпретаторов + входные любых языков, чьи выходы попали в bin
+      - copied:     файлы, присутствующие в bin.json, но не вошедшие в executed/compiled
+      - izb:        остальные (избыточные)
+    Возвращает кортеж (executed, compiled, copied, izb).
     """
+    # Множества для быстрой проверки
     bin_hashes_set = set(bin_hashes)
     bin_paths_set = set(bin_paths)
 
+    # Строим множества входных и выходных файлов (хеши и нормализованные пути)
     input_hashes = {inp['hash'] for inp in input_files if inp.get('hash')}
     input_paths_norm = {inp['path_norm'] for inp in input_files if inp.get('path_norm')}
     output_hashes = {out['hash'] for out in output_files if out.get('hash')}
     output_paths_norm = {out['path_norm'] for out in output_files if out.get('path_norm')}
 
+    # Словари для быстрого получения индексов команд по хешу/пути
     input_by_hash = {}
     input_by_path = {}
     for inp in input_files:
@@ -840,6 +862,7 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
         if p:
             output_by_path.setdefault(p, set()).add(out['cmd_index'])
 
+    # Для каждой команды запомним, есть ли у неё выходы в bin
     cmd_has_bin_output = [False] * len(raw_cmds)
     for cmd_idx, cmd in enumerate(raw_cmds):
         outputs = cmd.get('output', {})
@@ -862,15 +885,17 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
                     cmd_has_bin_output[cmd_idx] = True
                     break
 
+    # Преобразуем команды в строки для вывода
     cmd_idx_to_command = {}
     for idx, cmd in enumerate(raw_cmds):
         cmd_list = cmd.get('command', [])
         if cmd_list:
             cmd_idx_to_command[idx] = ' '.join(cmd_list)
 
+    # Предварительная фильтрация интерпретируемых сигнатур
     interpreted_entries = [s for s in signatures if is_interpreted_extension(s.get('path', ''))]
     total_interp = len(interpreted_entries)
-    print("  [INFO] Pass 3: classifying {} interpreted files...".format(total_interp))
+    print(_ts() + "   Pass 3: classifying {} interpreted files...".format(total_interp))
 
     executed = []
     compiled_used = []
@@ -879,13 +904,16 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
     izb = []
     added_compiled_paths = set()
 
+    # Цикл по интерпретируемым файлам
     for i, entry in enumerate(interpreted_entries):
         progress_log("Pass 3 classifying", i + 1, total_interp)
         path = entry['path']
         h = entry.get('hash', '')
-        p_norm = entry.get('path_norm', '')
+        # Гарантируем что p_norm всегда нормализован
+        p_norm = entry.get('path_norm', '') or os.path.normpath(path) if path else ''
 
         # --- 1. Проверка на copied (файл присутствует в bin.json напрямую) ---
+        # Это первый приоритет: если файл скопирован в дистрибутив — он точно не избыточен
         in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
         if in_bin:
             copied.append({'path': path, 'hash': h})
@@ -899,7 +927,7 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             added_compiled_paths.add(p_norm)
             continue
 
-        # --- 3. Проверка на входной файл, чей выход попал в bin (leads_to_bin) ---
+        # --- 3. Проверка на leads_to_bin (входной файл, чей выход попал в bin) ---
         leads_to_bin = False
         cmd_indices = set()
         if h and h in input_hashes:
@@ -916,7 +944,7 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             added_compiled_paths.add(p_norm)
             continue
 
-        # --- 4. Проверка на executed (только Python, был входным) ---
+        # --- 4. Проверка на executed (только Python, был входным для интерпретатора) ---
         if is_python_extension(path):
             was_executed = (h and h in input_hashes) or (p_norm and p_norm in input_paths_norm)
             if was_executed:
@@ -926,29 +954,26 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
                     cmd_str = cmd_idx_to_command.get(idx)
                     if cmd_str and cmd_str not in commands:
                         commands.append(cmd_str)
-                executed.append({
-                    'path': path,
-                    'hash': h,
-                    'commands': commands
-                })
+                executed.append({'path': path, 'hash': h, 'commands': commands})
                 continue
 
         # --- 5. Остальное — избыточное ---
         izb.append({'path': path, 'hash': h})
 
-    # Добавляем выходные файлы интерпретатора, которых нет в signatures
+    # Добавляем выходные файлы интерпретатора которых нет в signatures
     for out in output_files:
         path = out.get('path', '')
         p_norm = out.get('path_norm', '')
-        if not p_norm or p_norm in added_compiled_paths:
+        if not p_norm:
             continue
-        h = out.get('hash', '')
-        in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
-        if in_bin:
-            compiled_used.append({'path': path, 'hash': h})
-        else:
-            compiled_unused.append({'path': path, 'hash': h})
-        added_compiled_paths.add(p_norm)
+        if p_norm not in added_compiled_paths:
+            h = out.get('hash', '')
+            in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
+            if in_bin:
+                compiled_used.append({'path': path, 'hash': h})
+            else:
+                compiled_unused.append({'path': path, 'hash': h})
+            added_compiled_paths.add(p_norm)
 
     return executed, compiled_used, compiled_unused, copied, izb
 
@@ -969,7 +994,7 @@ def analyze_pass1(signatures, buildography_hashes):
             continue
         processed += 1
         if processed % 5000 == 0:
-            print("  [INFO] Pass 1: analyzed {} source files...".format(processed))
+            print(_ts() + "   Pass 1: analyzed {} source files...".format(processed))
         if file_hash in buildography_hashes:
             direct.append({'path': path, 'hash': file_hash, 'path_norm': entry.get('path_norm', '')})
             continue
@@ -982,7 +1007,7 @@ def analyze_pass1(signatures, buildography_hashes):
             parent.append({'path': path, 'hash': file_hash, 'parent_hash': found_parent, 'path_norm': entry.get('path_norm', '')})
         else:
             redundant.append({'path': path, 'hash': file_hash, 'path_norm': entry.get('path_norm', '')})
-    print("  [INFO] Pass 1 done: direct={}, parent={}, redundant={}".format(
+    print(_ts() + "   Pass 1 done: direct={}, parent={}, redundant={}".format(
         len(direct), len(parent), len(redundant)))
     return direct, parent, redundant
 
@@ -990,19 +1015,59 @@ def analyze_pass1(signatures, buildography_hashes):
 # =============================================================================
 # ЗАПИСЬ РЕЗУЛЬТАТОВ (JSON и текстовые)
 # =============================================================================
+def get_try_dir(base_dir):
+    """
+    Возвращает путь к папке try{N} внутри base_dir.
+    Если try1 существует — возвращает try2, и т.д.
+    """
+    n = 1
+    while True:
+        try_dir = os.path.join(base_dir, "try{}".format(n))
+        if not os.path.exists(try_dir):
+            return try_dir
+        n += 1
+
+
 def write_json_result(output_path, category, files):
-    versioned_path = get_versioned_filepath(output_path)
-    if versioned_path != output_path:
-        print("  [WARN] File exists, writing to: {}".format(os.path.basename(versioned_path)))
     result = {
         'category': category,
         'total': len(files),
         'generated_at': datetime.now().isoformat(),
         'files': files,
     }
-    with open(versioned_path, 'w', encoding='utf-8') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=4)
-    print("  [INFO] Written {} entries -> {}".format(len(files), versioned_path))
+    print(_ts() + "   Written {} entries -> {}".format(len(files), output_path))
+
+
+def write_txt_result(output_path, category_label, entries):
+    """
+    Универсальная запись txt файла для любой категории.
+    Формат: путь<TAB>хеш
+    """
+    seen = set()
+    rows = []
+    for entry in entries:
+        path  = entry.get('path', '').strip()
+        hash_ = entry.get('hash', '').strip()
+        if not path and not hash_:
+            continue
+        key = (path, hash_)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((path, hash_))
+    rows.sort(key=lambda x: x[0])
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("# {}\n".format(category_label))
+        f.write("# Generated: {}\n".format(datetime.now().isoformat()))
+        f.write("# Total: {}\n".format(len(rows)))
+        f.write("# Format: path<TAB>hash\n")
+        f.write("#\n")
+        for path, hash_ in rows:
+            f.write("{}\t{}\n".format(path, hash_))
+    print(_ts() + "   Written {} entries -> {}".format(len(rows), output_path))
 
 
 def write_redundant_txt(output_path, project_name, redundant, not_compiled, hash_algorithm=''):
@@ -1023,7 +1088,7 @@ def write_redundant_txt(output_path, project_name, redundant, not_compiled, hash
 
     versioned_path = get_versioned_filepath(output_path)
     if versioned_path != output_path:
-        print("  [WARN] File exists, writing to: {}".format(os.path.basename(versioned_path)))
+        print(_ts() + "   File exists, writing to: {}".format(os.path.basename(versioned_path)))
 
     with open(versioned_path, 'w', encoding='utf-8') as f:
         f.write("# Redundant files report: {}\n".format(project_name))
@@ -1035,7 +1100,7 @@ def write_redundant_txt(output_path, project_name, redundant, not_compiled, hash
         f.write("#\n")
         for path, hash_ in rows:
             f.write("{}\t{}\n".format(path, hash_))
-    print("  [INFO] Written {} entries -> {}".format(len(rows), versioned_path))
+    print(_ts() + "   Written {} entries -> {}".format(len(rows), versioned_path))
     return len(rows)
 
 
@@ -1057,7 +1122,7 @@ def write_interpreted_izb_txt(output_path, izb_list):
 
     versioned_path = get_versioned_filepath(output_path)
     if versioned_path != output_path:
-        print("  [WARN] File exists, writing to: {}".format(os.path.basename(versioned_path)))
+        print(_ts() + "   File exists, writing to: {}".format(os.path.basename(versioned_path)))
 
     with open(versioned_path, 'w', encoding='utf-8') as f:
         f.write("# Interpreted redundant files (izb)\n")
@@ -1067,7 +1132,7 @@ def write_interpreted_izb_txt(output_path, izb_list):
         f.write("#\n")
         for path, hash_ in rows:
             f.write("{}\t{}\n".format(path, hash_))
-    print("  [INFO] Written {} entries -> {}".format(len(rows), versioned_path))
+    print(_ts() + "   Written {} entries -> {}".format(len(rows), versioned_path))
 
 
 def write_interpreted_executed_txt(output_path, executed_list):
@@ -1088,7 +1153,7 @@ def write_interpreted_executed_txt(output_path, executed_list):
 
     versioned_path = get_versioned_filepath(output_path)
     if versioned_path != output_path:
-        print("  [WARN] File exists, writing to: {}".format(os.path.basename(versioned_path)))
+        print(_ts() + "   File exists, writing to: {}".format(os.path.basename(versioned_path)))
 
     with open(versioned_path, 'w', encoding='utf-8') as f:
         f.write("# Interpreted executed Python files\n")
@@ -1098,244 +1163,382 @@ def write_interpreted_executed_txt(output_path, executed_list):
         f.write("#\n")
         for path, hash_ in rows:
             f.write("{}\t{}\n".format(path, hash_))
-    print("  [INFO] Written {} entries -> {}".format(len(rows), versioned_path))
+    print(_ts() + "   Written {} entries -> {}".format(len(rows), versioned_path))
 
 
 # =============================================================================
-# АНАЛИЗ — ПРОХОД 4: проверка происхождения файлов дистрибутива
+# =============================================================================
+# =============================================================================
+# =============================================================================
+# =============================================================================
+# =============================================================================
+# АНАЛИЗ — ПРОХОД 4: проверка происхождения бинарей дистрибутива
+#
+# Итеративное расширение графа только для нужных цепочек:
+#   1. Первый проход — out_to_deps для bin_hashes
+#   2. Находим промежуточные артефакты (dep in output_hashes)
+#   3. Повторные проходы — расширяем out_to_deps для промежуточных
+#   4. Повторяем пока frontier не пуст
+#   5. Классифицируем бинари
+#
+# Ловит все сценарии включая транзитивную компиляцию внешних исходников.
+# RAM: только нужные части графа, не весь граф.
 # =============================================================================
 
-def build_pass4_indexes(raw_cmds):
-    """
-    Строит индексы по хешу из raw_cmds:
-      - output_hashes      : хеши всех выходных файлов (файл был собран в этой сборке)
-      - dep_hashes         : хеши всех входных файлов (файл участвовал как зависимость)
-      - output_to_deps     : hash_output -> set(hash_dep) — прямые зависимости выхода
-      - dep_to_outputs     : hash_dep -> set(hash_output) — в каких выходах участвует dep
-    Хеши без значения (пустые строки) игнорируются.
-    """
-    output_hashes = set()
-    dep_hashes = set()
-    # hash выхода -> множество хешей его прямых зависимостей
-    output_to_deps = {}
-    # hash зависимости -> множество хешей выходов где она участвует
-    dep_to_outputs = {}
+def _hash_to_int(h):
+    try:
+        return int(h, 16) & 0xFFFFFFFFFFFFFFFF if h else None
+    except ValueError:
+        return None
 
-    total_cmds = len(raw_cmds)
-    print("  [INFO] Pass 4: indexing {} commands...".format(total_cmds))
-    for i, cmd in enumerate(raw_cmds):
-        progress_log("Pass 4 indexing commands", i + 1, total_cmds)
-        # Собираем хеши выходов этой команды
-        cmd_out_hashes = set()
-        outputs = cmd.get('output', {})
-        items = outputs.items() if isinstance(outputs, dict) else (
-            ((o.get('path', ''), o.get('hash', '')) if isinstance(o, dict) else (str(o), ''))
-            for o in (outputs if isinstance(outputs, list) else [])
+
+def _log_memory(label):
+    try:
+        with open('/proc/self/status', 'r') as f:
+            status = f.read()
+        def _get_kb(field):
+            for line in status.splitlines():
+                if line.startswith(field + ':'):
+                    return int(line.split()[1])
+            return 0
+        vmrss  = _get_kb('VmRSS')
+        vmvirt = _get_kb('VmSize')
+        vmswap = _get_kb('VmSwap')
+        print(_ts() + "   {}: RSS={:.1f} MB, VIRT={:.1f} MB, SWAP={:.1f} MB".format(
+            label, vmrss/1024, vmvirt/1024, vmswap/1024))
+    except Exception as e:
+        print(_ts() + "   {}: could not read memory: {}".format(label, e))
+
+
+SYSTEM_PATH_PREFIXES = (
+    '/usr/lib/', '/usr/lib64/', '/lib/', '/lib64/',
+    '/usr/include/', '/usr/local/lib/',
+    '/etc/', '/proc/', '/sys/', '/dev/',
+    '/usr/share/', '/var/',
+)
+
+
+def _is_system_path(path):
+    return any(path.startswith(pfx) for pfx in SYSTEM_PATH_PREFIXES)
+
+
+def _count_cmds(buildography_files):
+    total = 0
+    for path in buildography_files:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            data = json.load(f, strict=False)
+        total += len(data.get('component_commands', []))
+    return total
+
+
+def _scan_pass(buildography_files, target_hashes, total_cmds, label):
+    """
+    Один проход по buildography.
+    Для команд чьи выходы пересекаются с target_hashes —
+    собираем их зависимости.
+    
+    Возвращает:
+      out_to_deps : dict {out_hash_int -> [(dep_hash_int, dep_path, dep_hash_str)]}
+      output_hashes_seen : set всех output хешей встреченных в этом проходе
+      dep_hashes_seen    : set всех dep хешей встреченных в этом проходе
+    """
+    out_to_deps        = {}
+    output_hashes_seen = set()
+    dep_hashes_seen    = set()
+
+    processed = 0
+    for file_path in buildography_files:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            data = json.load(f, strict=False)
+        cmds = data.get('component_commands', [])
+
+        for cmd in cmds:
+            processed += 1
+            progress_log(label, processed, total_cmds)
+
+            # Выходы
+            out_ints = set()
+            outputs = cmd.get('output', {})
+            if isinstance(outputs, dict):
+                for _, h in outputs.items():
+                    hi = _hash_to_int(h.strip() if h else '')
+                    if hi is not None:
+                        output_hashes_seen.add(hi)
+                        out_ints.add(hi)
+            elif isinstance(outputs, list):
+                for out in outputs:
+                    if isinstance(out, dict):
+                        hi = _hash_to_int(out.get('hash', '').strip())
+                        if hi is not None:
+                            output_hashes_seen.add(hi)
+                            out_ints.add(hi)
+
+            # Зависимости
+            deps_raw = cmd.get('dependencies', {})
+            dep_list = []
+            if isinstance(deps_raw, dict):
+                for path, h in deps_raw.items():
+                    h = h.strip() if h else ''
+                    hi = _hash_to_int(h)
+                    if hi is not None:
+                        dep_hashes_seen.add(hi)
+                        dep_list.append((hi, path, h))
+            elif isinstance(deps_raw, list):
+                for dep in deps_raw:
+                    if isinstance(dep, dict):
+                        path = dep.get('path', '')
+                        h = dep.get('hash', '').strip()
+                        hi = _hash_to_int(h)
+                        if hi is not None:
+                            dep_hashes_seen.add(hi)
+                            dep_list.append((hi, path, h))
+
+            # Индексируем если выход в target_hashes
+            relevant = out_ints & target_hashes
+            if relevant and dep_list:
+                for out_hi in relevant:
+                    existing = out_to_deps.get(out_hi, [])
+                    out_to_deps[out_hi] = existing + dep_list
+
+        del data, cmds
+        gc.collect()
+
+    return out_to_deps, output_hashes_seen, dep_hashes_seen
+
+
+def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir):
+    """
+    Проверяет происхождение бинарей дистрибутива.
+    Итеративно расширяет граф только для нужных цепочек.
+    """
+    _log_memory("Pass 4 start")
+
+    # Конвертируем src_hashes в int
+    src_hashes_int = set()
+    for h in src_hashes:
+        hi = _hash_to_int(h)
+        if hi is not None:
+            src_hashes_int.add(hi)
+    print(_ts() + "   Pass 4: src_hashes_int={}".format(len(src_hashes_int)))
+
+    # Хеши бинарей для проверки
+    bin_hashes_int = set()
+    for entry in bin_entries:
+        hi = _hash_to_int(entry.get('hash', '').strip())
+        if hi is not None:
+            bin_hashes_int.add(hi)
+    print(_ts() + "   Pass 4: bin_hashes_int={}".format(len(bin_hashes_int)))
+
+    total_cmds = _count_cmds(buildography_files)
+
+    # Максимальная глубина итераций — покрывает сценарии:
+    # iter1: бинарь ← прямые зависимости
+    # iter2: .o/.a ← их зависимости (компиляция из скачанных исходников)
+    # iter3: .so ← их зависимости (редкий случай)
+    MAX_ITERATIONS = 3
+    # Максимальный размер frontier — защита от "жирных" команд
+    # (линковщики с сотнями тысяч зависимостей)
+    MAX_FRONTIER = 10000
+
+    # ==========================================================================
+    # Итеративное расширение графа
+    # ==========================================================================
+    # Общий граф — накапливается итеративно
+    full_out_to_deps   = {}   # out_hash_int -> [(dep_hi, path, h_str)]
+    all_output_hashes  = set()
+    all_dep_hashes     = set()
+
+    # Стартуем с бинарей из bin_entries
+    frontier = set(bin_hashes_int)
+    iteration = 0
+
+    while frontier and iteration < MAX_ITERATIONS:
+        iteration += 1
+        print(_ts() + "   Pass 4 iter {}/{}: scanning for {} hashes...".format(
+            iteration, MAX_ITERATIONS, len(frontier)))
+        _log_memory("Pass 4 iter {} start".format(iteration))
+
+        out_to_deps, output_hashes_seen, dep_hashes_seen = _scan_pass(
+            buildography_files, frontier, total_cmds,
+            "Pass 4 iter{}".format(iteration)
         )
-        for path, h in (outputs.items() if isinstance(outputs, dict) else []):
-            h = h.strip() if h else ''
-            if h:
-                output_hashes.add(h)
-                cmd_out_hashes.add(h)
 
-        if isinstance(outputs, list):
-            for out in outputs:
-                if isinstance(out, dict):
-                    h = out.get('hash', '').strip()
-                else:
-                    h = ''
-                if h:
-                    output_hashes.add(h)
-                    cmd_out_hashes.add(h)
+        # Объединяем с общим графом
+        for out_hi, deps in out_to_deps.items():
+            existing = full_out_to_deps.get(out_hi, [])
+            full_out_to_deps[out_hi] = existing + deps
 
-        # Собираем хеши зависимостей этой команды
-        cmd_dep_hashes = set()
-        deps = cmd.get('dependencies', {})
-        if isinstance(deps, dict):
-            for path, h in deps.items():
-                h = h.strip() if h else ''
-                if h:
-                    dep_hashes.add(h)
-                    cmd_dep_hashes.add(h)
-        elif isinstance(deps, list):
-            for dep in deps:
-                if isinstance(dep, dict):
-                    h = dep.get('hash', '').strip()
-                else:
-                    h = ''
-                if h:
-                    dep_hashes.add(h)
-                    cmd_dep_hashes.add(h)
+        all_output_hashes.update(output_hashes_seen)
+        all_dep_hashes.update(dep_hashes_seen)
 
-        # Связываем выходы с зависимостями
-        for out_h in cmd_out_hashes:
-            output_to_deps.setdefault(out_h, set()).update(cmd_dep_hashes)
-        for dep_h in cmd_dep_hashes:
-            dep_to_outputs.setdefault(dep_h, set()).update(cmd_out_hashes)
+        _log_memory("Pass 4 iter {} after scan".format(iteration))
+        print(_ts() + "   Pass 4 iter {}: found {} commands, "
+              "output_hashes={}, dep_hashes={}".format(
+              iteration, len(out_to_deps),
+              len(all_output_hashes), len(all_dep_hashes)))
 
-    return output_hashes, dep_hashes, output_to_deps, dep_to_outputs
+        # Новый frontier — промежуточные артефакты
+        new_frontier = set()
+        for deps in out_to_deps.values():
+            for (dep_hi, dep_path, _) in deps:
+                if (dep_hi in all_output_hashes and
+                        dep_hi not in full_out_to_deps and
+                        not _is_system_path(dep_path)):
+                    new_frontier.add(dep_hi)
 
+        # Ограничиваем размер frontier
+        if len(new_frontier) > MAX_FRONTIER:
+            print(_ts() + "   Pass 4 iter {}: frontier truncated {} → {} (MAX_FRONTIER)".format(
+                iteration, len(new_frontier), MAX_FRONTIER))
+            new_frontier = set(list(new_frontier)[:MAX_FRONTIER])
 
-def build_leaf_cache(output_to_deps, output_hashes):
-    """
-    Вычисляет для каждого хеша из output_hashes множество его листовых зависимостей
-    (транзитивно). Лист — хеш которого нет в output_hashes (исходник или внешний файл).
+        frontier = new_frontier
+        print(_ts() + "   Pass 4 iter {}: new frontier size: {}".format(
+            iteration, len(frontier)))
 
-    Использует итеративный BFS вместо рекурсии — каждый хеш обходится ровно один раз.
-    Возвращает словарь: hash -> frozenset(leaf_hashes).
-    """
-    from collections import deque
+        del out_to_deps, output_hashes_seen, dep_hashes_seen
+        gc.collect()
 
-    # Топологический обход: сначала находим все хеши которые нужно обойти
-    all_hashes = set(output_to_deps.keys())
-    leaf_cache = {}   # hash -> set(leaf_hashes)
+    print(_ts() + "   Pass 4: graph expansion done after {} iterations".format(iteration))
+    print(_ts() + "   Pass 4: full_out_to_deps={}, all_output_hashes={}, "
+          "all_dep_hashes={}".format(
+          len(full_out_to_deps), len(all_output_hashes), len(all_dep_hashes)))
+    _log_memory("after graph expansion")
 
-    total = len(all_hashes)
-    print("  [INFO] Pass 4: building leaf cache for {} output hashes...".format(total))
-    done = 0
+    # ==========================================================================
+    # Классификация бинарей
+    # ==========================================================================
+    system_binaries  = []  # путь в дистрибутиве — системный (usr/lib, lib и т.д.)
+    compiled_from_src = [] # сценарий 1: собран из src.json, трассировщик подтверждает
+    binaries_from_src = [] # сценарий 2: хеш в src.json, скопирован напрямую
+    untraced_from_src = [] # сценарий 6: хеш в src.json, трассировщик не видит
+    external_built   = []  # сценарий 5: собран из внешних исходников
+    external_prebuilt = [] # сценарий 3: готовый бинарь извне, трассировщик видит
+    untraced_external = [] # сценарий 4: не в src.json, трассировщик не видит
 
-    for start_hash in all_hashes:
-        if start_hash in leaf_cache:
-            done += 1
-            continue
+    # Системные пути в дистрибутиве — проверяем путь бинаря в дистрибутиве
+    DISTRIB_SYSTEM_PREFIXES = (
+        '/usr/lib/', '/usr/lib64/', '/lib/', '/lib64/',
+        '/usr/include/', '/usr/local/lib/',
+        '/etc/', '/proc/', '/sys/', '/dev/',
+        '/usr/share/', '/var/',
+        # Те же пути без ведущего слеша (относительные)
+        'usr/lib/', 'usr/lib64/', 'lib/', 'lib64/',
+        'usr/include/', 'usr/local/lib/',
+        'etc/', 'proc/', 'sys/', 'dev/',
+        'usr/share/', 'var/',
+    )
 
-        # Итеративный DFS с постобработкой (bottom-up)
-        stack = [start_hash]
-        order = []          # порядок обработки (постфиксный)
-        visited_local = set()
-
-        while stack:
-            h = stack.pop()
-            if h in visited_local:
-                continue
-            visited_local.add(h)
-            order.append(h)
-            if h in output_hashes:
-                for dep_h in output_to_deps.get(h, ()):
-                    if dep_h not in visited_local and dep_h not in leaf_cache:
-                        stack.append(dep_h)
-
-        # Вычисляем leaf_cache в обратном порядке (листья раньше родителей)
-        for h in reversed(order):
-            if h not in output_hashes:
-                # Лист
-                leaf_cache[h] = frozenset({h})
+    def _is_distrib_system_path(path):
+        """Проверяем путь бинаря внутри дистрибутива."""
+        # Убираем префикс типа KTDL.00554-01/bin/ или bin/
+        p = path
+        # Убираем PROJECT/bin/ или bin/
+        for prefix in ('bin/', ):
+            idx = p.find(prefix)
+            if idx >= 0:
+                p = p[idx + len(prefix):]
+                break
+        # Убираем архивные суффиксы типа foo.iso/bar.deb/
+        # и смотрим на финальный путь
+        parts = p.split('/')
+        # Ищем первую часть которая не выглядит как архив
+        clean_parts = []
+        for part in parts:
+            if any(part.endswith(ext) for ext in
+                   ('.iso', '.deb', '.rpm', '.tar', '.tgz', '.zip', '.gz')):
+                clean_parts = []  # сбрасываем — начинаем после архива
             else:
-                deps = output_to_deps.get(h, set())
-                leaves = set()
-                for dep_h in deps:
-                    if dep_h not in output_hashes:
-                        leaves.add(dep_h)
-                    else:
-                        leaves.update(leaf_cache.get(dep_h, frozenset()))
-                leaf_cache[h] = frozenset(leaves)
-
-        done += len(visited_local)
-        progress_log("Pass 4 leaf cache", min(done, total), total)
-
-    print("  [INFO] Pass 4: leaf cache built, {} entries".format(len(leaf_cache)))
-    return leaf_cache
-
-
-def analyze_pass4(bin_entries, src_hashes, raw_cmds):
-    """
-    Классифицирует файлы дистрибутива (bin.json) по происхождению:
-      - untraced          : хеш не найден ни в output, ни в dependencies трассировщика
-      - external_unbuilt  : хеш есть в dependencies, но не в output (пришёл готовым извне)
-      - external_sources  : собран (есть в output), но в цепочке deps есть хеши не из src.json
-      - traced            : собран и вся цепочка восходит к src.json
-
-    bin_entries : список {'path': ..., 'hash': ...} из bin.json
-    src_hashes  : множество хешей из src.json
-    raw_cmds    : команды трассировщика
-
-    Возвращает (untraced, external_unbuilt, external_sources, traced).
-    """
-    print("  [INFO] Pass 4: building tracer indexes...")
-    output_hashes, dep_hashes, output_to_deps, dep_to_outputs = build_pass4_indexes(raw_cmds)
-    print("  [INFO] Pass 4: output_hashes={}, dep_hashes={}".format(
-        len(output_hashes), len(dep_hashes)))
-
-    # Строим кеш листовых зависимостей один раз для всех хешей
-    leaf_cache = build_leaf_cache(output_to_deps, output_hashes)
-
-    untraced = []
-    external_unbuilt = []
-    external_sources = []
-    traced = []
+                clean_parts.append(part)
+        clean_path = '/'.join(clean_parts)
+        return any(clean_path.startswith(pfx) for pfx in DISTRIB_SYSTEM_PREFIXES)
 
     total_bin = len(bin_entries)
-    print("  [INFO] Pass 4: checking origin of {} distrib files...".format(total_bin))
+    print(_ts() + "   Pass 4: classifying {} binaries...".format(total_bin))
+
+    def _get_ext_deps(hi, visited=None):
+        """Рекурсивно находит внешние листья в цепочке зависимостей hi."""
+        if visited is None:
+            visited = set()
+        if hi in visited:
+            return []
+        visited.add(hi)
+        ext = []
+        for (dep_hi, dep_path, dep_h_str) in full_out_to_deps.get(hi, []):
+            if _is_system_path(dep_path):
+                continue
+            if dep_hi in src_hashes_int:
+                continue
+            if dep_hi in all_output_hashes:
+                ext.extend(_get_ext_deps(dep_hi, visited))
+            else:
+                ext.append({'hash': dep_h_str, 'path': dep_path})
+        return ext
+
     for i, entry in enumerate(bin_entries):
-        progress_log("Pass 4 checking files", i + 1, total_bin)
-        path = entry.get('path', '')
-        h = entry.get('hash', '').strip()
-        if not h:
-            untraced.append({'path': path, 'hash': h})
+        progress_log("Pass 4 classifying", i + 1, total_bin)
+        path  = entry.get('path', '')
+        h_str = entry.get('hash', '').strip()
+        hi    = _hash_to_int(h_str)
+
+        # Первый фильтр — системный путь в дистрибутиве
+        if _is_distrib_system_path(path):
+            system_binaries.append({'path': path, 'hash': h_str})
             continue
 
-        # Категория 1: вообще нет в трассировщике
-        if h not in output_hashes and h not in dep_hashes:
-            untraced.append({'path': path, 'hash': h})
+        if hi is None:
+            untraced_external.append({'path': path, 'hash': h_str})
             continue
 
-        # Категория 2: есть в зависимостях, но не был собран
-        if h not in output_hashes and h in dep_hashes:
-            external_unbuilt.append({'path': path, 'hash': h})
+        if hi not in all_output_hashes and hi not in all_dep_hashes:
+            # Нет в трассировщике — проверяем есть ли в src.json
+            if h_str in src_hashes:
+                untraced_from_src.append({'path': path, 'hash': h_str})
+            else:
+                untraced_external.append({'path': path, 'hash': h_str})
             continue
 
-        # Файл есть в output — был собран. Берём листья из кеша.
-        leaf_hashes = leaf_cache.get(h, frozenset())
+        if hi not in all_output_hashes and hi in all_dep_hashes:
+            # Готовый бинарь — трассировщик видит его как зависимость
+            # Проверяем есть ли в src.json
+            if h_str in src_hashes:
+                binaries_from_src.append({'path': path, 'hash': h_str})
+            else:
+                external_prebuilt.append({'path': path, 'hash': h_str})
+            continue
 
-        # Листья которых нет в src.json — чужие исходники
-        external_leaf_hashes = leaf_hashes - src_hashes
+        # Собран — проверяем цепочку зависимостей
+        ext_deps = _get_ext_deps(hi)
 
-        if external_leaf_hashes:
-            ext_deps = [{'hash': eh} for eh in external_leaf_hashes]
-            external_sources.append({
+        if ext_deps:
+            external_built.append({
                 'path': path,
-                'hash': h,
+                'hash': h_str,
                 'external_deps': ext_deps
             })
         else:
-            traced.append({'path': path, 'hash': h})
+            # Все зависимости из src.json — проверяем есть ли сам в src.json
+            if h_str in src_hashes:
+                binaries_from_src.append({'path': path, 'hash': h_str})
+            else:
+                compiled_from_src.append({'path': path, 'hash': h_str})
 
-    print("  [INFO] Pass 4 done: untraced={}, external_unbuilt={}, external_sources={}, traced={}".format(
-        len(untraced), len(external_unbuilt), len(external_sources), len(traced)))
+    del full_out_to_deps, all_output_hashes, all_dep_hashes
+    del src_hashes_int, bin_hashes_int
+    gc.collect()
+    _log_memory("Pass 4 done")
 
-    return untraced, external_unbuilt, external_sources, traced
+    print(_ts() + "   Pass 4 done: "
+          "compiled_from_src={}, binaries_from_src={}, untraced_from_src={}, "
+          "external_built={}, external_prebuilt={}, untraced_external={}, "
+          "system_binaries={}".format(
+          len(compiled_from_src), len(binaries_from_src), len(untraced_from_src),
+          len(external_built), len(external_prebuilt), len(untraced_external),
+          len(system_binaries)))
 
+    return (compiled_from_src, binaries_from_src, untraced_from_src,
+            external_built, external_prebuilt, untraced_external, system_binaries)
 
-def enrich_external_sources_with_paths(external_sources, raw_cmds):
-    """
-    Дополняет external_deps в external_sources записями path
-    используя обратный индекс hash->path из raw_cmds.
-    Вызывать после analyze_pass4.
-    """
-    # Строим индекс hash -> path по всем зависимостям трассировщика
-    hash_to_path = {}
-    for cmd in raw_cmds:
-        deps = cmd.get('dependencies', {})
-        if isinstance(deps, dict):
-            for path, h in deps.items():
-                h = h.strip() if h else ''
-                if h and h not in hash_to_path:
-                    hash_to_path[h] = path.strip()
-        elif isinstance(deps, list):
-            for dep in deps:
-                if isinstance(dep, dict):
-                    h = dep.get('hash', '').strip()
-                    p = dep.get('path', '').strip()
-                    if h and h not in hash_to_path:
-                        hash_to_path[h] = p
-
-    for entry in external_sources:
-        for dep in entry.get('external_deps', []):
-            h = dep.get('hash', '')
-            if h and 'path' not in dep:
-                dep['path'] = hash_to_path.get(h, '')
-
-    return external_sources
 
 
 def write_pass4_txt(output_path, category_label, entries):
@@ -1356,7 +1559,7 @@ def write_pass4_txt(output_path, category_label, entries):
 
     versioned_path = get_versioned_filepath(output_path)
     if versioned_path != output_path:
-        print("  [WARN] File exists, writing to: {}".format(os.path.basename(versioned_path)))
+        print(_ts() + "   File exists, writing to: {}".format(os.path.basename(versioned_path)))
 
     with open(versioned_path, 'w', encoding='utf-8') as f:
         f.write("# Pass 4: {}\n".format(category_label))
@@ -1366,13 +1569,13 @@ def write_pass4_txt(output_path, category_label, entries):
         f.write("#\n")
         for path, h in rows:
             f.write("{}\t{}\n".format(path, h))
-    print("  [INFO] Written {} entries -> {}".format(len(rows), versioned_path))
+    print(_ts() + "   Written {} entries -> {}".format(len(rows), versioned_path))
 
 
 # =============================================================================
 # ОБРАБОТКА ПРОЕКТА
 # =============================================================================
-def process_project(project_name, compiler_basenames, interpreter_basenames):
+def process_project(project_name, compiler_basenames, interpreter_basenames, by_disk=False):
     print("\n" + "=" * 50)
     print("Processing project: {}".format(project_name))
     print("=" * 50)
@@ -1380,23 +1583,23 @@ def process_project(project_name, compiler_basenames, interpreter_basenames):
     buildography_pattern = os.path.join(BUILDOGRAPHY_DIR, project_name, "*.json")
     buildography_files = sorted(glob.glob(buildography_pattern))
     if not buildography_files:
-        print("  [ERROR] No buildography JSON found: {}".format(buildography_pattern))
+        print(_ts() + "   No buildography JSON found: {}".format(buildography_pattern))
         return False
 
-    print("  [INFO] Buildography files found: {}".format(len(buildography_files)))
+    print(_ts() + "   Buildography files found: {}".format(len(buildography_files)))
     for f in buildography_files:
-        print("  [INFO]   {}".format(os.path.basename(f)))
+        print(_ts() + "     {}".format(os.path.basename(f)))
 
     sources_dir = os.path.join(RESULTS_DIR, project_name, "sources")
     signatures_pattern = os.path.join(sources_dir, "*_src.json")
     signatures_files = sorted(glob.glob(signatures_pattern))
     if not signatures_files:
-        print("  [ERROR] No *_src.json found: {}".format(signatures_pattern))
+        print(_ts() + "   No *_src.json found: {}".format(signatures_pattern))
         return False
 
-    print("  [INFO] Source signature files found: {}".format(len(signatures_files)))
+    print(_ts() + "   Source signature files found: {}".format(len(signatures_files)))
     for f in signatures_files:
-        print("  [INFO]   {}".format(os.path.basename(f)))
+        print(_ts() + "     {}".format(os.path.basename(f)))
 
     output_dir = os.path.join(RESULTS_DIR, project_name, "izb")
     os.makedirs(output_dir, exist_ok=True)
@@ -1406,30 +1609,101 @@ def process_project(project_name, compiler_basenames, interpreter_basenames):
         buildography_hashes, raw_cmds = load_buildography_data(buildography_files)
         bin_hashes, bin_paths = load_bin_signatures(project_name)
     except Exception as e:
-        print("  [ERROR] Failed to load data: {}".format(e))
+        print(_ts() + "   Failed to load data: {}".format(e))
         import traceback
         traceback.print_exc()
         return False
 
-    # Загружаем bin_entries (path + hash) для Прохода 4
+    # Загружаем bin_entries для Прохода 4 — только реальные бинари из binaries_in_bin.txt
+    # binaries_in_bin.txt содержит пути ELF бинарей из дистрибутива
+    # Хеши берём из bin.json по путям
+    bin_entries = []  # инициализируем заранее на случай если файлы не найдены
+    pass4_ran   = False  # флаг успешного выполнения Pass 4
+    total_bin_count = 0  # будем хранить количество бинарных файлов для статистики
     bin_json_path = os.path.join(RESULTS_DIR, project_name, "sources",
                                  "{}_bin.json".format(project_name))
-    bin_entries = []
-    if os.path.isfile(bin_json_path):
+    binaries_in_bin_path = os.path.join(RESULTS_DIR, project_name, "ext",
+                                        "binaries_in_bin.txt")
+
+    if os.path.isfile(bin_json_path) and os.path.isfile(binaries_in_bin_path):
         try:
+            # Читаем bin.json — строим индекс path -> hash
             with open(bin_json_path, 'r', encoding='utf-8') as f:
                 bin_data = json.load(f)
-            raw_files = bin_data if isinstance(bin_data, list) else bin_data.get('files', [])
+            if isinstance(bin_data, list):
+                raw_files = bin_data
+            elif 'signatures' in bin_data:
+                raw_files = bin_data['signatures']
+            else:
+                raw_files = bin_data.get('files', [])
+
+            # Строим индекс по нормализованному пути
+            path_to_hash = {}
             for item in raw_files:
                 p = item.get('path', '').strip()
                 h = item.get('hash', '').strip()
-                if p or h:
-                    bin_entries.append({'path': p, 'hash': h})
-            print("  [INFO] bin.json loaded: {} entries".format(len(bin_entries)))
+                if p and h:
+                    # Нормализуем путь — убираем ведущий слеш если есть
+                    p_norm = p.lstrip('/')
+                    path_to_hash[p_norm] = h
+                    path_to_hash[p] = h  # также оригинальный путь
+
+            print(_ts() + "   bin.json loaded: {} entries".format(len(path_to_hash)))
+
+            # Читаем binaries_in_bin.txt
+            loaded = 0
+            skipped_type = 0
+            skipped_hash = 0
+            with open(binaries_in_bin_path, 'r', encoding='utf-8', errors='replace') as f:
+                for lineno, line in enumerate(f):
+                    raw = line
+                    line = line.strip()
+                    if not line or line.startswith('TYPE') or line.startswith('---'):
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) < 2:
+                        continue
+                    ftype = parts[0].strip()
+                    fpath = parts[1].strip()
+                    if lineno < 8:
+                        print(_ts() + "   line {}: type={!r} path={!r}".format(
+                            lineno, ftype, fpath[:80]))
+                    if ftype not in ('ELF', 'PE32', 'MSDOS', 'BINARY_EXT'):
+                        skipped_type += 1
+                        continue
+                    fpath_with_prefix = "{}/{}".format(project_name, fpath)
+                    # Нормализуем — убираем суффиксы _dir добавленные analyze-ext
+                    # bin/foo.iso_dir/bar.deb_dir/file → KTDL.../bin/foo.iso/bar.deb/file
+                    import re
+                    fpath_norm = re.sub(r'_dir(?=/|$)', '', fpath_with_prefix)
+                    h = (path_to_hash.get(fpath_norm) or
+                         path_to_hash.get(fpath_with_prefix) or
+                         path_to_hash.get(fpath) or
+                         path_to_hash.get(fpath.lstrip('/')))
+                    if h:
+                        bin_entries.append({'path': fpath_norm, 'hash': h})
+                        loaded += 1
+                    else:
+                        skipped_hash += 1
+                        if skipped_hash <= 3:
+                            print(_ts() + "   hash not found for: {!r}".format(
+                                fpath_norm[:100]))
+            print(_ts() + "   binaries_in_bin.txt: loaded={}, skipped_type={}, skipped_hash={}".format(
+                loaded, skipped_type, skipped_hash))
+
+            print(_ts() + "   binaries_in_bin.txt: {} ELF/PE binaries loaded for Pass 4".format(
+                len(bin_entries)))
+            total_bin_count = len(bin_entries)   # сохраняем количество
         except Exception as e:
-            print("  [WARN] Could not load bin.json: {}".format(e))
-    else:
-        print("  [WARN] bin.json not found: {} — Pass 4 will be skipped".format(bin_json_path))
+            print(_ts() + "   Could not load bin entries for Pass 4: {}".format(e))
+            import traceback
+            traceback.print_exc()
+    elif not os.path.isfile(bin_json_path):
+        print(_ts() + "   bin.json not found: {} — Pass 4 will be skipped".format(bin_json_path))
+    elif not os.path.isfile(binaries_in_bin_path):
+        print(_ts() + "   binaries_in_bin.txt not found: {} — Pass 4 will be skipped".format(
+            binaries_in_bin_path))
+        print(_ts() + "   Run analyze-ext_v3.sh first to generate binaries_in_bin.txt")
 
     # src_hashes — множество хешей из src.json (все загруженные signatures)
     src_hashes = {
@@ -1439,100 +1713,121 @@ def process_project(project_name, compiler_basenames, interpreter_basenames):
     }
 
     # --- Проход 1 ---
-    print("  [INFO] Starting pass 1 (hash analysis)...")
+    print(_ts() + "   Starting pass 1 (hash analysis)...")
     direct, parent, redundant = analyze_pass1(signatures, buildography_hashes)
+
+    # buildography_hashes больше не нужен
+    del buildography_hashes
+    gc.collect()
+    print(_ts() + "   Pass 1 done. Memory freed: buildography_hashes")
 
     # --- Проход 2 (компиляторы) ---
     if compiler_basenames:
-        print("  [INFO] Starting pass 2 (transitive closure from bin using compilers)...")
+        print(_ts() + "   Starting pass 2 (transitive closure from bin using compilers)...")
         good_compiler_input_keys = build_good_compiler_inputs(
             raw_cmds, compiler_basenames, bin_hashes, bin_paths
         )
-        print("  [INFO] Good compiler input keys: {}".format(len(good_compiler_input_keys)))
+        print(_ts() + "   Good compiler input keys: {}".format(len(good_compiler_input_keys)))
         direct, parent, redundant, not_compiled = analyze_pass2(
             direct, parent, redundant, good_compiler_input_keys
         )
+        del good_compiler_input_keys
+        gc.collect()
+        print(_ts() + "   Pass 2 done. Memory freed: good_compiler_input_keys")
     else:
-        print("  [WARN] Pass 2 skipped (no compiler list)")
+        print(_ts() + "   Pass 2 skipped (no compiler list)")
         not_compiled = []
 
     # --- Проход 3 (интерпретаторы) ---
     if interpreter_basenames:
-        print("  [INFO] Starting pass 3 (interpreted languages)...")
+        print(_ts() + "   Starting pass 3 (interpreted languages)...")
         input_files, output_files = build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames)
-        print("  [INFO] Interpreted input files: {}, output files: {}".format(len(input_files), len(output_files)))
+        print(_ts() + "   Interpreted input files: {}, output files: {}".format(len(input_files), len(output_files)))
         executed, compiled_used, compiled_unused, copied, izb = analyze_interpreted(
             signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds
         )
+        del input_files, output_files
+        gc.collect()
+        print(_ts() + "   Pass 3 done. Memory freed: input_files, output_files")
     else:
-        print("  [WARN] Pass 3 skipped (no interpreter list)")
+        print(_ts() + "   Pass 3 skipped (no interpreter list)")
         executed = compiled_used = compiled_unused = copied = izb = []
 
     # --- Проход 4 (происхождение файлов дистрибутива) ---
+    # Освобождаем raw_cmds ДО Pass 4 — Pass 4 перечитает файлы сам
+    del raw_cmds
+    gc.collect()
+    print(_ts() + "   raw_cmds freed before pass 4")
+
     if bin_entries:
-        print("  [INFO] Starting pass 4 (distrib origin check)...")
-        p4_untraced, p4_ext_unbuilt, p4_ext_sources, p4_traced = analyze_pass4(
-            bin_entries, src_hashes, raw_cmds
+        print(_ts() + "   Starting pass 4 (distrib origin check)...")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        p4_compiled_from_src, p4_binaries_from_src, p4_untraced_from_src, \
+        p4_external_built, p4_external_prebuilt, p4_untraced_external, \
+        p4_system_binaries = analyze_pass4(
+            bin_entries, src_hashes, buildography_files, script_dir
         )
-        p4_ext_sources = enrich_external_sources_with_paths(p4_ext_sources, raw_cmds)
+        del bin_entries, src_hashes
+        gc.collect()
+        pass4_ran = True
+        print(_ts() + "   Pass 4 done. Memory freed: bin_entries, src_hashes")
     else:
-        print("  [WARN] Pass 4 skipped (no bin entries)")
-        p4_untraced = p4_ext_unbuilt = p4_ext_sources = p4_traced = []
+        print(_ts() + "   Pass 4 skipped (no bin entries)")
+        p4_compiled_from_src = p4_binaries_from_src = p4_untraced_from_src = \
+        p4_external_built = p4_external_prebuilt = p4_untraced_external = \
+        p4_system_binaries = []
+        pass4_ran = False
+        del src_hashes
+        gc.collect()
+        pass4_ran = False
 
-    # --- Запись JSON результатов ---
-    print("  [INFO] Writing JSON results...")
-    write_json_result(os.path.join(output_dir, "{}_direct.json".format(project_name)), 'direct', direct)
-    write_json_result(os.path.join(output_dir, "{}_parent.json".format(project_name)), 'parent', parent)
-    write_json_result(os.path.join(output_dir, "{}_redundant.json".format(project_name)), 'redundant', redundant)
-    write_json_result(os.path.join(output_dir, "{}_not_compiled.json".format(project_name)), 'not_compiled', not_compiled)
-    write_json_result(os.path.join(output_dir, "{}_interpreted_executed.json".format(project_name)), 'interpreted_executed', executed)
-    write_json_result(os.path.join(output_dir, "{}_interpreted_compiled_used.json".format(project_name)), 'interpreted_compiled_used', compiled_used)
-    write_json_result(os.path.join(output_dir, "{}_interpreted_compiled_unused.json".format(project_name)), 'interpreted_compiled_unused', compiled_unused)
-    write_json_result(os.path.join(output_dir, "{}_interpreted_copied.json".format(project_name)), 'interpreted_copied', copied)
-    write_json_result(os.path.join(output_dir, "{}_interpreted_izb.json".format(project_name)), 'interpreted_izb', izb)
+    # Создаём папку try{N} и подпапки для каждого прохода
+    izb_base = os.path.join(RESULTS_DIR, project_name, "izb")
+    try_dir  = get_try_dir(izb_base)
+    os.makedirs(try_dir, exist_ok=True)
+    print(_ts() + "   Results directory: {}".format(try_dir))
 
-    # --- Запись JSON результатов Прохода 4 ---
-    if bin_entries:
-        print("  [INFO] Writing pass 4 JSON results...")
-        write_json_result(os.path.join(output_dir, "{}_pass4_untraced.json".format(project_name)),
-                          'pass4_untraced', p4_untraced)
-        write_json_result(os.path.join(output_dir, "{}_pass4_external_unbuilt.json".format(project_name)),
-                          'pass4_external_unbuilt', p4_ext_unbuilt)
-        write_json_result(os.path.join(output_dir, "{}_pass4_external_sources.json".format(project_name)),
-                          'pass4_external_sources', p4_ext_sources)
-        write_json_result(os.path.join(output_dir, "{}_pass4_traced.json".format(project_name)),
-                          'pass4_traced', p4_traced)
+    pass1_dir = os.path.join(try_dir, "pass1")
+    pass2_dir = os.path.join(try_dir, "pass2")
+    pass3_dir = os.path.join(try_dir, "pass3")
+    pass4_dir = os.path.join(try_dir, "pass4")
+    for d in [pass1_dir, pass2_dir, pass3_dir, pass4_dir]:
+        os.makedirs(d, exist_ok=True)
 
-    # --- Запись текстовых файлов ---
-    print("  [INFO] Writing text results...")
-    hash_algorithm = read_hash_cmd(GENERATE_JSON_SCRIPT)
-    txt_path = os.path.join(output_dir, "{}_redundant.txt".format(project_name))
-    write_redundant_txt(txt_path, project_name, redundant, not_compiled, hash_algorithm)
+    def jt(folder, name, category, entries):
+        """Записывает JSON и TXT файлы для категории."""
+        base = os.path.join(folder, "{}_{}".format(project_name, name))
+        write_json_result(base + ".json", category, entries)
+        write_txt_result(base + ".txt", category, entries)
 
-    izb_txt_path = os.path.join(output_dir, "{}_interpreted_izb.txt".format(project_name))
-    write_interpreted_izb_txt(izb_txt_path, izb)
+    # --- Pass 1 ---
+    print(_ts() + "   Writing pass 1 results...")
+    jt(pass1_dir, "direct",           "direct",    direct)
+    jt(pass1_dir, "parent",           "parent",    parent)
+    jt(pass1_dir, "redundant-by-hash","redundant", redundant)
 
-    compiled_unused_txt = os.path.join(output_dir, "{}_interpreted_compiled_unused.txt".format(project_name))
-    write_interpreted_izb_txt(compiled_unused_txt, compiled_unused)
+    # --- Pass 2 ---
+    print(_ts() + "   Writing pass 2 results...")
+    jt(pass2_dir, "not_compiled", "not_compiled", not_compiled)
 
-    executed_txt_path = os.path.join(output_dir, "{}_interpreted_executed.txt".format(project_name))
-    write_interpreted_executed_txt(executed_txt_path, executed)
+    # --- Pass 3 ---
+    print(_ts() + "   Writing pass 3 results...")
+    jt(pass3_dir, "executed",        "interpreted_executed",        executed)
+    jt(pass3_dir, "compiled_used",   "interpreted_compiled_used",   compiled_used)
+    jt(pass3_dir, "compiled_unused", "interpreted_compiled_unused", compiled_unused)
+    jt(pass3_dir, "copied",          "interpreted_copied",          copied)
+    jt(pass3_dir, "not_used",        "interpreted_not_used",        izb)
 
-    # --- Запись текстовых файлов Прохода 4 ---
-    if bin_entries:
-        print("  [INFO] Writing pass 4 text results...")
-        write_pass4_txt(
-            os.path.join(output_dir, "{}_pass4_untraced.txt".format(project_name)),
-            'untraced (not found in tracer at all)', p4_untraced)
-        write_pass4_txt(
-            os.path.join(output_dir, "{}_pass4_external_unbuilt.txt".format(project_name)),
-            'external_unbuilt (in deps but not built in this build)', p4_ext_unbuilt)
-        write_pass4_txt(
-            os.path.join(output_dir, "{}_pass4_external_sources.txt".format(project_name)),
-            'external_sources (built but deps not in src.json)', p4_ext_sources)
-        write_pass4_txt(
-            os.path.join(output_dir, "{}_pass4_traced.txt".format(project_name)),
-            'traced (fully verified origin)', p4_traced)
+    # --- Pass 4 ---
+    if pass4_ran:
+        print(_ts() + "   Writing pass 4 results...")
+        jt(pass4_dir, "compiled_from_src",  "compiled_from_src",  p4_compiled_from_src)
+        jt(pass4_dir, "binaries_from_src",  "binaries_from_src",  p4_binaries_from_src)
+        jt(pass4_dir, "untraced_from_src",  "untraced_from_src",  p4_untraced_from_src)
+        jt(pass4_dir, "external_built",     "external_built",     p4_external_built)
+        jt(pass4_dir, "external_prebuilt",  "external_prebuilt",  p4_external_prebuilt)
+        jt(pass4_dir, "untraced_external",  "untraced_external",  p4_untraced_external)
+        jt(pass4_dir, "system_binaries",    "system_binaries",    p4_system_binaries)
 
     # --- Статистика ---
     def pct(n, total):
@@ -1567,27 +1862,133 @@ def process_project(project_name, compiler_basenames, interpreter_basenames):
     print("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(compiled_used),   pct(len(compiled_used),   total_interp)))
     print("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(compiled_unused), pct(len(compiled_unused), total_interp)))
     print("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(copied),          pct(len(copied),          total_interp)))
-    print("  Избыточные (izb)                                   : {:>7}  ({:.1f}%)".format(len(izb),             pct(len(izb),             total_interp)))
+    print("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(izb),             pct(len(izb),             total_interp)))
 
     print("\n  Итого ({} файлов)".format(total_all))
     print(sep)
     print("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb, pct(total_all - total_izb, total_all)))
-    print("  Избыточные (not_compiled + compiled_unused + izb)  : {:>7}  ({:.1f}%)".format(total_izb,             pct(total_izb,             total_all)))
+    print("  Избыточные (not_compiled + compiled_unused + not_used): {:>7}  ({:.1f}%)".format(total_izb,             pct(total_izb,             total_all)))
 
-    if bin_entries:
-        total_bin = len(bin_entries)
-        print("\n  Происхождение файлов дистрибутива ({} файлов)".format(total_bin))
+    if pass4_ran:
+        total_bin = (len(p4_compiled_from_src) + len(p4_binaries_from_src) +
+                     len(p4_untraced_from_src) + len(p4_external_built) +
+                     len(p4_external_prebuilt) + len(p4_untraced_external) +
+                     len(p4_system_binaries))
+        print("\n  Происхождение бинарей дистрибутива ({} файлов)".format(total_bin))
         print(sep)
-        print("  Traced (подтверждённое)          : {:>7}  ({:.1f}%)".format(
-            len(p4_traced),     pct(len(p4_traced),     total_bin)))
-        print("  Untraced (нет в трассировщике)   : {:>7}  ({:.1f}%)".format(
-            len(p4_untraced),   pct(len(p4_untraced),   total_bin)))
-        print("  External unbuilt (готовый извне) : {:>7}  ({:.1f}%)".format(
-            len(p4_ext_unbuilt), pct(len(p4_ext_unbuilt), total_bin)))
-        print("  External sources (чужие исходники): {:>7}  ({:.1f}%)".format(
-            len(p4_ext_sources), pct(len(p4_ext_sources), total_bin)))
+        print("  Compiled from src  (собран из src.json)            : {:>7}  ({:.1f}%)".format(
+            len(p4_compiled_from_src),  pct(len(p4_compiled_from_src),  total_bin)))
+        print("  Binaries from src  (бинарь из src.json, скопирован): {:>7}  ({:.1f}%)".format(
+            len(p4_binaries_from_src),  pct(len(p4_binaries_from_src),  total_bin)))
+        print("  Untraced from src  (в src.json, трасс. не видит)   : {:>7}  ({:.1f}%)".format(
+            len(p4_untraced_from_src),  pct(len(p4_untraced_from_src),  total_bin)))
+        print("  External built     (компил. из внешних исх.)       : {:>7}  ({:.1f}%)".format(
+            len(p4_external_built),     pct(len(p4_external_built),     total_bin)))
+        print("  External prebuilt  (готовый извне, трасс. видит)   : {:>7}  ({:.1f}%)".format(
+            len(p4_external_prebuilt),  pct(len(p4_external_prebuilt),  total_bin)))
+        print("  Untraced external  (не в src, трасс. не видит)     : {:>7}  ({:.1f}%)".format(
+            len(p4_untraced_external),  pct(len(p4_untraced_external),  total_bin)))
+        print("  System binaries    (системные пути в дистрибутиве) : {:>7}  ({:.1f}%)".format(
+            len(p4_system_binaries),    pct(len(p4_system_binaries),    total_bin)))
+
+    # --- Pass 5 (по дискам, если флаг --by-disk) ---
+    if by_disk:
+        print(_ts() + "   Starting pass 5 (breakdown by disk)...")
+        run_pass5(
+            try_dir, project_name,
+            redundant, not_compiled, izb, compiled_unused,
+            p4_compiled_from_src, p4_binaries_from_src, p4_untraced_from_src,
+            p4_external_built, p4_external_prebuilt,
+            p4_untraced_external, p4_system_binaries
+        )
+    elif not by_disk:
+        print(_ts() + "   Pass 5 skipped (use --by-disk to enable)")
 
     return True
+
+
+# =============================================================================
+# ПРОХОД 5: разбивка избыточных файлов по дискам
+# =============================================================================
+
+def _get_disk(path, separator):
+    """
+    Извлекает имя диска из пути — первый компонент после separator ('src' или 'bin').
+    Например:
+      KTDL.00554-01/src/DISK01/file.c → DISK01
+      KTDL.00554-01/bin/12_05_DISK02.iso_dir/... → 12_05_DISK02.iso_dir
+    """
+    parts = path.split('/')
+    try:
+        idx = parts.index(separator)
+        return parts[idx + 1] if idx + 1 < len(parts) else 'unknown'
+    except ValueError:
+        return 'unknown'
+
+
+def group_by_disk(entries, separator):
+    """Группирует записи по диску. separator = 'src' или 'bin'."""
+    groups = {}
+    for entry in entries:
+        disk = _get_disk(entry.get('path', ''), separator)
+        groups.setdefault(disk, []).append(entry)
+    return groups
+
+
+def run_pass5(try_dir, project_name,
+              # src категории
+              redundant, not_compiled, not_used, compiled_unused,
+              # bin категории
+              p4_compiled_from_src, p4_binaries_from_src, p4_untraced_from_src,
+              p4_external_built, p4_external_prebuilt,
+              p4_untraced_external, p4_system_binaries):
+    """
+    Pass 5: разбивка избыточных файлов по дискам.
+    Создаёт папку pass5/src/ и pass5/bin/ с файлами для каждого диска.
+    """
+    pass5_dir     = os.path.join(try_dir, "pass5")
+    pass5_src_dir = os.path.join(pass5_dir, "src")
+    pass5_bin_dir = os.path.join(pass5_dir, "bin")
+    os.makedirs(pass5_src_dir, exist_ok=True)
+    os.makedirs(pass5_bin_dir, exist_ok=True)
+
+    print(_ts() + "   Pass 5: breakdown by disk...")
+
+    def jt5(folder, disk, name, category, entries):
+        base = os.path.join(folder, "{}_{}_{}.".format(disk, project_name, name))
+        write_json_result(base + "json", category, entries)
+        write_txt_result(base + "txt",  category, entries)
+
+    # --- SRC ---
+    src_categories = [
+        ("redundant-by-hash", "redundant",         redundant),
+        ("not_compiled",      "not_compiled",       not_compiled),
+        ("not_used",          "interpreted_not_used", not_used),
+        ("compiled_unused",   "interpreted_compiled_unused", compiled_unused),
+    ]
+    for name, category, entries in src_categories:
+        groups = group_by_disk(entries, 'src')
+        for disk, disk_entries in sorted(groups.items()):
+            jt5(pass5_src_dir, disk, name, category, disk_entries)
+        print(_ts() + "   Pass 5 src {}: {} disks".format(name, len(groups)))
+
+    # --- BIN ---
+    bin_categories = [
+        ("compiled_from_src",  "compiled_from_src",  p4_compiled_from_src),
+        ("binaries_from_src",  "binaries_from_src",  p4_binaries_from_src),
+        ("untraced_from_src",  "untraced_from_src",  p4_untraced_from_src),
+        ("external_built",     "external_built",     p4_external_built),
+        ("external_prebuilt",  "external_prebuilt",  p4_external_prebuilt),
+        ("untraced_external",  "untraced_external",  p4_untraced_external),
+        ("system_binaries",    "system_binaries",    p4_system_binaries),
+    ]
+    for name, category, entries in bin_categories:
+        groups = group_by_disk(entries, 'bin')
+        for disk, disk_entries in sorted(groups.items()):
+            jt5(pass5_bin_dir, disk, name, category, disk_entries)
+        print(_ts() + "   Pass 5 bin {}: {} disks".format(name, len(groups)))
+
+    print(_ts() + "   Pass 5 done. Results: {}".format(pass5_dir))
 
 
 # =============================================================================
@@ -1611,14 +2012,20 @@ def main():
         metavar='NAME',
         help='Обработать только один указанный проект'
     )
+    parser.add_argument(
+        '--by-disk',
+        action='store_true',
+        default=False,
+        help='Pass 5: разбить избыточные файлы по дискам (pass5/src/ и pass5/bin/)'
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(BUILDOGRAPHY_DIR):
-        print("[ERROR] Buildography directory not found: {}".format(BUILDOGRAPHY_DIR))
+        print(_ts() + " Buildography directory not found: {}".format(BUILDOGRAPHY_DIR))
         sys.exit(1)
 
     if not os.path.isdir(RESULTS_DIR):
-        print("[ERROR] Results directory not found: {}".format(RESULTS_DIR))
+        print(_ts() + " Results directory not found: {}".format(RESULTS_DIR))
         sys.exit(1)
 
     compiler_basenames, interpreter_basenames = load_utilities_lists(UTILITIES_FILE)
@@ -1626,25 +2033,28 @@ def main():
     if args.single_project:
         project_dir = os.path.join(BUILDOGRAPHY_DIR, args.single_project)
         if not os.path.isdir(project_dir):
-            print("[ERROR] Project not found: {}".format(project_dir))
+            print(_ts() + " Project not found: {}".format(project_dir))
             sys.exit(1)
         projects = [args.single_project]
     else:
         projects = get_all_projects()
         if not projects:
-            print("[ERROR] No projects found in: {}".format(BUILDOGRAPHY_DIR))
+            print(_ts() + " No projects found in: {}".format(BUILDOGRAPHY_DIR))
             sys.exit(1)
 
-    print("[INFO] Projects to analyze: {}".format(len(projects)))
-    print("[INFO] Projects: {}".format(', '.join(projects)))
-    print("[INFO] UTILITIES_FILE: {}".format(UTILITIES_FILE))
-    print("[INFO] Compilers: {}, Interpreters: {}".format(len(compiler_basenames), len(interpreter_basenames)))
+    print(_ts() + " Projects to analyze: {}".format(len(projects)))
+    print(_ts() + " Projects: {}".format(', '.join(projects)))
+    print(_ts() + " UTILITIES_FILE: {}".format(UTILITIES_FILE))
+    print(_ts() + " Compilers: {}, Interpreters: {}".format(len(compiler_basenames), len(interpreter_basenames)))
 
     start_time = datetime.now()
     results = {}
 
     for project_name in projects:
-        results[project_name] = process_project(project_name, compiler_basenames, interpreter_basenames)
+        results[project_name] = process_project(
+            project_name, compiler_basenames, interpreter_basenames,
+            by_disk=args.by_disk
+        )
 
     elapsed = datetime.now() - start_time
     success_count = sum(1 for v in results.values() if v)
