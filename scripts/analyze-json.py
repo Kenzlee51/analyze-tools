@@ -110,7 +110,12 @@ analyze-json.py - Скрипт анализа избыточных файлов 
   {project}_external_built.json / .txt
       Бинарь собран (трассировщик видит), но зависимости не из src.json.
       Скомпилирован из внешних исходников. Подозрительно.
-      Поля: path, hash, external_deps
+      Поля: path, hash, external_deps, filtered_deps (опционально)
+        external_deps  — реально подозрительные внешние зависимости:
+                         path (путь в системе), hash, aliases (для versioned .so)
+        filtered_deps  — допустимые внешние зависимости (заголовки, системные
+                         библиотеки, pkgconfig и т.д.) с полем reason:
+                         'header' | 'allowed_system' | 'system_path'
 
   {project}_external_prebuilt.json / .txt
       Трассировщик видит бинарь как зависимость, но он не собирался —
@@ -1212,14 +1217,94 @@ def _log_memory(label):
 
 SYSTEM_PATH_PREFIXES = (
     '/usr/lib/', '/usr/lib64/', '/lib/', '/lib64/',
-    '/usr/include/', '/usr/local/lib/',
+    '/usr/include/', '/usr/local/lib/', '/usr/local/include/',
     '/etc/', '/proc/', '/sys/', '/dev/',
     '/usr/share/', '/var/',
+    # Cross-compiler sysroots
+    '/usr/arm-linux-gnueabi/', '/usr/arm-linux-gnueabihf/',
+    '/usr/aarch64-linux-gnu/', '/usr/mips-linux-gnu/',
+    '/usr/mipsel-linux-gnu/', '/usr/powerpc-linux-gnu/',
+    '/usr/powerpc64-linux-gnu/', '/usr/powerpc64le-linux-gnu/',
+    '/usr/riscv64-linux-gnu/', '/usr/s390x-linux-gnu/',
+    '/usr/x86_64-linux-gnu/', '/usr/i686-linux-gnu/',
+    '/usr/sparc64-linux-gnu/', '/usr/m68k-linux-gnu/',
+    '/usr/sh4-linux-gnu/', '/usr/hppa-linux-gnu/',
+    # Linker scripts
+    '/usr/lib/ldscripts/',
+    # pkgconfig / cmake
+    '/usr/lib/pkgconfig/', '/usr/share/pkgconfig/',
+    '/usr/lib64/pkgconfig/', '/usr/local/lib/pkgconfig/',
+    '/usr/share/cmake/', '/usr/lib/cmake/',
+    # Python / Perl stdlib
+    '/usr/lib/python', '/usr/lib/python3',
+    '/usr/lib/perl', '/usr/lib/perl5',
 )
+
+import re as _re
+# Паттерн versioned .so: libfoo.so, libfoo.so.1, libfoo.so.1.2, libfoo.so.1.2.3 и т.д.
+_SO_VERSIONED_RE = _re.compile(r'\.so(\.\d+)*$')
+
+
+def _so_base_name(filename):
+    """
+    Возвращает базовое имя .so без версионного суффикса.
+    Примеры:
+      libfoo.so.1.2.3  -> libfoo.so
+      libfoo.so.1      -> libfoo.so
+      libfoo.so        -> libfoo.so
+      libfoo.a         -> None (не .so)
+    """
+    m = _SO_VERSIONED_RE.search(filename)
+    if m is None:
+        return None
+    base = filename[:m.start()] + '.so'
+    return base
 
 
 def _is_system_path(path):
+    """Возвращает True если путь относится к системным файлам хоста сборки."""
     return any(path.startswith(pfx) for pfx in SYSTEM_PATH_PREFIXES)
+
+
+def _is_allowed_external_dep(dep_path):
+    """
+    Возвращает True если внешняя зависимость является допустимой и не подозрительной.
+    Такие зависимости исключаются из external_deps и не делают бинарь external_built.
+
+    Категории допустимых внешних зависимостей:
+      1. Любой .h / .hpp / .hxx — системные заголовочные файлы
+      2. Системные .so / .so.N / .a — библиотеки из системных путей
+      3. pkgconfig / cmake find-файлы из системных путей
+      4. Linker scripts из системных путей
+      5. Python/Perl stdlib из системных путей
+      6. Любой путь из SYSTEM_PATH_PREFIXES (общий фильтр)
+    """
+    if not dep_path:
+        return False
+
+    # 1. Любой заголовочный файл — всегда допустим
+    ext = os.path.splitext(dep_path)[1].lower()
+    if ext in ('.h', '.hpp', '.hxx', '.h++', '.hh'):
+        return True
+
+    # 2. Системный путь (общий фильтр — покрывает .so, .a, pkgconfig и т.д.)
+    if _is_system_path(dep_path):
+        return True
+
+    # 3. .so / versioned .so в любом пути — системные библиотеки линковщика
+    #    (иногда лежат не в /usr/lib, а в sysroot или build-tree)
+    basename = os.path.basename(dep_path)
+    if _SO_VERSIONED_RE.search(basename):
+        # Разрешаем только если путь выглядит системным или содержит /lib/
+        if ('/lib/' in dep_path or '/lib64/' in dep_path or
+                '/include/' in dep_path or dep_path.startswith('/usr/') or
+                dep_path.startswith('/lib')):
+            return True
+
+    # 4. Linker scripts без расширения в системных путях (уже покрыто п.2)
+    # 5. .pc / .cmake файлы в системных путях (уже покрыто п.2)
+
+    return False
 
 
 def _count_cmds(buildography_files):
@@ -1456,24 +1541,85 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir):
     total_bin = len(bin_entries)
     print(_ts() + "   Pass 4: classifying {} binaries...".format(total_bin))
 
-    def _get_ext_deps(hi, visited=None):
-        """Рекурсивно находит внешние листья в цепочке зависимостей hi."""
-        if visited is None:
-            visited = set()
-        if hi in visited:
-            return []
-        visited.add(hi)
-        ext = []
-        for (dep_hi, dep_path, dep_h_str) in full_out_to_deps.get(hi, []):
-            if _is_system_path(dep_path):
+    def _get_ext_deps(start_hi):
+        """
+        Итеративный BFS по графу зависимостей начиная с start_hi.
+        Рекурсия заменена на явную очередь — защита от циклов и глубоких цепочек.
+
+        Возвращает dict с двумя списками:
+          real     — реально подозрительные внешние зависимости
+          filtered — зависимости отфильтрованные как допустимые
+        """
+        from collections import deque
+
+        real     = []
+        filtered = []
+        visited  = set()
+        queue    = deque([start_hi])
+
+        while queue:
+            hi = queue.popleft()
+            if hi in visited:
                 continue
-            if dep_hi in src_hashes_int:
+            visited.add(hi)
+
+            for (dep_hi, dep_path, dep_h_str) in full_out_to_deps.get(hi, []):
+                if _is_system_path(dep_path):
+                    filtered.append({"hash": dep_h_str, "path": dep_path,
+                                      "reason": "system_path"})
+                    continue
+                if dep_hi in src_hashes_int:
+                    continue
+                if dep_hi in all_output_hashes:
+                    if dep_hi not in visited:
+                        queue.append(dep_hi)
+                else:
+                    if _is_allowed_external_dep(dep_path):
+                        reason = "header" if os.path.splitext(dep_path)[1].lower() in (
+                            ".h", ".hpp", ".hxx", ".h++", ".hh") else "allowed_system"
+                        filtered.append({"hash": dep_h_str, "path": dep_path,
+                                          "reason": reason})
+                    else:
+                        real.append({"hash": dep_h_str, "path": dep_path})
+
+        real = _merge_so_aliases(real)
+        return {"real": real, "filtered": filtered}
+
+
+    def _merge_so_aliases(deps):
+        """
+        Схлопывает versioned .so в одну запись с полем 'aliases'.
+        libfoo.so, libfoo.so.1, libfoo.so.1.2.3 → одна запись,
+        base_name=libfoo.so, aliases=[все найденные варианты путей].
+        """
+        # Группируем по директории + базовому имени .so
+        groups  = {}   # (dir, base_so_name) -> list of dep dicts
+        singles = []   # не .so — оставляем как есть
+
+        for dep in deps:
+            p    = dep.get('path', '')
+            bn   = os.path.basename(p)
+            base = _so_base_name(bn)
+            if base is None:
+                singles.append(dep)
                 continue
-            if dep_hi in all_output_hashes:
-                ext.extend(_get_ext_deps(dep_hi, visited))
+            key = (os.path.dirname(p), base)
+            groups.setdefault(key, []).append(dep)
+
+        merged = list(singles)
+        for (dirn, base_so), group in groups.items():
+            if len(group) == 1:
+                merged.append(group[0])
             else:
-                ext.append({'hash': dep_h_str, 'path': dep_path})
-        return ext
+                # Берём запись с минимальным суффиксом (базовый .so если есть)
+                primary = min(group, key=lambda d: len(d.get('path', '')))
+                aliases = sorted(set(d.get('path', '') for d in group))
+                entry = {'hash': primary.get('hash', ''),
+                         'path': os.path.join(dirn, base_so),
+                         'aliases': aliases}
+                merged.append(entry)
+
+        return merged
 
     for i, entry in enumerate(bin_entries):
         progress_log("Pass 4 classifying", i + 1, total_bin)
@@ -1508,16 +1654,21 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir):
             continue
 
         # Собран — проверяем цепочку зависимостей
-        ext_deps = _get_ext_deps(hi)
+        deps_result   = _get_ext_deps(hi)
+        real_ext_deps = deps_result['real']
+        filt_ext_deps = deps_result['filtered']
 
-        if ext_deps:
-            external_built.append({
-                'path': path,
-                'hash': h_str,
-                'external_deps': ext_deps
-            })
+        if real_ext_deps:
+            entry = {
+                'path':          path,
+                'hash':          h_str,
+                'external_deps': real_ext_deps,
+            }
+            if filt_ext_deps:
+                entry['filtered_deps'] = filt_ext_deps
+            external_built.append(entry)
         else:
-            # Все зависимости из src.json — проверяем есть ли сам в src.json
+            # Все подозрительные зависимости отфильтрованы — бинарь чистый
             if h_str in src_hashes:
                 binaries_from_src.append({'path': path, 'hash': h_str})
             else:
