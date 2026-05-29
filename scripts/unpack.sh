@@ -1,13 +1,15 @@
 #!/bin/bash
 #
 # =============================================================================
-# unpack.sh — Скрипт рекурсивной распаковки архивов
+# unpack.sh — Скрипт рекурсивной распаковки архивов + автонормализация имён
 # =============================================================================
 #
 # ОПИСАНИЕ:
 #   Рекурсивно распаковывает все архивы в директории src/PROJ
 #   в директорию unpacked/PROJ. Поддерживает вложенные архивы любой глубины.
 #   Каждый архив распаковывается в директорию АРХИВ_dir рядом с ним.
+#   ** Перед началом работы автоматически исправляет имена папок проектов,
+#      если в них обнаружены кракозябры или кириллица (скрипт 1). **
 #
 # ИСПОЛЬЗОВАНИЕ:
 #   ./unpack.sh [OPTIONS]
@@ -37,7 +39,8 @@
 # ОЖИДАЕМАЯ СТРУКТУРА:
 #   BASE_DIR/
 #   ├── scripts/
-#   │   └── unpack.sh
+#   │   ├── unpack.sh
+#   │   └── normalize_names.py   ← скрипт 1 (переименование папок)
 #   ├── src/
 #   │   ├── PROJ1/          ← исходные архивы
 #   │   └── PROJ2/
@@ -51,7 +54,7 @@
 #
 # ЗАВИСИМОСТИ:
 #   Обязательные : bash 4+, file, find, stat, sort, grep, awk, date, bc
-#                  tar, gzip, bzip2, xz, unzip, p7zip-full
+#                  tar, gzip, bzip2, xz, unzip, p7zip-full, python3
 #   Опциональные : unrar, zstd, lz4, rpm2cpio+cpio, dpkg-deb,
 #                  cabextract, msitools, squashfs-tools, libarchive-tools
 #
@@ -96,6 +99,7 @@ declare -A REQUIRED_TOOLS=(
     ["unzip"]="unzip"
     ["7z"]="p7zip-full"
     ["bc"]="bc"
+    ["python3"]="python3"   # Нужен для нормализации имён папок
 )
 
 # Опциональные утилиты: утилита → пакет
@@ -169,6 +173,36 @@ check_dependencies() {
         return 1
     fi
     return 0
+}
+
+# =============================================================================
+# === Интеграция скрипта 1: автоисправление имён папок проектов ===
+# =============================================================================
+
+check_and_fix_project_names() {
+    local src_dir="$1"
+
+    echo "[FIX] Рекурсивное исправление сломанной кириллицы в $src_dir ..."
+    if [[ -f "$FIX_CYRILLIC_SCRIPT" ]]; then
+        python3 "$FIX_CYRILLIC_SCRIPT" "$src_dir" || {
+            echo "[ERROR] Ошибка при исправлении внутренней кириллицы"
+            return 1
+        }
+        echo "[FIX] Внутренняя кириллица исправлена."
+    else
+        echo "[WARN] Скрипт fix_cyrillic.py не найден: $FIX_CYRILLIC_SCRIPT"
+    fi
+
+    echo "[FIX] Транслитерация имён проектов..."
+    if [[ -f "$NORMALIZE_SCRIPT" ]]; then
+        python3 "$NORMALIZE_SCRIPT" || {
+            echo "[ERROR] Ошибка нормализации имён проектов"
+            return 1
+        }
+        echo "[FIX] Транслитерация завершена."
+    else
+        echo "[WARN] Скрипт normalize.py не найден: $NORMALIZE_SCRIPT"
+    fi
 }
 
 # =============================================================================
@@ -313,11 +347,16 @@ UNPACKED_DIR="$BASE_DIR/unpacked"
 LOG_DIR="$BASE_DIR/logs/unpack"
 ERROR_LOG="$LOG_DIR/errors_unpack.txt"
 SKIPPED_LOG="$LOG_DIR/skipped_archives.txt"
+NORMALIZE_SCRIPT="$BASE_DIR/lib/normalize.py"          # транслитерация имён проектов
+FIX_CYRILLIC_SCRIPT="$BASE_DIR/lib/fix_cyrillic.py"   # починка внутренней кириллицы
 
 if [[ ! -d "$PROJECTS_DIR" ]]; then
     echo "[ERROR] Projects directory not found: $PROJECTS_DIR"
     exit 1
 fi
+
+# === АВТОИСПРАВЛЕНИЕ ИМЁН ПРОЕКТОВ (скрипт 1) ===
+check_and_fix_project_names "$PROJECTS_DIR"
 
 mkdir -p "$UNPACKED_DIR"
 mkdir -p "$LOG_DIR"
