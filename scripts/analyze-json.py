@@ -279,39 +279,51 @@ PYTHON_EXTENSIONS = {'.py', '.pyx', '.pxd', '.pxi'}
 # ЗАГРУЗКА СПИСКОВ ИЗ UTILITIES.YAML
 # =============================================================================
 def load_utilities_lists(utilities_path):
-    """Загружает множества компиляторов и интерпретаторов."""
+    """Загружает множества компиляторов, линкеров и интерпретаторов."""
     compilers = set()
+    linkers = set()
     interpreters = set()
     if not os.path.exists(utilities_path):
         print(_ts() + " utilities.yaml not found: {}".format(utilities_path))
-        return compilers, interpreters
+        return compilers, linkers, interpreters
     try:
         import yaml
         with open(utilities_path, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
         utilities = data.get('utilities', {})
         compilers = set(utilities.get('compilers', []))
+        linkers = set(utilities.get('linkers', []))
         interpreters = set(utilities.get('interpreters', []))
-        print(_ts() + " Loaded {} compilers, {} interpreters".format(len(compilers), len(interpreters)))
-        return compilers, interpreters
+        print(_ts() + " Loaded {} compilers, {} linkers, {} interpreters".format(
+            len(compilers), len(linkers), len(interpreters)))
+        return compilers, linkers, interpreters
     except ImportError:
         # fallback: простой парсер
         try:
             compilers = []
+            linkers = []
             interpreters = []
             with open(utilities_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
             in_compilers = False
+            in_linkers = False
             in_interpreters = False
             for line in lines:
                 stripped = line.rstrip()
                 if stripped.strip() == 'compilers:':
                     in_compilers = True
+                    in_linkers = False
+                    in_interpreters = False
+                    continue
+                if stripped.strip() == 'linkers:':
+                    in_linkers = True
+                    in_compilers = False
                     in_interpreters = False
                     continue
                 if stripped.strip() == 'interpreters:':
                     in_interpreters = True
                     in_compilers = False
+                    in_linkers = False
                     continue
                 if in_compilers:
                     if stripped and not stripped.startswith(' ') and not stripped.startswith('\t'):
@@ -320,6 +332,13 @@ def load_utilities_lists(utilities_path):
                         val = stripped.strip()
                         if val.startswith('- '):
                             compilers.append(val[2:].strip())
+                if in_linkers:
+                    if stripped and not stripped.startswith(' ') and not stripped.startswith('\t'):
+                        in_linkers = False
+                    else:
+                        val = stripped.strip()
+                        if val.startswith('- '):
+                            linkers.append(val[2:].strip())
                 if in_interpreters:
                     if stripped and not stripped.startswith(' ') and not stripped.startswith('\t'):
                         in_interpreters = False
@@ -327,8 +346,9 @@ def load_utilities_lists(utilities_path):
                         val = stripped.strip()
                         if val.startswith('- '):
                             interpreters.append(val[2:].strip())
-            print(_ts() + " Loaded {} compilers, {} interpreters (fallback)".format(len(compilers), len(interpreters)))
-            return set(compilers), set(interpreters)
+            print(_ts() + " Loaded {} compilers, {} linkers, {} interpreters (fallback)".format(
+                len(compilers), len(linkers), len(interpreters)))
+            return set(compilers), set(linkers), set(interpreters)
         except Exception as e:
             print(_ts() + " Failed to parse utilities.yaml: {}".format(e))
             return set(), set()
@@ -1316,12 +1336,17 @@ def _count_cmds(buildography_files):
     return total
 
 
-def _scan_pass(buildography_files, target_hashes, total_cmds, label):
+def _scan_pass(buildography_files, target_hashes, total_cmds, label,
+               compiler_linker_basenames=None):
     """
     Один проход по buildography.
     Для команд чьи выходы пересекаются с target_hashes —
     собираем их зависимости.
-    
+
+    compiler_linker_basenames — множество имён компиляторов и линкеров из utilities.yaml.
+    Если задано, в out_to_deps попадают только зависимости команд-компиляторов/линкеров.
+    Зависимости команд типа cp/install/cat/make игнорируются как неподозрительные.
+
     Возвращает:
       out_to_deps : dict {out_hash_int -> [(dep_hash_int, dep_path, dep_hash_str)]}
       output_hashes_seen : set всех output хешей встреченных в этом проходе
@@ -1330,6 +1355,9 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label):
     out_to_deps        = {}
     output_hashes_seen = set()
     dep_hashes_seen    = set()
+
+    # Для раннего выхода: отслеживаем сколько целей из frontier уже найдено
+    targets_remaining = set(target_hashes)
 
     processed = 0
     for file_path in buildography_files:
@@ -1358,6 +1386,23 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label):
                             output_hashes_seen.add(hi)
                             out_ints.add(hi)
 
+            # Индексируем если выход в target_hashes
+            relevant = out_ints & target_hashes
+            if not relevant:
+                continue
+
+            # Отмечаем найденные цели
+            targets_remaining -= relevant
+
+            # Проверяем является ли команда компилятором/линкером
+            # Если список задан и команда не компилятор/линкер — зависимости не собираем
+            if compiler_linker_basenames is not None:
+                cmd_list = cmd.get('command', [])
+                cmd_tool = os.path.basename(cmd_list[0]) if cmd_list else ''
+                is_compiler_or_linker = cmd_tool in compiler_linker_basenames
+            else:
+                is_compiler_or_linker = True  # фильтр не задан — берём все
+
             # Зависимости
             deps_raw = cmd.get('dependencies', {})
             dep_list = []
@@ -1378,12 +1423,18 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label):
                             dep_hashes_seen.add(hi)
                             dep_list.append((hi, path, h))
 
-            # Индексируем если выход в target_hashes
-            relevant = out_ints & target_hashes
-            if relevant and dep_list:
+            # Индексируем зависимости только для компиляторов/линкеров
+            if dep_list and is_compiler_or_linker:
                 for out_hi in relevant:
                     existing = out_to_deps.get(out_hi, [])
                     out_to_deps[out_hi] = existing + dep_list
+
+        # Ранний выход: все цели frontier найдены — дальше читать незачем
+        if not targets_remaining:
+            print(_ts() + "   {}: early exit at {}/{} cmds — all {} targets found".format(
+                label, processed, total_cmds, len(target_hashes)))
+            del data, cmds
+            break
 
         del data, cmds
         gc.collect()
@@ -1391,12 +1442,26 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label):
     return out_to_deps, output_hashes_seen, dep_hashes_seen
 
 
-def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir):
+def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
+                  compiler_basenames=None, linker_basenames=None):
     """
     Проверяет происхождение бинарей дистрибутива.
     Итеративно расширяет граф только для нужных цепочек.
+
+    compiler_basenames, linker_basenames — множества из utilities.yaml.
+    Если заданы, внешние зависимости учитываются только для команд компиляторов/линкеров.
+    Зависимости cp/install/make/cat и т.д. игнорируются.
     """
     _log_memory("Pass 4 start")
+
+    # Объединяем компиляторы и линкеры в одно множество для фильтра
+    if compiler_basenames or linker_basenames:
+        compiler_linker_basenames = set(compiler_basenames or set()) | set(linker_basenames or set())
+        print(_ts() + "   Pass 4: compiler+linker filter: {} tools".format(
+            len(compiler_linker_basenames)))
+    else:
+        compiler_linker_basenames = None
+        print(_ts() + "   Pass 4: compiler+linker filter: disabled")
 
     # Конвертируем src_hashes в int
     src_hashes_int = set()
@@ -1445,7 +1510,8 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir):
 
         out_to_deps, output_hashes_seen, dep_hashes_seen = _scan_pass(
             buildography_files, frontier, total_cmds,
-            "Pass 4 iter{}".format(iteration)
+            "Pass 4 iter{}".format(iteration),
+            compiler_linker_basenames=compiler_linker_basenames
         )
 
         # Объединяем с общим графом
@@ -1726,7 +1792,7 @@ def write_pass4_txt(output_path, category_label, entries):
 # =============================================================================
 # ОБРАБОТКА ПРОЕКТА
 # =============================================================================
-def process_project(project_name, compiler_basenames, interpreter_basenames, by_disk=False):
+def process_project(project_name, compiler_basenames, linker_basenames, interpreter_basenames, by_disk=False):
     print("\n" + "=" * 50)
     print("Processing project: {}".format(project_name))
     print("=" * 50)
@@ -1916,7 +1982,9 @@ def process_project(project_name, compiler_basenames, interpreter_basenames, by_
         p4_compiled_from_src, p4_binaries_from_src, p4_untraced_from_src, \
         p4_external_built, p4_external_prebuilt, p4_untraced_external, \
         p4_system_binaries = analyze_pass4(
-            bin_entries, src_hashes, buildography_files, script_dir
+            bin_entries, src_hashes, buildography_files, script_dir,
+            compiler_basenames=compiler_basenames,
+            linker_basenames=linker_basenames
         )
         del bin_entries, src_hashes
         gc.collect()
@@ -2179,7 +2247,7 @@ def main():
         print(_ts() + " Results directory not found: {}".format(RESULTS_DIR))
         sys.exit(1)
 
-    compiler_basenames, interpreter_basenames = load_utilities_lists(UTILITIES_FILE)
+    compiler_basenames, linker_basenames, interpreter_basenames = load_utilities_lists(UTILITIES_FILE)
 
     if args.single_project:
         project_dir = os.path.join(BUILDOGRAPHY_DIR, args.single_project)
@@ -2196,14 +2264,14 @@ def main():
     print(_ts() + " Projects to analyze: {}".format(len(projects)))
     print(_ts() + " Projects: {}".format(', '.join(projects)))
     print(_ts() + " UTILITIES_FILE: {}".format(UTILITIES_FILE))
-    print(_ts() + " Compilers: {}, Interpreters: {}".format(len(compiler_basenames), len(interpreter_basenames)))
+    print(_ts() + " Compilers: {}, Linkers: {}, Interpreters: {}".format(len(compiler_basenames), len(linker_basenames), len(interpreter_basenames)))
 
     start_time = datetime.now()
     results = {}
 
     for project_name in projects:
         results[project_name] = process_project(
-            project_name, compiler_basenames, interpreter_basenames,
+            project_name, compiler_basenames, linker_basenames, interpreter_basenames,
             by_disk=args.by_disk
         )
 
