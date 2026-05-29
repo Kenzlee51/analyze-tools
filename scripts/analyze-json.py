@@ -1,135 +1,175 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-analyze-json.py - Скрипт анализа избыточных файлов исходных текстов
+analyze-json.py — Анализ происхождения файлов сборки
 =============================================================================
 
 ОПИСАНИЕ:
-    Сравнивает JSON сигнатур исходных текстов с JSON buildography и
-    распределяет файлы по категориям. Добавлена поддержка Python-файлов,
-    которые были выполнены (interpreted_executed) с выводом команд запуска.
-    Проход 4 проверяет происхождение файлов дистрибутива.
+    Скрипт сравнивает хеши исходных файлов проекта (src.json) с данными
+    трассировщика сборки (buildography) и распределяет файлы по категориям:
+    какие исходники реально используются, какие избыточны, откуда пришли
+    бинари в дистрибутив.
+
+    Анализ выполняется за 4 прохода:
+      Проход 1 — сравнение хешей исходников с buildography
+      Проход 2 — анализ компилируемых файлов (.c, .cpp, .rs, .go и др.)
+      Проход 3 — анализ интерпретируемых файлов (.py, .sh, .js и др.)
+      Проход 4 — проверка происхождения бинарей в дистрибутиве
+
+    Требуемые входные данные (готовятся отдельными скриптами):
+      results/{project}/sources/{project}_src.json   — хеши исходников
+      results/{project}/sources/{project}_bin.json   — хеши файлов дистрибутива
+      results/{project}/ext/binaries_in_bin.txt      — список ELF/PE бинарей
+      buildography/builds/{project}/*.json           — данные трассировщика
+      lib/utilities.yaml                             — списки компиляторов и интерпретаторов
+
+    ВАЖНО: если трассировщик не охватывает фазу компиляции (например,
+    компиляция происходит внутри dpkg-buildpackage), бинари собранные
+    из ваших исходников попадут в untraced_from_src — это нормально
+    и не означает подозрительного происхождения.
 
 ИСПОЛЬЗОВАНИЕ:
     python3 analyze-json.py [OPTIONS]
 
 ОПЦИИ:
-    --single-project NAME   Обработать только один указанный проект
-    -h, --help              Показать справку
+    -p, --single-project NAME   Обработать только один указанный проект.
+                                Без этого флага обрабатываются все проекты
+                                из buildography/builds/.
+
+    -d, --by-disk               Включить Проход 5: разбить результаты
+                                по дискам (pass5/src/ и pass5/bin/).
+                                Полезно для проектов с несколькими дисками.
+
+    -h, --help                  Показать эту справку и выйти.
 
 ПРИМЕРЫ:
+    # Обработать все проекты
     python3 analyze-json.py
-    python3 analyze-json.py --single-project proj1
+
+    # Обработать один проект
+    python3 analyze-json.py -p KTDL.00554-01
+    python3 analyze-json.py --single-project KTDL.00554-01
+
+    # Обработать один проект с разбивкой по дискам
+    python3 analyze-json.py -p KTDL.00554-01 -d
+    python3 analyze-json.py --single-project KTDL.00554-01 --by-disk
+
+НАСТРОЙКА ПУТЕЙ:
+    Все пути настраиваются в начале скрипта (раздел НАСТРАИВАЕМЫЕ ПУТИ):
+      BASE_DIR         — корневая папка проекта
+      BUILDOGRAPHY_DIR — папка с данными трассировщика
+      RESULTS_DIR      — папка для результатов
+      UTILITIES_FILE   — путь к utilities.yaml
 
 =============================================================================
-РЕЗУЛЬТИРУЮЩИЕ ФАЙЛЫ (results/{project}/izb/)
+РЕЗУЛЬТИРУЮЩИЕ ФАЙЛЫ (results/{project}/izb/tryN/)
 =============================================================================
 
-Файлы разбиты по папкам по проходам:
-  results/{project}/izb/pass1/  — анализ хешей исходников
-  results/{project}/izb/pass2/  — компилируемые языки
-  results/{project}/izb/pass3/  — интерпретируемые языки
-  results/{project}/izb/pass4/  — происхождение бинарей дистрибутива
+Каждый запуск создаёт новую папку tryN (try1, try2, ...) чтобы не
+перезаписывать предыдущие результаты. Файлы разбиты по проходам.
 
-  --- Проход 1 (pass1/): анализ хешей исходников ---
+  --- Проход 1 (pass1/): сравнение хешей исходников ---
+  Каждый исходный файл из src.json проверяется по хешу в buildography.
 
-  {project}_direct.json
-      Исходные файлы, чей хеш напрямую найден в buildography.
-      Поля: path, hash
+  {project}_direct.json / .txt
+      Исходные файлы, чей хеш напрямую найден в buildography — файл
+      использовался в сборке. Поля: path, hash
 
-  {project}_parent.json
-      Исходные файлы, чей хеш не найден напрямую, но найден хеш
-      родительского архива. Поля: path, hash, parent_hash
+  {project}_parent.json / .txt
+      Файлы, чей хеш не найден напрямую, но найден хеш родительского
+      архива (.tar.gz и т.д.) — файл попал в сборку через архив.
+      Поля: path, hash, parent_hash
 
-  {project}_redundant.json
-      Исходные файлы, не найденные ни напрямую, ни через архив.
-      Включает файлы из not_compiled (перемещаются сюда в Проходе 2).
-      Поля: path, hash
+  {project}_redundant-by-hash.json / .txt
+      Файлы не найденные ни напрямую ни через архив — потенциально
+      избыточные исходники. Поля: path, hash
 
   --- Проход 2 (pass2/): компилируемые языки ---
+  Из redundant выделяются компилируемые файлы и проверяется были ли
+  они на входе у компиляторов (gcc, g++, rustc и др. из utilities.yaml).
 
-  {project}_not_compiled.json
-      Подмножество redundant: файлы компилируемых языков (.c, .cpp, .rs, .go и др.),
-      которые компилировались, но результат компиляции не попал в дистрибутив.
+  {project}_not_compiled.json / .txt
+      Компилируемые файлы (.c, .cpp, .rs, .go и др.) которые не попали
+      в дистрибутив — компилировались, но результат не нужен.
       Поля: path, hash, source (direct|parent)
 
-  {project}_redundant.txt
-      Объединение redundant.json + not_compiled.json (без дублей).
-      Формат: путь<TAB>хеш. Заголовок содержит алгоритм хеширования.
-
   --- Проход 3 (pass3/): интерпретируемые языки ---
+  Анализируются .py, .sh, .js и другие интерпретируемые файлы.
 
-  {project}_interpreted_executed.json
-      Python-файлы, которые были входными для команд интерпретаторов.
-      Поля: path, hash, commands (список полных команд запуска)
+  {project}_executed.json / .txt
+      Файлы которые запускались интерпретатором в ходе сборки
+      (python3 script.py, bash build.sh и т.д.).
+      Поля: path, hash, commands (список команд запуска)
 
-  {project}_interpreted_executed.txt
-      Текстовый вариант interpreted_executed.json (без команд).
-      Формат: путь<TAB>хеш
+  {project}_compiled_used.json / .txt
+      Интерпретируемые файлы результат компиляции которых (.pyc и т.д.)
+      попал в дистрибутив. Поля: path, hash
 
-  {project}_interpreted_compiled_used.json
-      Интерпретируемые файлы сгенерированные интерпретатором или входные
-      файлы чьи выходы попали в дистрибутив. Результат компиляции — в bin.
-      Поля: path, hash  (TXT не создаётся)
+  {project}_compiled_unused.json / .txt
+      Интерпретируемые файлы которые компилировались, но результат
+      не попал в дистрибутив — избыточные. Поля: path, hash
 
-  {project}_interpreted_compiled_unused.json
-      Интерпретируемые файлы сгенерированные интерпретатором, но результат
-      их компиляции НЕ попал в дистрибутив — избыточные.
-      Поля: path, hash
-
-  {project}_interpreted_compiled_unused.txt
-      Текстовый вариант interpreted_compiled_unused.json.
-      Формат: путь<TAB>хеш
-
-  {project}_interpreted_copied.json / .txt
-      Интерпретируемые файлы присутствующие в дистрибутиве напрямую,
-      но не вошедшие в executed/compiled_used. Поля: path, hash
+  {project}_copied.json / .txt
+      Интерпретируемые файлы присутствующие в дистрибутиве напрямую
+      (скопированы как есть). Поля: path, hash
 
   {project}_not_used.json / .txt
-      Интерпретируемые файлы которые не используются нигде —
-      не запускались, не компилировались, не в дистрибутиве.
+      Интерпретируемые файлы которые нигде не используются —
+      не запускались, не компилировались, не скопированы в дистрибутив.
       Поля: path, hash
 
-  --- Проход 4 (pass4/): проверка происхождения бинарей дистрибутива ---
-  Анализируются только реальные бинари из binaries_in_bin.txt.
-  Системные пути в дистрибутиве выделяются отдельно.
+  --- Проход 4 (pass4/): происхождение бинарей дистрибутива ---
+  Для каждого ELF/PE бинаря из binaries_in_bin.txt определяется
+  откуда он взялся. Категории упорядочены от "чистых" к "подозрительным".
 
   {project}_compiled_from_src.json / .txt
-      Бинарь собран в этой сборке, все исходники подтверждены в src.json.
-      Чисто. Поля: path, hash
+      Бинарь собран из исходников проекта: трассировщик видит цепочку
+      компиляции и все зависимости из src.json. Чисто.
+      Поля: path, hash, container (если внутри пакета)
 
   {project}_binaries_from_src.json / .txt
-      Хеш бинаря найден в src.json — бинарь лежал в исходниках и скопирован
-      в дистрибутив. Учтён, но факт бинаря в исходниках требует внимания.
-      Поля: path, hash
+      Хеш бинаря найден в src.json — бинарь хранился прямо в исходниках
+      и скопирован в дистрибутив. Требует внимания (бинарь в репозитории).
+      Поля: path, hash, container
 
   {project}_untraced_from_src.json / .txt
-      Хеш в src.json, но трассировщик не видит попадание в дистрибутив.
-      Возможно скопирован напрямую минуя трассировщик. Поля: path, hash
+      Хеш в src.json, но трассировщик не видит как он попал в дистрибутив.
+      Типично когда компиляция происходит внутри dpkg-buildpackage и
+      трассировщик не охватывает эту фазу — тогда это ваши собственные
+      скомпилированные бинари и подозрений нет.
+      Поля: path, hash, container
 
   {project}_external_built.json / .txt
-      Бинарь собран (трассировщик видит), но зависимости не из src.json.
-      Скомпилирован из внешних исходников. Подозрительно.
-      Поля: path, hash, external_deps, filtered_deps (опционально)
-        external_deps  — реально подозрительные внешние зависимости:
-                         path (путь в системе), hash, aliases (для versioned .so)
-        filtered_deps  — допустимые внешние зависимости (заголовки, системные
-                         библиотеки, pkgconfig и т.д.) с полем reason:
-                         'header' | 'allowed_system' | 'system_path'
+      Бинарь собран (трассировщик видит компиляцию), но зависимости
+      не из src.json — скомпилирован из внешних исходников. Подозрительно.
+      Поля: path, hash, container, external_deps, filtered_deps (опц.)
+        external_deps  — подозрительные внешние зависимости:
+                         path, hash, aliases (для versioned .so)
+        filtered_deps  — допустимые зависимости (системные заголовки,
+                         .so из /usr/lib и т.д.) с полем reason
 
   {project}_external_prebuilt.json / .txt
-      Трассировщик видит бинарь как зависимость, но он не собирался —
-      пришёл готовым извне (apt download, wget, pip). Подозрительно.
-      Поля: path, hash
+      Трассировщик видит бинарь как зависимость чьей-то команды, но
+      сам он не собирался — пришёл готовым (apt, wget, pip). Подозрительно.
+      Поля: path, hash, container
+
+  {project}_external_package_content.json / .txt
+      Файлы внутри внешних пакетов (.deb, pip whl, node_modules) источник
+      которых известен трассировщику (apt download, pip install и т.д.).
+      Не подозрительно — это штатные внешние зависимости.
+      JSON: сгруппировано по пакетам: package_type, container, source,
+            command (apt download / pip install / npm install), files.
+      TXT: path<TAB>hash<TAB>package_type<TAB>container<TAB>command
 
   {project}_untraced_external.json / .txt
-      Не в src.json, трассировщик не видит. Полностью неизвестное
-      происхождение. Очень подозрительно. Поля: path, hash
+      Не в src.json, трассировщик не видит, не внутри известного пакета.
+      Полностью неизвестное происхождение. Очень подозрительно.
+      Поля: path, hash, container (если определён)
 
   {project}_system_binaries.json / .txt
-      Бинарь находится в системном пути дистрибутива (usr/lib, lib и т.д.).
-      Анализируется отдельно — системные библиотеки поставляемые дистрибутивом.
-      Поля: path, hash
+      Бинарь в системном пути дистрибутива (/usr/lib/, /lib/ и т.д.) —
+      системные библиотеки поставляемые дистрибутивом, не проектом.
+      Поля: path, hash, container
 
 =============================================================================
 """
@@ -1442,6 +1482,286 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label,
     return out_to_deps, output_hashes_seen, dep_hashes_seen
 
 
+# =============================================================================
+# ОПРЕДЕЛЕНИЕ КОНТЕЙНЕРОВ ВНЕШНИХ ПАКЕТОВ (deb / pip / npm)
+# =============================================================================
+
+# Инструменты → читаемая команда
+_PKG_TOOL_TO_CMD = {
+    'apt':       'apt download',
+    'apt-get':   'apt-get install',
+    'apt-cache': 'apt-cache',
+    'dpkg':      'dpkg -i',
+    'dpkg-deb':  'dpkg-deb',
+    'pip':       'pip install',
+    'pip2':      'pip install',
+    'pip3':      'pip install',
+    'npm':       'npm install',
+    'yarn':      'yarn add',
+    'wget':      'wget',
+    'curl':      'curl',
+}
+for _v in ['pip3.5','pip3.6','pip3.7','pip3.8','pip3.9','pip3.10','pip3.11']:
+    _PKG_TOOL_TO_CMD[_v] = 'pip install'
+
+
+def _detect_package_type(path):
+    """
+    Определяет тип внешнего пакета по пути файла.
+    Возвращает (package_type, container) или (None, None).
+
+    Типы:
+      'deb'  — файл внутри .deb_dir/ или .deb/
+      'pip'  — файл внутри venv/site-packages/ или .whl_dir/
+      'npm'  — файл внутри node_modules/
+    """
+    parts = path.replace('\\', '/').split('/')
+
+    # --- deb ---
+    for i, part in enumerate(parts):
+        name = part[:-4] if part.endswith('_dir') else part
+        if name.lower().endswith('.deb') or name.lower().endswith('.rpm'):
+            return 'deb', name
+
+    # --- pip: venv/site-packages ---
+    for i, part in enumerate(parts):
+        if part in ('site-packages', 'dist-packages'):
+            # container = имя пакета (следующий компонент)
+            pkg = parts[i + 1] if i + 1 < len(parts) else 'unknown'
+            # убираем __pycache__ и подпапки — берём только имя пакета
+            if pkg.startswith('__'):
+                pkg = parts[i - 1] if i > 0 else 'unknown'
+            return 'pip', pkg
+
+    # --- pip: .whl_dir ---
+    for part in parts:
+        name = part[:-4] if part.endswith('_dir') else part
+        if name.lower().endswith('.whl'):
+            return 'pip', name
+
+    # --- npm: node_modules ---
+    for i, part in enumerate(parts):
+        if part == 'node_modules':
+            pkg = parts[i + 1] if i + 1 < len(parts) else 'unknown'
+            # scoped packages: @scope/name
+            if pkg.startswith('@') and i + 2 < len(parts):
+                pkg = pkg + '/' + parts[i + 2]
+            return 'npm', pkg
+
+    return None, None
+
+
+def build_external_package_index(buildography_files):
+    """
+    Строит индекс: container_name -> {package_type, source, command}
+    Ищет в buildography команды apt/pip/npm у которых в output есть
+    .deb/.whl файлы — это и есть источник пакета.
+
+    Возвращает dict: container_name (str) -> dict с полями:
+      package_type, source (путь откуда скачан), command (читаемая строка)
+    """
+    import re as _re2
+    index = {}  # container_name -> {package_type, source, command}
+
+    for file_path in buildography_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f, strict=False)
+        except Exception:
+            continue
+
+        for cmd in data.get('component_commands', []):
+            cmd_list = cmd.get('command', [])
+            if not cmd_list:
+                continue
+            tool = os.path.basename(str(cmd_list[0]))
+            readable_cmd = _PKG_TOOL_TO_CMD.get(tool, tool)
+
+            # Смотрим зависимости — там исходный путь пакета (откуда скачан)
+            deps = cmd.get('dependencies', {})
+            dep_paths = []
+            if isinstance(deps, dict):
+                dep_paths = list(deps.keys())
+            elif isinstance(deps, list):
+                dep_paths = [
+                    d.get('path', '') if isinstance(d, dict) else str(d)
+                    for d in deps
+                ]
+
+            # Смотрим выходы — там конечный путь пакета
+            outputs = cmd.get('output', {})
+            out_paths = []
+            if isinstance(outputs, dict):
+                out_paths = list(outputs.keys())
+            elif isinstance(outputs, list):
+                out_paths = [
+                    o.get('path', '') if isinstance(o, dict) else str(o)
+                    for o in outputs
+                ]
+
+            # Индексируем .deb/.rpm/.whl из выходов
+            for out_path in out_paths:
+                bn = os.path.basename(out_path)
+                bn_lower = bn.lower()
+                if (bn_lower.endswith('.deb') or bn_lower.endswith('.rpm') or
+                        bn_lower.endswith('.whl')):
+                    # Ищем источник в зависимостях (тот же basename)
+                    source = ''
+                    for dep in dep_paths:
+                        if os.path.basename(dep).lower() == bn_lower:
+                            source = dep
+                            break
+                    if not source and dep_paths:
+                        # Берём первую зависимость с похожим именем
+                        for dep in dep_paths:
+                            if bn_lower.split('_')[0] in dep.lower():
+                                source = dep
+                                break
+
+                    if bn_lower.endswith('.deb') or bn_lower.endswith('.rpm'):
+                        pkg_type = 'deb'
+                    else:
+                        pkg_type = 'pip'
+
+                    if bn not in index:
+                        index[bn] = {
+                            'package_type': pkg_type,
+                            'source':       source or out_path,
+                            'command':      readable_cmd,
+                        }
+
+        del data
+
+    return index
+
+
+def classify_external_package_content(untraced_external, buildography_files):
+    """
+    Из списка untraced_external выделяет файлы внутри известных пакетов
+    (deb/pip/npm) в отдельную категорию external_package_content.
+
+    Возвращает:
+      pkg_content   — list записей для external_package_content
+      remaining     — list записей которые остаются в untraced_external
+    """
+    print(_ts() + "   Building external package index from buildography...")
+    pkg_index = build_external_package_index(buildography_files)
+    print(_ts() + "   Package index: {} known containers".format(len(pkg_index)))
+
+    pkg_content = []
+    remaining   = []
+
+    for entry in untraced_external:
+        path = entry.get('path', '')
+        pkg_type, container = _detect_package_type(path)
+
+        if pkg_type is None:
+            remaining.append(entry)
+            continue
+
+        # Ищем источник в индексе
+        # Для deb: container это имя .deb файла — ищем напрямую
+        # Для pip/npm: container это имя пакета — ищем по подстроке
+        pkg_info = pkg_index.get(container, {})
+        if not pkg_info and pkg_type == 'pip':
+            # Для pip пакетов ищем .whl в индексе по имени пакета
+            for key, val in pkg_index.items():
+                if container.lower() in key.lower() and val['package_type'] == 'pip':
+                    pkg_info = val
+                    break
+
+        new_entry = dict(entry)
+        new_entry['package_type'] = pkg_type
+        new_entry['container']    = container
+        if pkg_info:
+            new_entry['source']  = pkg_info.get('source', '')
+            new_entry['command'] = pkg_info.get('command', pkg_type)
+        else:
+            new_entry['source']  = ''
+            new_entry['command'] = pkg_type
+        pkg_content.append(new_entry)
+
+    return pkg_content, remaining
+
+
+def write_external_package_content_json(output_path, entries):
+    """
+    Записывает external_package_content.json сгруппированный по пакетам.
+    """
+    # Группируем по (package_type, container)
+    groups = {}
+    for e in entries:
+        key = (e.get('package_type', ''), e.get('container', ''))
+        groups.setdefault(key, []).append(e)
+
+    packages = []
+    for (pkg_type, container), group in sorted(groups.items()):
+        # Берём source и command из первой записи
+        source  = group[0].get('source', '')
+        command = group[0].get('command', pkg_type)
+        files   = [{'path': e.get('path',''), 'hash': e.get('hash','')}
+                   for e in group]
+        packages.append({
+            'package_type': pkg_type,
+            'container':    container,
+            'source':       source,
+            'command':      command,
+            'files_count':  len(files),
+            'files':        files,
+        })
+
+    result = {
+        'category':       'external_package_content',
+        'generated':      datetime.now().isoformat(),
+        'total_files':    len(entries),
+        'total_packages': len(packages),
+        'packages':       packages,
+    }
+
+    versioned_path = get_versioned_filepath(output_path)
+    if versioned_path != output_path:
+        print(_ts() + "   File exists, writing to: {}".format(
+            os.path.basename(versioned_path)))
+
+    with open(versioned_path, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(_ts() + "   Written {} files in {} packages -> {}".format(
+        len(entries), len(packages), versioned_path))
+
+
+def write_external_package_content_txt(output_path, entries):
+    """
+    Записывает external_package_content.txt.
+    Формат: path<TAB>hash<TAB>package_type<TAB>container<TAB>command
+    """
+    rows = sorted(entries, key=lambda e: (
+        e.get('package_type',''), e.get('container',''), e.get('path','')))
+
+    versioned_path = get_versioned_filepath(output_path)
+    if versioned_path != output_path:
+        print(_ts() + "   File exists, writing to: {}".format(
+            os.path.basename(versioned_path)))
+
+    with open(versioned_path, 'w', encoding='utf-8') as f:
+        f.write("# external_package_content\n")
+        f.write("# Generated: {}\n".format(datetime.now().isoformat()))
+        f.write("# Total files: {}, Total packages: {}\n".format(
+            len(entries),
+            len(set((e.get('package_type',''), e.get('container',''))
+                    for e in entries))))
+        f.write("# Format: path<TAB>hash<TAB>package_type<TAB>container<TAB>command\n")
+        f.write("#\n")
+        for e in rows:
+            f.write("{}\t{}\t{}\t{}\t{}\n".format(
+                e.get('path', ''),
+                e.get('hash', ''),
+                e.get('package_type', ''),
+                e.get('container', ''),
+                e.get('command', ''),
+            ))
+    print(_ts() + "   Written {} entries -> {}".format(len(rows), versioned_path))
+
+
 def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
                   compiler_basenames=None, linker_basenames=None):
     """
@@ -1580,25 +1900,68 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
         'usr/share/', 'var/',
     )
 
+    # Расширения архивов/пакетов — используются в нескольких функциях
+    _CONTAINER_EXTS = ('.iso', '.iso_dir', '.deb', '.deb_dir', '.rpm', '.rpm_dir',
+                       '.tar', '.tgz', '.zip', '.gz', '.xz', '.bz2')
+
+    def _get_container(path):
+        """
+        Извлекает ближайший контейнер (архив/пакет) из пути.
+        Возвращает имя файла-контейнера (без _dir суффикса) или None.
+
+        Примеры:
+          .../DISK02.iso_dir/repo/kt-watchdog_5.0.2_amd64.deb_dir/usr/bin/foo
+            → 'kt-watchdog_5.0.2_amd64.deb'
+          .../DISK01.iso_dir/KTDL/devel_debs/libapache2_amd64.deb_dir/usr/lib/foo.so
+            → 'libapache2_amd64.deb'
+          .../bin/usr/bin/foo   (нет контейнера)
+            → None
+        """
+        parts = path.split('/')
+        container = None
+        for part in parts:
+            # Убираем _dir суффикс если есть
+            name = part[:-4] if part.endswith('_dir') else part
+            for ext in _CONTAINER_EXTS:
+                if name.lower().endswith(ext) and not ext.endswith('_dir'):
+                    container = name
+                    break
+        return container
+
+    def _is_inside_package(path):
+        """Возвращает True если путь содержит сегмент .deb/_dir или .rpm/_dir."""
+        parts = path.split('/')
+        for part in parts:
+            name = part[:-4] if part.endswith('_dir') else part
+            if name.lower().endswith('.deb') or name.lower().endswith('.rpm'):
+                return True
+        return False
+
     def _is_distrib_system_path(path):
-        """Проверяем путь бинаря внутри дистрибутива."""
+        """
+        Проверяем путь бинаря внутри дистрибутива.
+        ВАЖНО: файлы внутри .deb/.rpm пакетов НЕ считаются системными —
+        это содержимое пакета, а не системный путь хоста сборки.
+        """
+        # Если файл внутри .deb/.rpm — не системный, это пакет
+        if _is_inside_package(path):
+            return False
+
         # Убираем префикс типа KTDL.00554-01/bin/ или bin/
         p = path
-        # Убираем PROJECT/bin/ или bin/
         for prefix in ('bin/', ):
             idx = p.find(prefix)
             if idx >= 0:
                 p = p[idx + len(prefix):]
                 break
         # Убираем архивные суффиксы типа foo.iso/bar.deb/
-        # и смотрим на финальный путь
         parts = p.split('/')
-        # Ищем первую часть которая не выглядит как архив
         clean_parts = []
         for part in parts:
-            if any(part.endswith(ext) for ext in
+            name = part[:-4] if part.endswith('_dir') else part
+            if any(name.lower().endswith(ext) for ext in
                    ('.iso', '.deb', '.rpm', '.tar', '.tgz', '.zip', '.gz')):
-                clean_parts = []  # сбрасываем — начинаем после архива
+                clean_parts = []
             else:
                 clean_parts.append(part)
         clean_path = '/'.join(clean_parts)
@@ -1689,34 +2052,44 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
     for i, entry in enumerate(bin_entries):
         progress_log("Pass 4 classifying", i + 1, total_bin)
-        path  = entry.get('path', '')
-        h_str = entry.get('hash', '').strip()
-        hi    = _hash_to_int(h_str)
+        path      = entry.get('path', '')
+        h_str     = entry.get('hash', '').strip()
+        hi        = _hash_to_int(h_str)
+        container = _get_container(path)  # ближайший архив/пакет в пути или None
+
+        def _make_entry(extra=None):
+            """Строит базовую запись с опциональным полем container."""
+            e = {'path': path, 'hash': h_str}
+            if container:
+                e['container'] = container
+            if extra:
+                e.update(extra)
+            return e
 
         # Первый фильтр — системный путь в дистрибутиве
         if _is_distrib_system_path(path):
-            system_binaries.append({'path': path, 'hash': h_str})
+            system_binaries.append(_make_entry())
             continue
 
         if hi is None:
-            untraced_external.append({'path': path, 'hash': h_str})
+            untraced_external.append(_make_entry())
             continue
 
         if hi not in all_output_hashes and hi not in all_dep_hashes:
             # Нет в трассировщике — проверяем есть ли в src.json
             if h_str in src_hashes:
-                untraced_from_src.append({'path': path, 'hash': h_str})
+                untraced_from_src.append(_make_entry())
             else:
-                untraced_external.append({'path': path, 'hash': h_str})
+                untraced_external.append(_make_entry())
             continue
 
         if hi not in all_output_hashes and hi in all_dep_hashes:
             # Готовый бинарь — трассировщик видит его как зависимость
             # Проверяем есть ли в src.json
             if h_str in src_hashes:
-                binaries_from_src.append({'path': path, 'hash': h_str})
+                binaries_from_src.append(_make_entry())
             else:
-                external_prebuilt.append({'path': path, 'hash': h_str})
+                external_prebuilt.append(_make_entry())
             continue
 
         # Собран — проверяем цепочку зависимостей
@@ -1725,20 +2098,18 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
         filt_ext_deps = deps_result['filtered']
 
         if real_ext_deps:
-            entry = {
-                'path':          path,
-                'hash':          h_str,
+            entry = _make_entry({
                 'external_deps': real_ext_deps,
-            }
+            })
             if filt_ext_deps:
                 entry['filtered_deps'] = filt_ext_deps
             external_built.append(entry)
         else:
             # Все подозрительные зависимости отфильтрованы — бинарь чистый
             if h_str in src_hashes:
-                binaries_from_src.append({'path': path, 'hash': h_str})
+                binaries_from_src.append(_make_entry())
             else:
-                compiled_from_src.append({'path': path, 'hash': h_str})
+                compiled_from_src.append(_make_entry())
 
     del full_out_to_deps, all_output_hashes, all_dep_hashes
     del src_hashes_int, bin_hashes_int
@@ -1988,6 +2359,15 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         )
         del bin_entries, src_hashes
         gc.collect()
+
+        # Выделяем содержимое внешних пакетов из untraced_external
+        print(_ts() + "   Starting external package content classification...")
+        p4_external_package_content, p4_untraced_external = \
+            classify_external_package_content(
+                p4_untraced_external, buildography_files)
+        print(_ts() + "   external_package_content={}, untraced_external={}".format(
+            len(p4_external_package_content), len(p4_untraced_external)))
+
         pass4_ran = True
         print(_ts() + "   Pass 4 done. Memory freed: bin_entries, src_hashes")
     else:
@@ -1995,6 +2375,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         p4_compiled_from_src = p4_binaries_from_src = p4_untraced_from_src = \
         p4_external_built = p4_external_prebuilt = p4_untraced_external = \
         p4_system_binaries = []
+        p4_external_package_content = []
         pass4_ran = False
         del src_hashes
         gc.collect()
@@ -2048,6 +2429,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         jt(pass4_dir, "untraced_external",  "untraced_external",  p4_untraced_external)
         jt(pass4_dir, "system_binaries",    "system_binaries",    p4_system_binaries)
 
+        # external_package_content — специальный формат, отдельные функции записи
+        base_epc = os.path.join(pass4_dir,
+                                "{}_external_package_content".format(project_name))
+        write_external_package_content_json(base_epc + ".json",
+                                            p4_external_package_content)
+        write_external_package_content_txt(base_epc + ".txt",
+                                           p4_external_package_content)
+
     # --- Статистика ---
     def pct(n, total):
         return (n / total * 100) if total else 0
@@ -2092,7 +2481,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         total_bin = (len(p4_compiled_from_src) + len(p4_binaries_from_src) +
                      len(p4_untraced_from_src) + len(p4_external_built) +
                      len(p4_external_prebuilt) + len(p4_untraced_external) +
-                     len(p4_system_binaries))
+                     len(p4_system_binaries) + len(p4_external_package_content))
         print("\n  Происхождение бинарей дистрибутива ({} файлов)".format(total_bin))
         print(sep)
         print("  Compiled from src  (собран из src.json)            : {:>7}  ({:.1f}%)".format(
@@ -2109,6 +2498,9 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             len(p4_untraced_external),  pct(len(p4_untraced_external),  total_bin)))
         print("  System binaries    (системные пути в дистрибутиве) : {:>7}  ({:.1f}%)".format(
             len(p4_system_binaries),    pct(len(p4_system_binaries),    total_bin)))
+        print("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(
+            len(p4_external_package_content),
+            pct(len(p4_external_package_content), total_bin)))
 
     # --- Pass 5 (по дискам, если флаг --by-disk) ---
     if by_disk:
@@ -2224,18 +2616,21 @@ def get_all_projects():
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Анализ избыточных файлов исходных текстов'
+        description='Анализ происхождения файлов сборки',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '--single-project',
+        '-p', '--single-project',
         metavar='NAME',
-        help='Обработать только один указанный проект'
+        help='Обработать только один указанный проект. '
+             'Без флага обрабатываются все проекты из buildography/builds/.'
     )
     parser.add_argument(
-        '--by-disk',
+        '-d', '--by-disk',
         action='store_true',
         default=False,
-        help='Pass 5: разбить избыточные файлы по дискам (pass5/src/ и pass5/bin/)'
+        help='Включить Проход 5: разбить результаты по дискам '
+             '(pass5/src/ и pass5/bin/).'
     )
     args = parser.parse_args()
 
