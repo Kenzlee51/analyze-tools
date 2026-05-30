@@ -314,6 +314,7 @@ UNPACKED_DIR="$BASE_DIR/unpacked"
 LOG_DIR="$BASE_DIR/logs/unpack"
 ERROR_LOG="$LOG_DIR/errors_unpack.txt"
 SKIPPED_LOG="$LOG_DIR/skipped_archives.txt"
+NORMALIZE_PY="$BASE_DIR/lib/normalize.py"
 
 if [[ ! -d "$PROJECTS_DIR" ]]; then
     echo "[ERROR] Projects directory not found: $PROJECTS_DIR"
@@ -633,6 +634,30 @@ process_project() {
     fi
 
     echo "[TIME] [$project_name] cp -a: $(format_duration $(( $(now_ns) - t0 )))"
+
+    # Нормализация имён файлов и папок ДО распаковки
+    # Только восстановление сломанной кодировки — без транслитерации
+    if [[ -f "$NORMALIZE_PY" ]]; then
+        t0=$(now_ns)
+        echo "[INFO] [$project_name] Normalizing filenames..."
+        python3 "$NORMALIZE_PY" --content-dir "$unpack_dir"
+        echo "[TIME] [$project_name] normalize: $(format_duration $(( $(now_ns) - t0 )))"
+    else
+        echo ""
+        echo "[WARN] [$project_name] normalize.py не найден: $NORMALIZE_PY"
+        echo "[WARN] Без нормализации файлы с некорректными именами могут не распаковаться."
+        local answer_norm
+        if [[ -t 0 ]]; then
+            read -r -p "[?] Продолжить без нормализации? [y/N]: " answer_norm
+        else
+            answer_norm="n"
+        fi
+        if [[ "${answer_norm,,}" != "y" && "${answer_norm,,}" != "yes" ]]; then
+            echo "[INFO] [$project_name] Отменено пользователем."
+            return 1
+        fi
+        echo "[INFO] [$project_name] Продолжаем без нормализации."
+    fi
 
     t0=$(now_ns)
     local -a queue=()
