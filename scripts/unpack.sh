@@ -1,46 +1,44 @@
 #!/bin/bash
 #
 # =============================================================================
-# unpack.sh — Скрипт рекурсивной распаковки архивов + автонормализация имён
+# unpack.sh — Скрипт рекурсивной распаковки архивов
 # =============================================================================
 #
 # ОПИСАНИЕ:
 #   Рекурсивно распаковывает все архивы в директории src/PROJ
 #   в директорию unpacked/PROJ. Поддерживает вложенные архивы любой глубины.
 #   Каждый архив распаковывается в директорию АРХИВ_dir рядом с ним.
-#   ** Перед началом работы автоматически исправляет имена папок проектов,
-#      если в них обнаружены кракозябры или кириллица (скрипт 1). **
 #
 # ИСПОЛЬЗОВАНИЕ:
 #   ./unpack.sh [OPTIONS]
 #
 # ОПЦИИ:
-#   --single-project NAME   Обработать только один указанный проект
-#   --all                   Распаковывать все архивы включая исключения
-#                           (по умолчанию .jar и .deb не распаковываются)
-#   -j, --parallel N        Количество параллельных проектов (default: 1)
-#                           Рекомендации: HDD → 1, SSD → 2-4, NVMe → 4-8
-#   --batch-size N          Файлов в один вызов file(1) (default: 500)
-#   --skip-path PATTERN     Regex для пропуска путей (можно несколько раз)
-#                           Пример: --skip-path node_modules --skip-path /m2_repo
-#   --full-file-check       Проверять все файлы через file(1) независимо
-#                           от расширения (медленно но надёжно)
-#   --check-deps            Только проверить наличие зависимостей и выйти
-#   -h, --help              Показать эту справку
+#   -p, --single-project NAME   Обработать только один указанный проект
+#   -a, --all                   Распаковывать все архивы включая исключения
+#                               (по умолчанию .jar и .deb не распаковываются)
+#   -j, --parallel N            Количество параллельных проектов (default: 1)
+#                               Рекомендации: HDD → 1, SSD → 2-4, NVMe → 4-8
+#   -b, --batch-size N          Файлов в один вызов file(1) (default: 500)
+#   -s, --skip-path PATTERN     Regex для пропуска путей (можно несколько раз)
+#                               Пример: -s node_modules -s /m2_repo
+#   -f, --full-file-check       Проверять все файлы через file(1) независимо
+#                               от расширения (медленно но надёжно)
+#   -c, --check-deps            Только проверить наличие зависимостей и выйти
+#   -h, --help                  Показать эту справку
 #
 # ПРИМЕРЫ:
 #   ./unpack.sh
+#   ./unpack.sh -p PROJ1
 #   ./unpack.sh --single-project PROJ1
-#   ./unpack.sh -j 4 --single-project PROJ1
-#   ./unpack.sh --all
-#   ./unpack.sh --skip-path node_modules
-#   ./unpack.sh --full-file-check -j 2
+#   ./unpack.sh -j 4 -p PROJ1
+#   ./unpack.sh -a
+#   ./unpack.sh -s node_modules
+#   ./unpack.sh -f -j 2
 #
 # ОЖИДАЕМАЯ СТРУКТУРА:
 #   BASE_DIR/
 #   ├── scripts/
-#   │   ├── unpack.sh
-#   │   └── normalize_names.py   ← скрипт 1 (переименование папок)
+#   │   └── unpack.sh
 #   ├── src/
 #   │   ├── PROJ1/          ← исходные архивы
 #   │   └── PROJ2/
@@ -54,7 +52,7 @@
 #
 # ЗАВИСИМОСТИ:
 #   Обязательные : bash 4+, file, find, stat, sort, grep, awk, date, bc
-#                  tar, gzip, bzip2, xz, unzip, p7zip-full, python3
+#                  tar, gzip, bzip2, xz, unzip, p7zip-full
 #   Опциональные : unrar, zstd, lz4, rpm2cpio+cpio, dpkg-deb,
 #                  cabextract, msitools, squashfs-tools, libarchive-tools
 #
@@ -99,7 +97,6 @@ declare -A REQUIRED_TOOLS=(
     ["unzip"]="unzip"
     ["7z"]="p7zip-full"
     ["bc"]="bc"
-    ["python3"]="python3"   # Нужен для нормализации имён папок
 )
 
 # Опциональные утилиты: утилита → пакет
@@ -176,36 +173,6 @@ check_dependencies() {
 }
 
 # =============================================================================
-# === Интеграция скрипта 1: автоисправление имён папок проектов ===
-# =============================================================================
-
-check_and_fix_project_names() {
-    local src_dir="$1"
-
-    echo "[FIX] Рекурсивное исправление сломанной кириллицы в $src_dir ..."
-    if [[ -f "$FIX_CYRILLIC_SCRIPT" ]]; then
-        python3 "$FIX_CYRILLIC_SCRIPT" "$src_dir" || {
-            echo "[ERROR] Ошибка при исправлении внутренней кириллицы"
-            return 1
-        }
-        echo "[FIX] Внутренняя кириллица исправлена."
-    else
-        echo "[WARN] Скрипт fix_cyrillic.py не найден: $FIX_CYRILLIC_SCRIPT"
-    fi
-
-    echo "[FIX] Транслитерация имён проектов..."
-    if [[ -f "$NORMALIZE_SCRIPT" ]]; then
-        python3 "$NORMALIZE_SCRIPT" || {
-            echo "[ERROR] Ошибка нормализации имён проектов"
-            return 1
-        }
-        echo "[FIX] Транслитерация завершена."
-    else
-        echo "[WARN] Скрипт normalize.py не найден: $NORMALIZE_SCRIPT"
-    fi
-}
-
-# =============================================================================
 # Regex архивных расширений
 # =============================================================================
 _ARCHIVE_NAMES=(
@@ -260,17 +227,17 @@ now_ns() { date +%s%N; }
 # =============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --single-project)
+        -p|--single-project)
             if [[ -n "${2:-}" ]]; then
                 SINGLE_PROJECT="$2"
                 echo "[INFO] Single project mode: $SINGLE_PROJECT"
                 shift 2
             else
-                echo "[ERROR] --single-project requires a project name"
+                echo "[ERROR] -p/--single-project requires a project name"
                 exit 1
             fi
             ;;
-        --all)
+        -a|--all)
             UNPACK_ALL=true
             echo "[INFO] Mode: --all (unpacking everything including ${SKIP_EXTENSIONS[*]})"
             shift
@@ -285,17 +252,17 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ;;
-        --batch-size)
+        -b|--batch-size)
             if [[ -n "${2:-}" && "${2:-}" =~ ^[0-9]+$ ]]; then
                 FILE_BATCH_SIZE="$2"
                 echo "[INFO] File batch size: $FILE_BATCH_SIZE"
                 shift 2
             else
-                echo "[ERROR] --batch-size requires a number argument"
+                echo "[ERROR] -b/--batch-size requires a number argument"
                 exit 1
             fi
             ;;
-        --skip-path)
+        -s|--skip-path)
             if [[ -n "${2:-}" ]]; then
                 if [[ -z "$SKIP_PATH_PATTERN" ]]; then
                     SKIP_PATH_PATTERN="$2"
@@ -305,21 +272,21 @@ while [[ $# -gt 0 ]]; do
                 echo "[INFO] Skip path pattern: $2"
                 shift 2
             else
-                echo "[ERROR] --skip-path requires a pattern argument"
+                echo "[ERROR] -s/--skip-path requires a pattern argument"
                 exit 1
             fi
             ;;
-        --full-file-check)
+        -f|--full-file-check)
             FULL_FILE_CHECK=true
             echo "[INFO] Full file check enabled"
             shift
             ;;
-        --check-deps)
+        -c|--check-deps)
             check_dependencies
             exit $?
             ;;
         -h|--help)
-            grep "^#" "$0" | head -70 | sed 's/^# \{0,1\}//'
+            grep "^#" "$0" | head -75 | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -347,16 +314,11 @@ UNPACKED_DIR="$BASE_DIR/unpacked"
 LOG_DIR="$BASE_DIR/logs/unpack"
 ERROR_LOG="$LOG_DIR/errors_unpack.txt"
 SKIPPED_LOG="$LOG_DIR/skipped_archives.txt"
-NORMALIZE_SCRIPT="$BASE_DIR/lib/normalize.py"          # транслитерация имён проектов
-FIX_CYRILLIC_SCRIPT="$BASE_DIR/lib/fix_cyrillic.py"   # починка внутренней кириллицы
 
 if [[ ! -d "$PROJECTS_DIR" ]]; then
     echo "[ERROR] Projects directory not found: $PROJECTS_DIR"
     exit 1
 fi
-
-# === АВТОИСПРАВЛЕНИЕ ИМЁН ПРОЕКТОВ (скрипт 1) ===
-check_and_fix_project_names "$PROJECTS_DIR"
 
 mkdir -p "$UNPACKED_DIR"
 mkdir -p "$LOG_DIR"
@@ -578,6 +540,29 @@ extract_archive() {
     fi
 }
 
+# Считает файлы в директории (непусто ли)
+count_files_in_dir() {
+    local dir="$1"
+    if [[ ! -d "$dir" ]]; then
+        echo 0
+        return
+    fi
+    find "$dir" -maxdepth 1 -mindepth 1 | wc -l
+}
+
+# Спрашивает пользователя интерактивно (только если stdin — терминал)
+ask_repack() {
+    local subdir="$1"
+    local count="$2"
+    local answer
+    if [[ -t 0 ]]; then
+        read -r -p "[?] $subdir уже содержит $count элементов. Перераспаковать? [y/N]: " answer
+    else
+        answer="n"
+    fi
+    [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
+}
+
 process_project() {
     local project="$1"
     local project_name
@@ -589,11 +574,64 @@ process_project() {
 
     local unpack_dir="$UNPACKED_DIR/${project_name}"
 
+    # Проверяем src/ и bin/ подпапки в unpacked/PROJ/
+    # Для каждой: если уже содержит что-то — спрашиваем перераспаковывать ли
+    local do_src=true
+    local do_bin=true
+
+    local src_unpacked="$unpack_dir/src"
+    local bin_unpacked="$unpack_dir/bin"
+
+    local src_count bin_count
+    src_count=$(count_files_in_dir "$src_unpacked")
+    bin_count=$(count_files_in_dir "$bin_unpacked")
+
+    if (( src_count > 0 )); then
+        if ask_repack "unpacked/$project_name/src" "$src_count"; then
+            echo "[INFO] [$project_name] Перераспаковываем src/"
+            rm -rf "$src_unpacked"
+        else
+            echo "[INFO] [$project_name] Пропускаем src/ (уже распакован)"
+            do_src=false
+        fi
+    fi
+
+    if (( bin_count > 0 )); then
+        if ask_repack "unpacked/$project_name/bin" "$bin_count"; then
+            echo "[INFO] [$project_name] Перераспаковываем bin/"
+            rm -rf "$bin_unpacked"
+        else
+            echo "[INFO] [$project_name] Пропускаем bin/ (уже распакован)"
+            do_bin=false
+        fi
+    fi
+
+    # Если оба пропускаем — ничего не делаем
+    if [[ "$do_src" == false && "$do_bin" == false ]]; then
+        echo "[INFO] [$project_name] Ничего не распаковывается — оба каталога уже есть."
+        return 0
+    fi
+
     local t0
     t0=$(now_ns)
-    echo "Copying $project -> $unpack_dir"
-    rm -rf "$unpack_dir"
-    cp -a "$project" "$unpack_dir"
+
+    # Копируем только нужные подкаталоги
+    mkdir -p "$unpack_dir"
+    if [[ "$do_src" == true && -d "$project/src" ]]; then
+        echo "Copying $project/src -> $src_unpacked"
+        cp -a "$project/src" "$src_unpacked"
+    fi
+    if [[ "$do_bin" == true && -d "$project/bin" ]]; then
+        echo "Copying $project/bin -> $bin_unpacked"
+        cp -a "$project/bin" "$bin_unpacked"
+    fi
+    # Если нет разделения src/bin — копируем всё как раньше
+    if [[ ! -d "$project/src" && ! -d "$project/bin" ]]; then
+        echo "Copying $project -> $unpack_dir (no src/bin split)"
+        rm -rf "$unpack_dir"
+        cp -a "$project" "$unpack_dir"
+    fi
+
     echo "[TIME] [$project_name] cp -a: $(format_duration $(( $(now_ns) - t0 )))"
 
     t0=$(now_ns)
