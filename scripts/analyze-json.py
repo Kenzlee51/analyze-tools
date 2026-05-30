@@ -40,10 +40,15 @@ analyze-json.py — Анализ происхождения файлов сбо�
                                 по дискам (pass5/src/ и pass5/bin/).
                                 Полезно для проектов с несколькими дисками.
 
+    -k, --keep                  Сохранять предыдущие результаты.
+                                По умолчанию (без флага) папка try1
+                                перезаписывается, а try2, try3, ... удаляются.
+                                С флагом создаётся новая папка tryN.
+
     -h, --help                  Показать эту справку и выйти.
 
 ПРИМЕРЫ:
-    # Обработать все проекты
+    # Обработать все проекты (try1 перезаписывается)
     python3 analyze-json.py
 
     # Обработать один проект
@@ -52,7 +57,16 @@ analyze-json.py — Анализ происхождения файлов сбо�
 
     # Обработать один проект с разбивкой по дискам
     python3 analyze-json.py -p KTDL.00554-01 -d
-    python3 analyze-json.py --single-project KTDL.00554-01 --by-disk
+
+    # Сохранить предыдущие результаты (создать try2, try3, ...)
+    python3 analyze-json.py -p KTDL.00554-01 -k
+    python3 analyze-json.py --single-project KTDL.00554-01 --keep
+
+ПРИМЕЧАНИЕ:
+    Перед запуском убедитесь что для каждого проекта выполнен
+    analyze-ext.sh — он генерирует binaries_in_bin.txt необходимый
+    для Прохода 4. Если файл отсутствует, скрипт предложит запустить
+    analyze-ext.sh автоматически.
 
 НАСТРОЙКА ПУТЕЙ:
     Все пути настраиваются в начале скрипта (раздел НАСТРАИВАЕМЫЕ ПУТИ):
@@ -1080,17 +1094,43 @@ def analyze_pass1(signatures, buildography_hashes):
 # =============================================================================
 # ЗАПИСЬ РЕЗУЛЬТАТОВ (JSON и текстовые)
 # =============================================================================
-def get_try_dir(base_dir):
+def get_try_dir(base_dir, keep=False):
     """
     Возвращает путь к папке try{N} внутри base_dir.
-    Если try1 существует — возвращает try2, и т.д.
+
+    Режим по умолчанию (keep=False):
+      - всегда использует try1
+      - удаляет try1 если существует
+      - удаляет try2, try3, ... если существуют
+
+    Режим --keep (keep=True):
+      - находит следующий свободный tryN
+      - ничего не удаляет
     """
-    n = 1
-    while True:
-        try_dir = os.path.join(base_dir, "try{}".format(n))
-        if not os.path.exists(try_dir):
-            return try_dir
-        n += 1
+    import shutil
+
+    if keep:
+        # Находим следующий свободный номер
+        n = 1
+        while True:
+            try_dir = os.path.join(base_dir, "try{}".format(n))
+            if not os.path.exists(try_dir):
+                return try_dir
+            n += 1
+    else:
+        # Удаляем try1 и все tryN
+        n = 1
+        while True:
+            try_dir = os.path.join(base_dir, "try{}".format(n))
+            if os.path.exists(try_dir):
+                shutil.rmtree(try_dir)
+                print(_ts() + "   Removed old results: {}".format(
+                    os.path.basename(try_dir)))
+                n += 1
+            else:
+                break
+        # Всегда возвращаем try1
+        return os.path.join(base_dir, "try1")
 
 
 def write_json_result(output_path, category, files):
@@ -1109,6 +1149,8 @@ def write_txt_result(output_path, category_label, entries):
     """
     Универсальная запись txt файла для любой категории.
     Формат: путь<TAB>хеш
+    Если entries пуст — файл сохраняется с суффиксом _EMPTY в имени.
+    Возвращает True если файл непустой, False если empty.
     """
     seen = set()
     rows = []
@@ -1124,6 +1166,20 @@ def write_txt_result(output_path, category_label, entries):
         rows.append((path, hash_))
     rows.sort(key=lambda x: x[0])
 
+    # Если пустой — меняем имя файла на *_EMPTY.txt
+    if not rows:
+        base, ext = os.path.splitext(output_path)
+        output_path = base + "_EMPTY" + ext
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write("# {}\n".format(category_label))
+        f.write("# Generated: {}\n".format(datetime.now().isoformat()))
+        f.write("# Total: 0\n")
+        f.write("# empty\n")
+    if not rows:
+        print(_ts() + "   Empty -> {}".format(os.path.basename(output_path)))
+        return False
+
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("# {}\n".format(category_label))
         f.write("# Generated: {}\n".format(datetime.now().isoformat()))
@@ -1132,7 +1188,8 @@ def write_txt_result(output_path, category_label, entries):
         f.write("#\n")
         for path, hash_ in rows:
             f.write("{}\t{}\n".format(path, hash_))
-    print(_ts() + "   Written {} entries -> {}".format(len(rows), output_path))
+    print(_ts() + "   Written {} entries -> {}".format(len(rows), os.path.basename(output_path)))
+    return True
 
 
 def write_redundant_txt(output_path, project_name, redundant, not_compiled, hash_algorithm=''):
@@ -1732,10 +1789,9 @@ def write_external_package_content_json(output_path, entries):
 def write_external_package_content_txt(output_path, entries):
     """
     Записывает external_package_content.txt.
-    Формат: path<TAB>hash<TAB>package_type<TAB>container<TAB>command
+    Формат: path<TAB>hash
     """
-    rows = sorted(entries, key=lambda e: (
-        e.get('package_type',''), e.get('container',''), e.get('path','')))
+    rows = sorted(entries, key=lambda e: e.get('path', ''))
 
     versioned_path = get_versioned_filepath(output_path)
     if versioned_path != output_path:
@@ -1749,15 +1805,12 @@ def write_external_package_content_txt(output_path, entries):
             len(entries),
             len(set((e.get('package_type',''), e.get('container',''))
                     for e in entries))))
-        f.write("# Format: path<TAB>hash<TAB>package_type<TAB>container<TAB>command\n")
+        f.write("# Format: path<TAB>hash\n")
         f.write("#\n")
         for e in rows:
-            f.write("{}\t{}\t{}\t{}\t{}\n".format(
+            f.write("{}\t{}\n".format(
                 e.get('path', ''),
                 e.get('hash', ''),
-                e.get('package_type', ''),
-                e.get('container', ''),
-                e.get('command', ''),
             ))
     print(_ts() + "   Written {} entries -> {}".format(len(rows), versioned_path))
 
@@ -2163,7 +2216,7 @@ def write_pass4_txt(output_path, category_label, entries):
 # =============================================================================
 # ОБРАБОТКА ПРОЕКТА
 # =============================================================================
-def process_project(project_name, compiler_basenames, linker_basenames, interpreter_basenames, by_disk=False):
+def process_project(project_name, compiler_basenames, linker_basenames, interpreter_basenames, by_disk=False, keep=False):
     print("\n" + "=" * 50)
     print("Processing project: {}".format(project_name))
     print("=" * 50)
@@ -2309,6 +2362,22 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     gc.collect()
     print(_ts() + "   Pass 1 done. Memory freed: buildography_hashes")
 
+    # Разбиваем redundant на:
+    #   redundant          — НЕ в buildography И НЕ в bin.json (истинно избыточные)
+    #   untraced_in_distrib — НЕ в buildography НО в bin.json (попал мимо трассировщика)
+    bin_hashes_set = set(bin_hashes.values()) if isinstance(bin_hashes, dict) else set(bin_hashes)
+    true_redundant      = []
+    untraced_in_distrib = []
+    for entry in redundant:
+        h = entry.get('hash', '').strip()
+        if h and h in bin_hashes_set:
+            untraced_in_distrib.append(entry)
+        else:
+            true_redundant.append(entry)
+    redundant = true_redundant
+    print(_ts() + "   Pass 1 split: redundant={}, untraced_in_distrib={}".format(
+        len(redundant), len(untraced_in_distrib)))
+
     # --- Проход 2 (компиляторы) ---
     if compiler_basenames:
         print(_ts() + "   Starting pass 2 (transitive closure from bin using compilers)...")
@@ -2383,7 +2452,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     # Создаём папку try{N} и подпапки для каждого прохода
     izb_base = os.path.join(RESULTS_DIR, project_name, "izb")
-    try_dir  = get_try_dir(izb_base)
+    try_dir  = get_try_dir(izb_base, keep=keep)
     os.makedirs(try_dir, exist_ok=True)
     print(_ts() + "   Results directory: {}".format(try_dir))
 
@@ -2394,39 +2463,60 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     for d in [pass1_dir, pass2_dir, pass3_dir, pass4_dir]:
         os.makedirs(d, exist_ok=True)
 
-    def jt(folder, name, category, entries):
-        """Записывает JSON и TXT файлы для категории."""
+    # Отслеживаем непустые txt файлы для summary
+    # summary_files[category] = abs_path_to_txt
+    summary_src_files = {}  # category -> txt path
+    summary_bin_files = {}  # category -> txt path
+
+    def jt(folder, name, category, entries,
+           summary_dict=None, summary_key=None):
+        """
+        Записывает JSON и TXT файлы для категории.
+        Если summary_dict и summary_key заданы — регистрирует непустые
+        txt файлы для последующего копирования в summary.
+        """
         base = os.path.join(folder, "{}_{}".format(project_name, name))
         write_json_result(base + ".json", category, entries)
-        write_txt_result(base + ".txt", category, entries)
+        nonempty = write_txt_result(base + ".txt", category, entries)
+        if summary_dict is not None and summary_key is not None and nonempty:
+            summary_dict[summary_key] = base + ".txt"
 
     # --- Pass 1 ---
     print(_ts() + "   Writing pass 1 results...")
-    jt(pass1_dir, "direct",           "direct",    direct)
-    jt(pass1_dir, "parent",           "parent",    parent)
-    jt(pass1_dir, "redundant-by-hash","redundant", redundant)
+    jt(pass1_dir, "direct",            "direct",    direct)
+    jt(pass1_dir, "parent",            "parent",    parent)
+    jt(pass1_dir, "redundant-by-hash", "redundant", redundant,
+       summary_src_files, "redundant-by-hash")
+    jt(pass1_dir, "untraced_in_distrib", "untraced_in_distrib", untraced_in_distrib)
 
     # --- Pass 2 ---
     print(_ts() + "   Writing pass 2 results...")
-    jt(pass2_dir, "not_compiled", "not_compiled", not_compiled)
+    jt(pass2_dir, "not_compiled", "not_compiled", not_compiled,
+       summary_src_files, "not_compiled")
 
     # --- Pass 3 ---
     print(_ts() + "   Writing pass 3 results...")
     jt(pass3_dir, "executed",        "interpreted_executed",        executed)
     jt(pass3_dir, "compiled_used",   "interpreted_compiled_used",   compiled_used)
-    jt(pass3_dir, "compiled_unused", "interpreted_compiled_unused", compiled_unused)
+    jt(pass3_dir, "compiled_unused", "interpreted_compiled_unused", compiled_unused,
+       summary_src_files, "compiled_unused")
     jt(pass3_dir, "copied",          "interpreted_copied",          copied)
-    jt(pass3_dir, "not_used",        "interpreted_not_used",        izb)
+    jt(pass3_dir, "not_used",        "interpreted_not_used",        izb,
+       summary_src_files, "not_used")
 
     # --- Pass 4 ---
     if pass4_ran:
         print(_ts() + "   Writing pass 4 results...")
         jt(pass4_dir, "compiled_from_src",  "compiled_from_src",  p4_compiled_from_src)
-        jt(pass4_dir, "binaries_from_src",  "binaries_from_src",  p4_binaries_from_src)
+        jt(pass4_dir, "binaries_from_src",  "binaries_from_src",  p4_binaries_from_src,
+           summary_bin_files, "binaries_from_src")
         jt(pass4_dir, "untraced_from_src",  "untraced_from_src",  p4_untraced_from_src)
-        jt(pass4_dir, "external_built",     "external_built",     p4_external_built)
-        jt(pass4_dir, "external_prebuilt",  "external_prebuilt",  p4_external_prebuilt)
-        jt(pass4_dir, "untraced_external",  "untraced_external",  p4_untraced_external)
+        jt(pass4_dir, "external_built",     "external_built",     p4_external_built,
+           summary_bin_files, "external_built")
+        jt(pass4_dir, "external_prebuilt",  "external_prebuilt",  p4_external_prebuilt,
+           summary_bin_files, "external_prebuilt")
+        jt(pass4_dir, "untraced_external",  "untraced_external",  p4_untraced_external,
+           summary_bin_files, "untraced_external")
         jt(pass4_dir, "system_binaries",    "system_binaries",    p4_system_binaries)
 
         # external_package_content — специальный формат, отдельные функции записи
@@ -2436,6 +2526,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                                             p4_external_package_content)
         write_external_package_content_txt(base_epc + ".txt",
                                            p4_external_package_content)
+        if p4_external_package_content:
+            summary_bin_files["external_package_content"] = base_epc + ".txt"
 
     # --- Статистика ---
     def pct(n, total):
@@ -2501,6 +2593,163 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         print("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(
             len(p4_external_package_content),
             pct(len(p4_external_package_content), total_bin)))
+
+    # =========================================================================
+    # SUMMARY: копируем непустые отчёты в summary{N}/
+    # =========================================================================
+    import shutil as _shutil
+    try_name     = os.path.basename(try_dir)          # try1, try2, ...
+    summary_name = try_name.replace("try", "summary") # summary1, summary2, ...
+    summary_dir  = os.path.join(os.path.dirname(try_dir), summary_name)
+    summary_src_dir = os.path.join(summary_dir, "src")
+    summary_bin_dir = os.path.join(summary_dir, "bin")
+    os.makedirs(summary_src_dir, exist_ok=True)
+    os.makedirs(summary_bin_dir, exist_ok=True)
+    print(_ts() + "   Summary directory: {}".format(summary_dir))
+
+    for key, src_path in summary_src_files.items():
+        dst = os.path.join(summary_src_dir, os.path.basename(src_path))
+        _shutil.copy2(src_path, dst)
+        print(_ts() + "   Summary src: {}".format(os.path.basename(dst)))
+
+    for key, src_path in summary_bin_files.items():
+        dst = os.path.join(summary_bin_dir, os.path.basename(src_path))
+        _shutil.copy2(src_path, dst)
+        print(_ts() + "   Summary bin: {}".format(os.path.basename(dst)))
+
+    # binaries_in_src.txt из ext/
+    binaries_in_src_path = os.path.join(
+        RESULTS_DIR, project_name, "ext", "binaries_in_bin.txt")
+    if os.path.isfile(binaries_in_src_path):
+        dst = os.path.join(summary_bin_dir,
+                           "{}_binaries_in_src.txt".format(project_name))
+        _shutil.copy2(binaries_in_src_path, dst)
+        print(_ts() + "   Summary bin: {}".format(os.path.basename(dst)))
+
+    print(_ts() + "   Summary done: src={} files, bin={} files".format(
+        len(summary_src_files), len(summary_bin_files)))
+
+    # =========================================================================
+    # README для summary
+    # =========================================================================
+    SUMMARY_DESCRIPTIONS = {
+        # src/
+        "redundant-by-hash": (
+            "src/",
+            "Избыточные исходные файлы",
+            "Файлы из репозитория исходников которые не найдены в buildography\n"
+            "  и отсутствуют в дистрибутиве."
+        ),
+        "not_compiled": (
+            "src/",
+            "Компилируемые файлы результат которых не в дистрибутиве",
+            "Исходные файлы компилируемых языков (.c, .cpp, .rs, .go и др.)\n"
+            "  которые компилировались в ходе сборки, но результат компиляции\n"
+            "  не попал в дистрибутив."
+        ),
+        "compiled_unused": (
+            "src/",
+            "Интерпретируемые файлы скомпилированные но не в дистрибутиве",
+            "Файлы интерпретируемых языков (.py и др.) которые компилировались\n"
+            "  (.pyc и т.д.), но результат компиляции не попал в дистрибутив."
+        ),
+        "not_used": (
+            "src/",
+            "Интерпретируемые файлы нигде не используемые",
+            "Файлы интерпретируемых языков которые не запускались, не\n"
+            "  компилировались и не скопированы в дистрибутив."
+        ),
+        # bin/
+        "external_built": (
+            "bin/",
+            "Бинари, в которые попали сторонние исходные тексты",
+            ""
+        ),
+        "external_prebuilt": (
+            "bin/",
+            "Готовые бинари полученные извне",
+            "Пришли готовыми извне (apt, wget, prebuilt)."
+        ),
+        "untraced_external": (
+            "bin/",
+            "Бинари полностью неизвестного происхождения",
+            ""
+        ),
+        "external_package_content": (
+            "bin/",
+            "Содержимое внешних пакетов (deb/pip/npm)",
+            "Файлы внутри внешних пакетов источник которых известен\n"
+            "  трассировщику (apt download, pip install, npm install и т.д.)."
+        ),
+        "binaries_from_src": (
+            "bin/",
+            "Бинари хранящиеся прямо в исходниках",
+            ""
+        ),
+        "binaries_in_src": (
+            "bin/",
+            "Полный список ELF/PE бинарей в переданных исходных текстах",
+            ""
+        ),
+    }
+
+    # Строим README только по файлам которые реально попали в summary
+    def _readme_entry(fname, section, title, descr):
+        lines = ["  {}".format(fname), "  {}".format(title)]
+        if descr:
+            lines.append("  {}".format(descr))
+        return lines
+
+    readme_lines = []
+    readme_lines.append("# Summary Report — {}".format(project_name))
+    readme_lines.append("# Generated: {}".format(datetime.now().isoformat()))
+    readme_lines.append("Краткая справка по отчётам в этой папке.")
+    readme_lines.append("Каждый отчёт содержит список файлов в формате: путь<TAB>хеш")
+
+    # src/ секция
+    src_entries = []
+    for key, fpath in summary_src_files.items():
+        fname = os.path.basename(fpath)
+        short = fname.replace("{}_".format(project_name), "").replace(".txt", "")
+        desc = SUMMARY_DESCRIPTIONS.get(short)
+        if desc:
+            src_entries.append((short, desc, fname))
+
+    if src_entries:
+        readme_lines.append("=" * 60)
+        readme_lines.append("src/  — избыточные исходные файлы")
+        readme_lines.append("=" * 60)
+        for short, (section, title, descr), fname in src_entries:
+            readme_lines.extend(_readme_entry(fname, section, title, descr))
+
+    # bin/ секция
+    bin_entries_readme = []
+    for key, fpath in summary_bin_files.items():
+        fname = os.path.basename(fpath)
+        short = fname.replace("{}_".format(project_name), "").replace(".txt", "")
+        desc = SUMMARY_DESCRIPTIONS.get(short)
+        if desc:
+            bin_entries_readme.append((short, desc, fname))
+
+    # binaries_in_src всегда в bin/ если скопирован
+    bins_in_src_dst = os.path.join(
+        summary_bin_dir, "{}_binaries_in_src.txt".format(project_name))
+    if os.path.isfile(bins_in_src_dst):
+        fname = os.path.basename(bins_in_src_dst)
+        bin_entries_readme.append(
+            ("binaries_in_src", SUMMARY_DESCRIPTIONS["binaries_in_src"], fname))
+
+    if bin_entries_readme:
+        readme_lines.append("=" * 60)
+        readme_lines.append("bin/  — происхождение бинарей дистрибутива")
+        readme_lines.append("=" * 60)
+        for short, (section, title, descr), fname in bin_entries_readme:
+            readme_lines.extend(_readme_entry(fname, section, title, descr))
+
+    readme_path = os.path.join(summary_dir, "README.txt")
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(readme_lines) + "\n")
+    print(_ts() + "   Summary README: {}".format(readme_path))
 
     # --- Pass 5 (по дискам, если флаг --by-disk) ---
     if by_disk:
@@ -2632,6 +2881,14 @@ def main():
         help='Включить Проход 5: разбить результаты по дискам '
              '(pass5/src/ и pass5/bin/).'
     )
+    parser.add_argument(
+        '-k', '--keep',
+        action='store_true',
+        default=False,
+        help='Сохранять предыдущие результаты: создавать tryN вместо '
+             'перезаписи try1. По умолчанию try1 перезаписывается, '
+             'а try2, try3, ... удаляются.'
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(BUILDOGRAPHY_DIR):
@@ -2659,15 +2916,63 @@ def main():
     print(_ts() + " Projects to analyze: {}".format(len(projects)))
     print(_ts() + " Projects: {}".format(', '.join(projects)))
     print(_ts() + " UTILITIES_FILE: {}".format(UTILITIES_FILE))
-    print(_ts() + " Compilers: {}, Linkers: {}, Interpreters: {}".format(len(compiler_basenames), len(linker_basenames), len(interpreter_basenames)))
+    print(_ts() + " Compilers: {}, Linkers: {}, Interpreters: {}".format(
+        len(compiler_basenames), len(linker_basenames), len(interpreter_basenames)))
+    print(_ts() + " Keep previous results: {}".format(args.keep))
 
+    # =========================================================================
+    # Проверяем наличие результатов analyze-ext.sh (binaries_in_bin.txt)
+    # =========================================================================
+    missing_ext = []
+    for project_name in projects:
+        binaries_in_bin_path = os.path.join(
+            RESULTS_DIR, project_name, "ext", "binaries_in_bin.txt")
+        if not os.path.isfile(binaries_in_bin_path):
+            missing_ext.append(project_name)
+
+    if missing_ext:
+        print()
+        print(_ts() + " [WARN] binaries_in_bin.txt не найден для проектов:")
+        for p in missing_ext:
+            print(_ts() + "   - {}".format(p))
+        print(_ts() + " Без этого файла Проход 4 (анализ бинарей) будет пропущен.")
+        print(_ts() + " Файл генерируется скриптом analyze-ext.sh.")
+        print()
+        try:
+            answer = input(" Запустить analyze-ext.sh сейчас? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = 'n'
+
+        if answer in ('y', 'yes', 'д', 'да'):
+            analyze_ext_sh = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "analyze-ext.sh")
+            if not os.path.isfile(analyze_ext_sh):
+                print(_ts() + " [ERROR] analyze-ext.sh not found: {}".format(
+                    analyze_ext_sh))
+            else:
+                import subprocess
+                for project_name in missing_ext:
+                    print(_ts() + " Running analyze-ext.sh for {}...".format(
+                        project_name))
+                    cmd = ["bash", analyze_ext_sh,
+                           "--single-project", project_name]
+                    ret = subprocess.call(cmd)
+                    if ret != 0:
+                        print(_ts() + " [WARN] analyze-ext.sh exited with code {}".format(ret))
+                    else:
+                        print(_ts() + " analyze-ext.sh done for {}".format(
+                            project_name))
+        else:
+            print(_ts() + " Продолжаем без analyze-ext.sh. Проход 4 будет пропущен.")
+
+    # =========================================================================
     start_time = datetime.now()
     results = {}
 
     for project_name in projects:
         results[project_name] = process_project(
             project_name, compiler_basenames, linker_basenames, interpreter_basenames,
-            by_disk=args.by_disk
+            by_disk=args.by_disk, keep=args.keep
         )
 
     elapsed = datetime.now() - start_time
