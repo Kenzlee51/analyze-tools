@@ -2517,7 +2517,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
            summary_bin_files, "external_prebuilt")
         jt(pass4_dir, "untraced_external",  "untraced_external",  p4_untraced_external,
            summary_bin_files, "untraced_external")
-        jt(pass4_dir, "system_binaries",    "system_binaries",    p4_system_binaries)
+        jt(pass4_dir, "system_binaries",    "system_binaries",    p4_system_binaries,
+           summary_bin_files, "system_binaries")
 
         # external_package_content — специальный формат, отдельные функции записи
         base_epc = os.path.join(pass4_dir,
@@ -2689,6 +2690,11 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         "binaries_in_src": (
             "bin/",
             "Полный список ELF/PE бинарей в переданных исходных текстах",
+            ""
+        ),
+        "system_binaries": (
+            "bin/",
+            "Системные бинари, обнаруженные в дистрибутиве.",
             ""
         ),
     }
