@@ -1608,17 +1608,69 @@ def _detect_package_type(path):
     return None, None
 
 
+# Инструменты которые СОБИРАЮТ пакеты из исходников
+_BUILT_PKG_TOOLS = {
+    'dpkg-deb',       # сборка .deb из исходников
+    'dpkg',           # упаковка deb
+    'rpmbuild',       # сборка .rpm
+    'fakeroot',       # обёртка для dpkg-deb
+    'faked-sysv',     # fakeroot вариант
+}
+# Python build_wheel и аналоги — определяем по аргументам
+_BUILT_PKG_ARGS = {
+    'build_wheel',    # python setup.py / pep517
+    'bdist_wheel',    # python setup.py bdist_wheel
+    'bdist_deb',      # python setup.py bdist_deb
+}
+
+# Инструменты которые СКАЧИВАЮТ внешние пакеты
+_EXTERNAL_PKG_TOOLS = {
+    'apt', 'apt-get', 'apt-cache', 'apt-download',
+    'pip', 'pip2', 'pip3',
+    'pip3.5', 'pip3.6', 'pip3.7', 'pip3.8', 'pip3.9', 'pip3.10', 'pip3.11',
+    'wget', 'curl',
+    'npm', 'yarn', 'npx',
+}
+
+
+def _is_built_pkg_cmd(cmd_list):
+    """Возвращает True если команда собирает пакет из исходников."""
+    if not cmd_list:
+        return False
+    tool = os.path.basename(str(cmd_list[0]))
+    if tool in _BUILT_PKG_TOOLS:
+        return True
+    # python3.x build_wheel / bdist_wheel
+    if 'python' in tool.lower():
+        cmd_str = ' '.join(str(x) for x in cmd_list)
+        if any(arg in cmd_str for arg in _BUILT_PKG_ARGS):
+            return True
+    return False
+
+
+def _is_external_pkg_cmd(cmd_list):
+    """Возвращает True если команда скачивает внешний пакет."""
+    if not cmd_list:
+        return False
+    tool = os.path.basename(str(cmd_list[0]))
+    return tool in _EXTERNAL_PKG_TOOLS
+
+
 def build_external_package_index(buildography_files):
     """
-    Строит индекс: container_name -> {package_type, source, command}
-    Ищет в buildography команды apt/pip/npm у которых в output есть
-    .deb/.whl файлы — это и есть источник пакета.
+    Строит индекс: container_name -> {package_type, source, command, origin}
+    Ищет в buildography команды у которых в output есть .deb/.whl/.rpm файлы.
+
+    Поле origin:
+      'built'    — пакет собран из исходников (dpkg-deb, python build_wheel и т.д.)
+      'external' — пакет скачан извне (apt, pip, wget и т.д.)
+      'copied'   — пакет скопирован (cp, rsync и т.д.) — неизвестно откуда
 
     Возвращает dict: container_name (str) -> dict с полями:
-      package_type, source (путь откуда скачан), command (читаемая строка)
+      package_type, source, command, origin
     """
     import re as _re2
-    index = {}  # container_name -> {package_type, source, command}
+    index = {}  # container_name -> {package_type, source, command, origin}
 
     for file_path in buildography_files:
         try:
@@ -1680,12 +1732,25 @@ def build_external_package_index(buildography_files):
                     else:
                         pkg_type = 'pip'
 
+                    # Определяем происхождение пакета
+                    if _is_built_pkg_cmd(cmd_list):
+                        origin = 'built'
+                    elif _is_external_pkg_cmd(cmd_list):
+                        origin = 'external'
+                    else:
+                        origin = 'copied'
+
                     if bn not in index:
                         index[bn] = {
                             'package_type': pkg_type,
                             'source':       source or out_path,
                             'command':      readable_cmd,
+                            'origin':       origin,
                         }
+                    elif origin == 'built' and index[bn].get('origin') != 'built':
+                        # Приоритет: built > external > copied
+                        index[bn]['origin'] = origin
+                        index[bn]['command'] = readable_cmd
 
         del data
 
@@ -1694,19 +1759,28 @@ def build_external_package_index(buildography_files):
 
 def classify_external_package_content(untraced_external, buildography_files):
     """
-    Из списка untraced_external выделяет файлы внутри известных пакетов
-    (deb/pip/npm) в отдельную категорию external_package_content.
+    Из списка untraced_external выделяет файлы внутри пакетов по категориям:
 
     Возвращает:
-      pkg_content   — list записей для external_package_content
-      remaining     — list записей которые остаются в untraced_external
+      external_pkg_content — содержимое ВНЕШНИХ пакетов (apt, pip download и т.д.)
+      built_pkg_content    — содержимое пакетов СОБРАННЫХ из исходников
+                             (dpkg-deb, python build_wheel и т.д.)
+      remaining            — остаётся в untraced_external
     """
     print(_ts() + "   Building external package index from buildography...")
     pkg_index = build_external_package_index(buildography_files)
     print(_ts() + "   Package index: {} known containers".format(len(pkg_index)))
 
-    pkg_content = []
-    remaining   = []
+    # Считаем статистику по origin
+    origins = {}
+    for v in pkg_index.values():
+        o = v.get('origin', 'unknown')
+        origins[o] = origins.get(o, 0) + 1
+    print(_ts() + "   Package origins: {}".format(origins))
+
+    external_pkg_content = []
+    built_pkg_content    = []
+    remaining            = []
 
     for entry in untraced_external:
         path = entry.get('path', '')
@@ -1716,12 +1790,9 @@ def classify_external_package_content(untraced_external, buildography_files):
             remaining.append(entry)
             continue
 
-        # Ищем источник в индексе
-        # Для deb: container это имя .deb файла — ищем напрямую
-        # Для pip/npm: container это имя пакета — ищем по подстроке
+        # Ищем контейнер в индексе
         pkg_info = pkg_index.get(container, {})
         if not pkg_info and pkg_type == 'pip':
-            # Для pip пакетов ищем .whl в индексе по имени пакета
             for key, val in pkg_index.items():
                 if container.lower() in key.lower() and val['package_type'] == 'pip':
                     pkg_info = val
@@ -1733,12 +1804,24 @@ def classify_external_package_content(untraced_external, buildography_files):
         if pkg_info:
             new_entry['source']  = pkg_info.get('source', '')
             new_entry['command'] = pkg_info.get('command', pkg_type)
+            new_entry['origin']  = pkg_info.get('origin', 'unknown')
         else:
             new_entry['source']  = ''
             new_entry['command'] = pkg_type
-        pkg_content.append(new_entry)
+            new_entry['origin']  = 'unknown'
 
-    return pkg_content, remaining
+        # Разделяем по origin
+        origin = new_entry.get('origin', 'unknown')
+        if origin == 'built':
+            built_pkg_content.append(new_entry)
+        else:
+            # external, copied, unknown — всё в external_package_content
+            external_pkg_content.append(new_entry)
+
+    print(_ts() + "   external_pkg_content={}, built_pkg_content={}, remaining={}".format(
+        len(external_pkg_content), len(built_pkg_content), len(remaining)))
+
+    return external_pkg_content, built_pkg_content, remaining
 
 
 def write_external_package_content_json(output_path, entries):
@@ -1851,6 +1934,108 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
         if hi is not None:
             bin_hashes_int.add(hi)
     print(_ts() + "   Pass 4: bin_hashes_int={}".format(len(bin_hashes_int)))
+
+    # ==========================================================================
+    # Индекс подписывающих инструментов (bsign, strip и др.)
+    # Строим маппинг: хеш_после_подписи → хеш_до_подписи
+    #
+    # bsign работает in-place: bsign -w ./file.so
+    # Файл указан в аргументе командной строки, не в output/dependencies.
+    # Трассировщик фиксирует один и тот же путь дважды:
+    #   - как dependency (чтение до подписи) → старый хеш
+    #   - как output (запись после подписи) → новый хеш
+    # Строим маппинг: новый_хеш → старый_хеш по совпадению пути.
+    # ==========================================================================
+    SIGN_TOOLS = {'bsign', 'strip', 'objcopy', 'llvm-strip', 'eu-strip',
+                  'codesign', 'signtool'}
+
+    print(_ts() + "   Pass 4: building sign remap index...")
+    # sign_remap: хеш_после_подписи (int) → хеш_до_подписи (int)
+    #
+    # bsign работает in-place и НЕ читает файл как dependency —
+    # трассировщик не видит исходный хеш в dependencies.
+    # Алгоритм:
+    #   1. Строим индекс path → [хеши] по всем output всех команд
+    #   2. Для каждой bsign команды берём путь из аргумента
+    #   3. Находим этот путь в output bsign → хеш после подписи
+    #   4. Находим этот путь в output других команд → хеш до подписи
+    #   5. Строим маппинг после → до
+    sign_remap = {}
+
+    # Шаг 1: строим path → список хешей по всем output (кроме bsign)
+    # path_to_hashes: нормализованный basename → set of hash_int
+    path_to_hashes = {}  # basename → set of (hash_int, full_path)
+
+    for file_path in buildography_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f, strict=False)
+        except Exception:
+            continue
+
+        for cmd in data.get('component_commands', []):
+            cmd_list = cmd.get('command', [])
+            tool = os.path.basename(str(cmd_list[0])) if cmd_list else ''
+
+            # Собираем все output кроме bsign
+            if tool not in SIGN_TOOLS:
+                for out in cmd.get('output', []):
+                    if not isinstance(out, dict): continue
+                    p = out.get('path', '')
+                    h = out.get('hash', '').strip()
+                    hi = _hash_to_int(h)
+                    if p and hi is not None:
+                        bn = os.path.basename(p)
+                        if bn not in path_to_hashes:
+                            path_to_hashes[bn] = set()
+                        path_to_hashes[bn].add(hi)
+
+        del data
+
+    print(_ts() + "   Pass 4: path_to_hashes index: {} basenames".format(
+        len(path_to_hashes)))
+
+    # Шаг 2-5: обходим bsign команды
+    for file_path in buildography_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f, strict=False)
+        except Exception:
+            continue
+
+        for cmd in data.get('component_commands', []):
+            cmd_list = cmd.get('command', [])
+            if not cmd_list: continue
+            tool = os.path.basename(str(cmd_list[0]))
+            if tool not in SIGN_TOOLS: continue
+
+            # Хеш после подписи — из output по basename аргумента
+            for arg in cmd_list[1:]:
+                if arg.startswith('-'): continue
+                bn = os.path.basename(arg)
+                if not bn: continue
+
+                # Ищем в output этой команды
+                after_hi = None
+                for out in cmd.get('output', []):
+                    if not isinstance(out, dict): continue
+                    if os.path.basename(out.get('path','')) == bn:
+                        after_hi = _hash_to_int(out.get('hash','').strip())
+                        break
+
+                if after_hi is None: continue
+
+                # Хеш до подписи — из индекса других команд
+                before_hashes = path_to_hashes.get(bn, set())
+                for before_hi in before_hashes:
+                    if before_hi != after_hi:
+                        sign_remap[after_hi] = before_hi
+                        break
+
+        del data
+
+    print(_ts() + "   Pass 4: sign remap index: {} entries".format(len(sign_remap)))
+    gc.collect()
 
     total_cmds = _count_cmds(buildography_files)
 
@@ -2128,25 +2313,31 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
             untraced_external.append(_make_entry())
             continue
 
-        if hi not in all_output_hashes and hi not in all_dep_hashes:
+        # Применяем sign_remap — если бинарь был подписан после сборки
+        # (bsign, strip и др.), его хеш изменился. Ищем исходный хеш до подписи.
+        hi_for_lookup = sign_remap.get(hi, hi)
+        h_str_for_lookup = format(hi_for_lookup, '064x') if hi_for_lookup != hi else h_str
+        was_remapped = (hi_for_lookup != hi)
+
+        if hi_for_lookup not in all_output_hashes and hi_for_lookup not in all_dep_hashes:
             # Нет в трассировщике — проверяем есть ли в src.json
-            if h_str in src_hashes:
+            if h_str_for_lookup in src_hashes or h_str in src_hashes:
                 untraced_from_src.append(_make_entry())
             else:
                 untraced_external.append(_make_entry())
             continue
 
-        if hi not in all_output_hashes and hi in all_dep_hashes:
+        if hi_for_lookup not in all_output_hashes and hi_for_lookup in all_dep_hashes:
             # Готовый бинарь — трассировщик видит его как зависимость
             # Проверяем есть ли в src.json
-            if h_str in src_hashes:
+            if h_str_for_lookup in src_hashes or h_str in src_hashes:
                 binaries_from_src.append(_make_entry())
             else:
                 external_prebuilt.append(_make_entry())
             continue
 
         # Собран — проверяем цепочку зависимостей
-        deps_result   = _get_ext_deps(hi)
+        deps_result   = _get_ext_deps(hi_for_lookup)
         real_ext_deps = deps_result['real']
         filt_ext_deps = deps_result['filtered']
 
@@ -2156,13 +2347,18 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
             })
             if filt_ext_deps:
                 entry['filtered_deps'] = filt_ext_deps
+            if was_remapped:
+                entry['sign_remapped'] = True
             external_built.append(entry)
         else:
             # Все подозрительные зависимости отфильтрованы — бинарь чистый
-            if h_str in src_hashes:
+            if h_str_for_lookup in src_hashes or h_str in src_hashes:
                 binaries_from_src.append(_make_entry())
             else:
-                compiled_from_src.append(_make_entry())
+                entry = _make_entry()
+                if was_remapped:
+                    entry['sign_remapped'] = True
+                compiled_from_src.append(entry)
 
     del full_out_to_deps, all_output_hashes, all_dep_hashes
     del src_hashes_int, bin_hashes_int
@@ -2266,9 +2462,11 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     binaries_in_bin_path = os.path.join(RESULTS_DIR, project_name, "ext",
                                         "binaries_in_bin.txt")
 
-    if os.path.isfile(bin_json_path) and os.path.isfile(binaries_in_bin_path):
+    if os.path.isfile(binaries_in_bin_path) and os.path.isfile(bin_json_path):
         try:
-            # Читаем bin.json — строим индекс path -> hash
+            import re as _re_bin
+
+            # Строим индекс path→hash из bin.json для поиска хешей по нормализованному пути
             with open(bin_json_path, 'r', encoding='utf-8') as f:
                 bin_data = json.load(f)
             if isinstance(bin_data, list):
@@ -2278,73 +2476,108 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             else:
                 raw_files = bin_data.get('files', [])
 
-            # Строим индекс по нормализованному пути
+            def _norm_bin_path(p):
+                """Нормализует путь из bin.json или binaries_in_bin.txt:
+                убирает _dir суффиксы, ведущий слеш, добавляет project_name/ если нет."""
+                p = p.strip().lstrip('/')
+                # Убираем _dir суффиксы: foo.iso_dir/ → foo.iso/
+                p = _re_bin.sub(r'_dir(?=/|$)', '', p)
+                # Добавляем project_name/ если путь НЕ содержит его уже
+                prefix = project_name + '/'
+                if not p.startswith(prefix):
+                    if p.startswith('bin/') or p.startswith('src/'):
+                        p = prefix + p
+                return p
+
             path_to_hash = {}
             for item in raw_files:
                 p = item.get('path', '').strip()
                 h = item.get('hash', '').strip()
                 if p and h:
-                    # Нормализуем путь — убираем ведущий слеш если есть
-                    p_norm = p.lstrip('/')
-                    path_to_hash[p_norm] = h
-                    path_to_hash[p] = h  # также оригинальный путь
+                    path_to_hash[_norm_bin_path(p)] = h
+                    path_to_hash[p] = h  # оригинальный путь тоже
 
-            print(_ts() + "   bin.json loaded: {} entries".format(len(path_to_hash)))
+            print(_ts() + "   bin.json loaded: {} entries".format(len(raw_files)))
 
             # Читаем binaries_in_bin.txt
+            # Формат: TYPE<TAB>path  или  TYPE  path
+            # Хеш берём из bin.json по нормализованному пути.
+            # Если хеш не найден — добавляем запись БЕЗ хеша (hash='')
+            # чтобы pass4 мог работать используя путь как идентификатор.
             loaded = 0
             skipped_type = 0
-            skipped_hash = 0
             with open(binaries_in_bin_path, 'r', encoding='utf-8', errors='replace') as f:
-                for lineno, line in enumerate(f):
-                    raw = line
+                for line in f:
                     line = line.strip()
-                    if not line or line.startswith('TYPE') or line.startswith('---'):
+                    if not line or line.startswith('TYPE') or line.startswith('---') or line.startswith('#'):
                         continue
                     parts = line.split(None, 1)
                     if len(parts) < 2:
                         continue
                     ftype = parts[0].strip()
                     fpath = parts[1].strip()
-                    if lineno < 8:
-                        print(_ts() + "   line {}: type={!r} path={!r}".format(
-                            lineno, ftype, fpath[:80]))
                     if ftype not in ('ELF', 'PE32', 'MSDOS', 'BINARY_EXT'):
                         skipped_type += 1
                         continue
-                    fpath_with_prefix = "{}/{}".format(project_name, fpath)
-                    # Нормализуем — убираем суффиксы _dir добавленные analyze-ext
-                    # bin/foo.iso_dir/bar.deb_dir/file → KTDL.../bin/foo.iso/bar.deb/file
-                    import re
-                    fpath_norm = re.sub(r'_dir(?=/|$)', '', fpath_with_prefix)
-                    h = (path_to_hash.get(fpath_norm) or
-                         path_to_hash.get(fpath_with_prefix) or
-                         path_to_hash.get(fpath) or
-                         path_to_hash.get(fpath.lstrip('/')))
-                    if h:
-                        bin_entries.append({'path': fpath_norm, 'hash': h})
-                        loaded += 1
-                    else:
-                        skipped_hash += 1
-                        if skipped_hash <= 3:
-                            print(_ts() + "   hash not found for: {!r}".format(
-                                fpath_norm[:100]))
-            print(_ts() + "   binaries_in_bin.txt: loaded={}, skipped_type={}, skipped_hash={}".format(
-                loaded, skipped_type, skipped_hash))
 
+                    # Нормализуем путь из binaries_in_bin.txt
+                    fpath_norm = _norm_bin_path(fpath)
+
+                    # Ищем хеш в bin.json — пробуем несколько вариантов пути
+                    h = (path_to_hash.get(fpath_norm) or
+                         path_to_hash.get(fpath) or
+                         path_to_hash.get('{}/{}'.format(project_name, fpath)) or
+                         '')
+
+                    bin_entries.append({'path': fpath_norm, 'hash': h})
+                    loaded += 1
+
+            print(_ts() + "   binaries_in_bin.txt: loaded={}, skipped_type={}".format(
+                loaded, skipped_type))
+            no_hash = sum(1 for e in bin_entries if not e.get('hash'))
+            print(_ts() + "   bin_entries: {} total, {} without hash".format(
+                len(bin_entries), no_hash))
             print(_ts() + "   binaries_in_bin.txt: {} ELF/PE binaries loaded for Pass 4".format(
                 len(bin_entries)))
-            total_bin_count = len(bin_entries)   # сохраняем количество
+            total_bin_count = len(bin_entries)
         except Exception as e:
             print(_ts() + "   Could not load bin entries for Pass 4: {}".format(e))
             import traceback
             traceback.print_exc()
-    elif not os.path.isfile(bin_json_path):
-        print(_ts() + "   bin.json not found: {} — Pass 4 will be skipped".format(bin_json_path))
+    elif os.path.isfile(binaries_in_bin_path) and not os.path.isfile(bin_json_path):
+        # bin.json отсутствует — загружаем только пути без хешей
+        try:
+            import re as _re_bin
+            loaded = 0
+            skipped_type = 0
+            with open(binaries_in_bin_path, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('TYPE') or line.startswith('---') or line.startswith('#'):
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) < 2:
+                        continue
+                    ftype = parts[0].strip()
+                    fpath = parts[1].strip()
+                    if ftype not in ('ELF', 'PE32', 'MSDOS', 'BINARY_EXT'):
+                        skipped_type += 1
+                        continue
+                    fpath_norm = _re_bin.sub(r'_dir(?=/|$)', '', fpath.lstrip('/'))
+                    prefix = project_name + '/'
+                    if not fpath_norm.startswith(prefix):
+                        if fpath_norm.startswith('bin/') or fpath_norm.startswith('src/'):
+                            fpath_norm = prefix + fpath_norm
+                    bin_entries.append({'path': fpath_norm, 'hash': ''})
+                    loaded += 1
+            print(_ts() + "   binaries_in_bin.txt (no bin.json): loaded={} entries without hash".format(loaded))
+            total_bin_count = len(bin_entries)
+        except Exception as e:
+            print(_ts() + "   Could not load bin entries: {}".format(e))
     elif not os.path.isfile(binaries_in_bin_path):
         print(_ts() + "   binaries_in_bin.txt not found: {} — Pass 4 will be skipped".format(
             binaries_in_bin_path))
-        print(_ts() + "   Run analyze-ext_v3.sh first to generate binaries_in_bin.txt")
+        print(_ts() + "   Run analyze-ext.sh first to generate binaries_in_bin.txt")
 
     # src_hashes — множество хешей из src.json (все загруженные signatures)
     src_hashes = {
@@ -2431,11 +2664,13 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
         # Выделяем содержимое внешних пакетов из untraced_external
         print(_ts() + "   Starting external package content classification...")
-        p4_external_package_content, p4_untraced_external = \
+        p4_external_package_content, p4_built_package_content, p4_untraced_external = \
             classify_external_package_content(
                 p4_untraced_external, buildography_files)
-        print(_ts() + "   external_package_content={}, untraced_external={}".format(
-            len(p4_external_package_content), len(p4_untraced_external)))
+        print(_ts() + "   external_package_content={}, built_package_content={}, "
+              "untraced_external={}".format(
+              len(p4_external_package_content), len(p4_built_package_content),
+              len(p4_untraced_external)))
 
         pass4_ran = True
         print(_ts() + "   Pass 4 done. Memory freed: bin_entries, src_hashes")
@@ -2445,6 +2680,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         p4_external_built = p4_external_prebuilt = p4_untraced_external = \
         p4_system_binaries = []
         p4_external_package_content = []
+        p4_built_package_content    = []
         pass4_ran = False
         del src_hashes
         gc.collect()
@@ -2530,6 +2766,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         if p4_external_package_content:
             summary_bin_files["external_package_content"] = base_epc + ".txt"
 
+        # built_package_content — пакеты собранные из исходников
+        base_bpc = os.path.join(pass4_dir,
+                                "{}_built_package_content".format(project_name))
+        write_external_package_content_json(base_bpc + ".json",
+                                            p4_built_package_content)
+        write_external_package_content_txt(base_bpc + ".txt",
+                                           p4_built_package_content)
+
     # --- Статистика ---
     def pct(n, total):
         return (n / total * 100) if total else 0
@@ -2574,7 +2818,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         total_bin = (len(p4_compiled_from_src) + len(p4_binaries_from_src) +
                      len(p4_untraced_from_src) + len(p4_external_built) +
                      len(p4_external_prebuilt) + len(p4_untraced_external) +
-                     len(p4_system_binaries) + len(p4_external_package_content))
+                     len(p4_system_binaries) + len(p4_external_package_content) +
+                     len(p4_built_package_content))
         print("\n  Происхождение бинарей дистрибутива ({} файлов)".format(total_bin))
         print(sep)
         print("  Compiled from src  (собран из src.json)            : {:>7}  ({:.1f}%)".format(
@@ -2594,6 +2839,9 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         print("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(
             len(p4_external_package_content),
             pct(len(p4_external_package_content), total_bin)))
+        print("  Built pkg content  (содержимое собственных пакетов): {:>7}  ({:.1f}%)".format(
+            len(p4_built_package_content),
+            pct(len(p4_built_package_content), total_bin)))
 
     # =========================================================================
     # SUMMARY: копируем непустые отчёты в summary{N}/
