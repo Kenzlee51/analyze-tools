@@ -2482,11 +2482,9 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                 p = p.strip().lstrip('/')
                 # Убираем _dir суффиксы: foo.iso_dir/ → foo.iso/
                 p = _re_bin.sub(r'_dir(?=/|$)', '', p)
-                # Добавляем project_name/ если путь НЕ содержит его уже
-                prefix = project_name + '/'
-                if not p.startswith(prefix):
-                    if p.startswith('bin/') or p.startswith('src/'):
-                        p = prefix + p
+                # Добавляем project_name/ если путь начинается с bin/ или src/
+                if p.startswith('bin/') or p.startswith('src/'):
+                    p = '{}/{}'.format(project_name, p)
                 return p
 
             path_to_hash = {}
@@ -2564,10 +2562,9 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                         skipped_type += 1
                         continue
                     fpath_norm = _re_bin.sub(r'_dir(?=/|$)', '', fpath.lstrip('/'))
-                    prefix = project_name + '/'
-                    if not fpath_norm.startswith(prefix):
+                    if not fpath_norm.startswith(project_name):
                         if fpath_norm.startswith('bin/') or fpath_norm.startswith('src/'):
-                            fpath_norm = prefix + fpath_norm
+                            fpath_norm = '{}/{}'.format(project_name, fpath_norm)
                     bin_entries.append({'path': fpath_norm, 'hash': ''})
                     loaded += 1
             print(_ts() + "   binaries_in_bin.txt (no bin.json): loaded={} entries without hash".format(loaded))
@@ -2868,15 +2865,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     # binaries_in_src.txt из ext/
     binaries_in_src_path = os.path.join(
-        RESULTS_DIR, project_name, "ext", "binaries_in_bin.txt")
+        RESULTS_DIR, project_name, "ext", "binaries_in_src.txt")
     if os.path.isfile(binaries_in_src_path):
         dst = os.path.join(summary_bin_dir,
-                           "{}_binaries_in_src.txt".format(project_name))
+                       "{}_binaries_in_src.txt".format(project_name))
         _shutil.copy2(binaries_in_src_path, dst)
         print(_ts() + "   Summary bin: {}".format(os.path.basename(dst)))
-
-    print(_ts() + "   Summary done: src={} files, bin={} files".format(
-        len(summary_src_files), len(summary_bin_files)))
+    else:
+        print(_ts() + "   Warning: binaries_in_src.txt not found in ext/ for project {}".format(project_name))
 
     # =========================================================================
     # README для summary
