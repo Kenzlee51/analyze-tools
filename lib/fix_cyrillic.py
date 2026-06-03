@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Рекурсивно восстанавливает имена файлов/папок, испорченные проблемами кодировки.
-Обрабатываются только имена, содержащие суррогатные символы (невалидный UTF‑8).
-Корректная кириллица, латиница и прочие символы остаются без изменений.
-"""
+# Совместимо с Python 3.5
 
 import os
 import sys
@@ -32,6 +28,11 @@ def decode_broken_name(name):
             continue
     return name   # если не удалось восстановить, возвращаем как есть
 
+def safe_print(msg):
+    """Вывод строки с заменой недопустимых символов через repr."""
+    # Python 3.5: нет sys.stdout.reconfigure, поэтому используем repr
+    print(repr(msg))
+
 def fix_cyrillic_names(root_dir):
     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
         for name in filenames + dirnames:
@@ -46,7 +47,7 @@ def fix_cyrillic_names(root_dir):
                 base, ext = os.path.splitext(new_name)
                 counter = 1
                 while True:
-                    candidate = f"{base}_{counter}{ext}"
+                    candidate = "{}_{}{}".format(base, counter, ext)
                     candidate_path = os.path.join(dirpath, candidate)
                     if not os.path.exists(candidate_path):
                         new_full_path = candidate_path
@@ -54,8 +55,7 @@ def fix_cyrillic_names(root_dir):
                         break
                     counter += 1
             os.rename(full_path, new_full_path)
-            # repr для безопасного вывода
-            print(f"FIXED: {repr(full_path)} -> {repr(new_name)}")
+            safe_print("FIXED: {!r} -> {!r}".format(full_path, new_name))
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
@@ -63,6 +63,6 @@ if __name__ == '__main__':
         sys.exit(1)
     root = sys.argv[1]
     if not os.path.isdir(root):
-        print(f"Error: {root} is not a directory")
+        print("Error: {} is not a directory".format(root))
         sys.exit(1)
     fix_cyrillic_names(root)
