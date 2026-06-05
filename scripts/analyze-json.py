@@ -900,14 +900,18 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
     return input_files, output_files
 
 
-def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds):
+def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds,
+                        all_good_cmds=None):
     """
     Классифицирует интерпретируемые файлы из signatures на четыре категории:
       - executed:   только Python-файлы, которые были входными для команд интерпретаторов
                     (добавляется поле "commands" со списком полных команд)
       - compiled:   выходные файлы интерпретаторов + входные любых языков, чьи выходы попали в bin
+                    (транзитивно — если выход команды транзитивно попадает в bin)
       - copied:     файлы, присутствующие в bin.json, но не вошедшие в executed/compiled
       - izb:        остальные (избыточные)
+    all_good_cmds — множество индексов команд транзитивно приводящих к bin (из pass2 BFS).
+                    Если передано — используется вместо прямой проверки cmd_has_bin_output.
     Возвращает кортеж (executed, compiled, copied, izb).
     """
     # Множества для быстрой проверки
@@ -941,28 +945,38 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
         if p:
             output_by_path.setdefault(p, set()).add(out['cmd_index'])
 
-    # Для каждой команды запомним, есть ли у неё выходы в bin
-    cmd_has_bin_output = [False] * len(raw_cmds)
-    for cmd_idx, cmd in enumerate(raw_cmds):
-        outputs = cmd.get('output', {})
-        if isinstance(outputs, dict):
-            for path, h in outputs.items():
-                path = path.strip()
-                h = h.strip()
-                if (h and h in bin_hashes_set) or (path and os.path.normpath(path) in bin_paths_set):
-                    cmd_has_bin_output[cmd_idx] = True
-                    break
-        elif isinstance(outputs, list):
-            for out in outputs:
-                if isinstance(out, dict):
-                    path = out.get('path', '').strip()
-                    h = out.get('hash', '').strip()
-                else:
-                    path = str(out).strip()
-                    h = ''
-                if (h and h in bin_hashes_set) or (path and os.path.normpath(path) in bin_paths_set):
-                    cmd_has_bin_output[cmd_idx] = True
-                    break
+    # Для каждой команды определяем попадает ли её выход (транзитивно) в bin.
+    # Если передан all_good_cmds из pass2 BFS — используем его (транзитивная проверка).
+    # Иначе — прямая проверка выходов команды.
+    if all_good_cmds is not None:
+        # Транзитивная проверка: команда "хорошая" если её выход транзитивно попадает в bin
+        cmd_has_bin_output = [idx in all_good_cmds for idx in range(len(raw_cmds))]
+        good_count = sum(1 for x in cmd_has_bin_output if x)
+        print(_ts() + "   Pass 3: using transitive good_cmds: {}/{} commands lead to bin".format(
+            good_count, len(raw_cmds)))
+    else:
+        # Прямая проверка — только команды чей выход напрямую в bin
+        cmd_has_bin_output = [False] * len(raw_cmds)
+        for cmd_idx, cmd in enumerate(raw_cmds):
+            outputs = cmd.get('output', {})
+            if isinstance(outputs, dict):
+                for path, h in outputs.items():
+                    path = path.strip()
+                    h = h.strip()
+                    if (h and h in bin_hashes_set) or (path and os.path.normpath(path) in bin_paths_set):
+                        cmd_has_bin_output[cmd_idx] = True
+                        break
+            elif isinstance(outputs, list):
+                for out in outputs:
+                    if isinstance(out, dict):
+                        path = out.get('path', '').strip()
+                        h = out.get('hash', '').strip()
+                    else:
+                        path = str(out).strip()
+                        h = ''
+                    if (h and h in bin_hashes_set) or (path and os.path.normpath(path) in bin_paths_set):
+                        cmd_has_bin_output[cmd_idx] = True
+                        break
 
     # Преобразуем команды в строки для вывода
     cmd_idx_to_command = {}
@@ -1051,7 +1065,24 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             if in_bin:
                 compiled_used.append({'path': path, 'hash': h})
             else:
-                compiled_unused.append({'path': path, 'hash': h})
+                # Проверяем, не используется ли этот файл как вход хорошей команды
+                is_used = False
+                if h and h in input_hashes:
+                    cmd_indices = input_by_hash.get(h, set())
+                    for idx in cmd_indices:
+                        if cmd_has_bin_output[idx]:
+                            is_used = True
+                            break
+                elif p_norm and p_norm in input_paths_norm:
+                    cmd_indices = input_by_path.get(p_norm, set())
+                    for idx in cmd_indices:
+                        if cmd_has_bin_output[idx]:
+                            is_used = True
+                            break
+                if is_used:
+                    compiled_used.append({'path': path, 'hash': h})
+                else:
+                    compiled_unused.append({'path': path, 'hash': h})
             added_compiled_paths.add(p_norm)
 
     return executed, compiled_used, compiled_unused, copied, izb
@@ -2379,11 +2410,37 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         len(redundant), len(untraced_in_distrib)))
 
     # --- Проход 2 (компиляторы) ---
+    all_good_cmds = None  # будет передан в pass3
     if compiler_basenames:
         print(_ts() + "   Starting pass 2 (transitive closure from bin using compilers)...")
-        good_compiler_input_keys = build_good_compiler_inputs(
-            raw_cmds, compiler_basenames, bin_hashes, bin_paths
-        )
+        # Строим транзитивный граф — он пригодится и для pass2 и для pass3
+        all_good_cmds = build_transitive_good_commands(raw_cmds, bin_hashes, bin_paths)
+
+        # Отбираем входы компиляторов из хороших команд
+        good_compiler_input_keys = set()
+        compiler_linker = set(compiler_basenames) | set(linker_basenames or set())
+        for idx in all_good_cmds:
+            cmd = raw_cmds[idx]
+            cmd_list = cmd.get('command', [])
+            if not cmd_list:
+                continue
+            if os.path.basename(cmd_list[0]) not in compiler_linker:
+                continue
+            deps = cmd.get('dependencies', {})
+            if isinstance(deps, dict):
+                for path, h in deps.items():
+                    if h: good_compiler_input_keys.add(h.strip())
+                    if path: good_compiler_input_keys.add(os.path.normpath(path))
+            elif isinstance(deps, list):
+                for dep in deps:
+                    if isinstance(dep, dict):
+                        h = dep.get('hash', '').strip()
+                        path = dep.get('path', '').strip()
+                    else:
+                        h, path = '', str(dep).strip()
+                    if h: good_compiler_input_keys.add(h)
+                    if path: good_compiler_input_keys.add(os.path.normpath(path))
+
         print(_ts() + "   Good compiler input keys: {}".format(len(good_compiler_input_keys)))
         direct, parent, redundant, not_compiled = analyze_pass2(
             direct, parent, redundant, good_compiler_input_keys
@@ -2401,7 +2458,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         input_files, output_files = build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames)
         print(_ts() + "   Interpreted input files: {}, output files: {}".format(len(input_files), len(output_files)))
         executed, compiled_used, compiled_unused, copied, izb = analyze_interpreted(
-            signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds
+            signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds,
+            all_good_cmds=all_good_cmds
         )
         del input_files, output_files
         gc.collect()
