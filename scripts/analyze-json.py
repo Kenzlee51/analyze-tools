@@ -2678,7 +2678,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     # binaries_in_src.txt из ext/
     binaries_in_src_path = os.path.join(
-        RESULTS_DIR, project_name, "ext", "binaries_in_bin.txt")
+        RESULTS_DIR, project_name, "ext", "binaries_in_src.txt")
     if os.path.isfile(binaries_in_src_path):
         dst = os.path.join(summary_bin_dir,
                            "{}_binaries_in_src.txt".format(project_name))
