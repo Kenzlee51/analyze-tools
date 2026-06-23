@@ -1846,6 +1846,66 @@ def write_external_package_content_txt(output_path, entries):
     print(_ts() + "   Written {} entries -> {}".format(len(rows), versioned_path))
 
 
+def build_apt_download_hashes(buildography_files):
+    """
+    Сканирует buildography и собирает хеши .deb файлов из output команд apt download.
+    Логика:
+      1. Видим apt download — фиксируем хеши .deb из output
+      2. Если такой хеш есть в bin.json → external_package_content
+      3. Если такой хеш есть в src.json → тоже external_package_content
+         (он уже учтён в binaries_in_src, не надо писать в untraced_from_src)
+    Возвращает:
+      apt_deb_hashes     : set хешей .deb файлов скачанных через apt download
+      apt_deb_containers : dict hash -> имя .deb файла (для поля container)
+    """
+    apt_deb_hashes     = set()
+    apt_deb_containers = {}
+
+    for file_path in buildography_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f, strict=False)
+        except Exception as e:
+            print(_ts() + "   build_apt_download_hashes: skip {}: {}".format(
+                os.path.basename(file_path), e))
+            continue
+
+        for cmd in data.get('component_commands', []):
+            cmd_list = cmd.get('command', [])
+            if not cmd_list:
+                continue
+            tool = os.path.basename(str(cmd_list[0]))
+            if tool != 'apt':
+                continue
+            if len(cmd_list) < 2 or cmd_list[1] != 'download':
+                continue
+
+            # Это apt download — берём все .deb из output
+            outputs = cmd.get('output', [])
+            if isinstance(outputs, dict):
+                items = [{'path': p, 'hash': h} for p, h in outputs.items()]
+            elif isinstance(outputs, list):
+                items = outputs
+            else:
+                items = []
+
+            for out in items:
+                if isinstance(out, dict):
+                    path = out.get('path', '')
+                    h    = out.get('hash', '').strip()
+                else:
+                    continue
+                if path.lower().endswith('.deb') and h:
+                    apt_deb_hashes.add(h)
+                    apt_deb_containers[h] = os.path.basename(path)
+
+        del data
+
+    print(_ts() + "   apt download index: {} .deb packages known".format(
+        len(apt_deb_hashes)))
+    return apt_deb_hashes, apt_deb_containers
+
+
 def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
                   compiler_basenames=None, linker_basenames=None):
     """
@@ -1866,6 +1926,9 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     else:
         compiler_linker_basenames = None
         print(_ts() + "   Pass 4: compiler+linker filter: disabled")
+
+    # Строим индекс apt download пакетов — они заведомо внешние
+    apt_deb_hashes, apt_deb_containers = build_apt_download_hashes(buildography_files)
 
     # Конвертируем src_hashes в int
     src_hashes_int = set()
@@ -1963,13 +2026,14 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     # ==========================================================================
     # Классификация бинарей
     # ==========================================================================
-    system_binaries  = []  # путь в дистрибутиве — системный (usr/lib, lib и т.д.)
-    compiled_from_src = [] # сценарий 1: собран из src.json, трассировщик подтверждает
-    binaries_from_src = [] # сценарий 2: хеш в src.json, скопирован напрямую
-    untraced_from_src = [] # сценарий 6: хеш в src.json, трассировщик не видит
-    external_built   = []  # сценарий 5: собран из внешних исходников
-    external_prebuilt = [] # сценарий 3: готовый бинарь извне, трассировщик видит
-    untraced_external = [] # сценарий 4: не в src.json, трассировщик не видит
+    system_binaries        = []  # путь в дистрибутиве — системный (usr/lib, lib и т.д.)
+    compiled_from_src      = []  # сценарий 1: собран из src.json, трассировщик подтверждает
+    binaries_from_src      = []  # сценарий 2: хеш в src.json, скопирован напрямую
+    untraced_from_src      = []  # сценарий 6: хеш в src.json, трассировщик не видит
+    external_built         = []  # сценарий 5: собран из внешних исходников
+    external_prebuilt      = []  # сценарий 3: готовый бинарь извне, трассировщик видит
+    untraced_external      = []  # сценарий 4: не в src.json, трассировщик не видит
+    apt_package_content    = []  # apt download: заведомо внешние .deb пакеты
 
     # Системные пути в дистрибутиве — проверяем путь бинаря в дистрибутиве
     DISTRIB_SYSTEM_PREFIXES = (
@@ -2150,6 +2214,18 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
                 e.update(extra)
             return e
 
+        # Нулевой фильтр — файл скачан через apt download (заведомо внешний)
+        # Логика: видим хеш в apt download output → внешний пакет, независимо
+        # от того есть ли он в src.json или нет.
+        if h_str in apt_deb_hashes:
+            apt_package_content.append(_make_entry({
+                'package_type': 'deb',
+                'source':       'apt download',
+                'command':      'apt download',
+                'container':    apt_deb_containers.get(h_str, container or ''),
+            }))
+            continue
+
         # Первый фильтр — системный путь в дистрибутиве
         if _is_distrib_system_path(path):
             system_binaries.append(_make_entry())
@@ -2203,13 +2279,14 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     print(_ts() + "   Pass 4 done: "
           "compiled_from_src={}, binaries_from_src={}, untraced_from_src={}, "
           "external_built={}, external_prebuilt={}, untraced_external={}, "
-          "system_binaries={}".format(
+          "system_binaries={}, apt_package_content={}".format(
           len(compiled_from_src), len(binaries_from_src), len(untraced_from_src),
           len(external_built), len(external_prebuilt), len(untraced_external),
-          len(system_binaries)))
+          len(system_binaries), len(apt_package_content)))
 
     return (compiled_from_src, binaries_from_src, untraced_from_src,
-            external_built, external_prebuilt, untraced_external, system_binaries)
+            external_built, external_prebuilt, untraced_external, system_binaries,
+            apt_package_content)
 
 
 
@@ -2479,7 +2556,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         script_dir = os.path.dirname(os.path.abspath(__file__))
         p4_compiled_from_src, p4_binaries_from_src, p4_untraced_from_src, \
         p4_external_built, p4_external_prebuilt, p4_untraced_external, \
-        p4_system_binaries = analyze_pass4(
+        p4_system_binaries, p4_apt_package_content = analyze_pass4(
             bin_entries, src_hashes, buildography_files, script_dir,
             compiler_basenames=compiler_basenames,
             linker_basenames=linker_basenames
@@ -2492,8 +2569,12 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         p4_external_package_content, p4_untraced_external = \
             classify_external_package_content(
                 p4_untraced_external, buildography_files)
-        print(_ts() + "   external_package_content={}, untraced_external={}".format(
-            len(p4_external_package_content), len(p4_untraced_external)))
+
+        # Объединяем apt_package_content с external_package_content
+        p4_external_package_content.extend(p4_apt_package_content)
+        print(_ts() + "   external_package_content={} (incl. apt={}), untraced_external={}".format(
+            len(p4_external_package_content), len(p4_apt_package_content),
+            len(p4_untraced_external)))
 
         pass4_ran = True
         print(_ts() + "   Pass 4 done. Memory freed: bin_entries, src_hashes")
