@@ -1848,18 +1848,16 @@ def write_external_package_content_txt(output_path, entries):
 
 def build_apt_download_hashes(buildography_files):
     """
-    Сканирует buildography и собирает хеши .deb файлов из output команд apt download.
+    Сканирует buildography и собирает имена .deb файлов из output команд apt download.
     Логика:
-      1. Видим apt download — фиксируем хеши .deb из output
-      2. Если такой хеш есть в bin.json → external_package_content
+      1. Видим apt download — фиксируем имена .deb из output
+      2. Если путь бинаря в bin.json содержит такое имя → external_package_content
       3. Если такой хеш есть в src.json → тоже external_package_content
          (он уже учтён в binaries_in_src, не надо писать в untraced_from_src)
     Возвращает:
-      apt_deb_hashes     : set хешей .deb файлов скачанных через apt download
-      apt_deb_containers : dict hash -> имя .deb файла (для поля container)
+      apt_deb_names : set имён .deb файлов {'libgcc-6-dev_...deb', ...}
     """
-    apt_deb_hashes     = set()
-    apt_deb_containers = {}
+    apt_deb_names = set()
 
     for file_path in buildography_files:
         try:
@@ -1892,18 +1890,16 @@ def build_apt_download_hashes(buildography_files):
             for out in items:
                 if isinstance(out, dict):
                     path = out.get('path', '')
-                    h    = out.get('hash', '').strip()
                 else:
                     continue
-                if path.lower().endswith('.deb') and h:
-                    apt_deb_hashes.add(h)
-                    apt_deb_containers[h] = os.path.basename(path)
+                bn = os.path.basename(path)
+                if bn.lower().endswith('.deb'):
+                    apt_deb_names.add(bn)
 
         del data
 
-    print(_ts() + "   apt download index: {} .deb packages known".format(
-        len(apt_deb_hashes)))
-    return apt_deb_hashes, apt_deb_containers
+    print(_ts() + "   apt download index: {} .deb packages known".format(len(apt_deb_names)))
+    return apt_deb_names
 
 
 def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
@@ -1928,7 +1924,7 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
         print(_ts() + "   Pass 4: compiler+linker filter: disabled")
 
     # Строим индекс apt download пакетов — они заведомо внешние
-    apt_deb_hashes, apt_deb_containers = build_apt_download_hashes(buildography_files)
+    apt_deb_names = build_apt_download_hashes(buildography_files)
 
     # Конвертируем src_hashes в int
     src_hashes_int = set()
@@ -2033,7 +2029,7 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     external_built         = []  # сценарий 5: собран из внешних исходников
     external_prebuilt      = []  # сценарий 3: готовый бинарь извне, трассировщик видит
     untraced_external      = []  # сценарий 4: не в src.json, трассировщик не видит
-    apt_package_content    = []  # apt download: заведомо внешние .deb пакеты
+    apt_package_content    = []  # apt download: файлы внутри скачанных .deb пакетов
 
     # Системные пути в дистрибутиве — проверяем путь бинаря в дистрибутиве
     DISTRIB_SYSTEM_PREFIXES = (
@@ -2214,15 +2210,15 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
                 e.update(extra)
             return e
 
-        # Нулевой фильтр — файл скачан через apt download (заведомо внешний)
-        # Логика: видим хеш в apt download output → внешний пакет, независимо
-        # от того есть ли он в src.json или нет.
-        if h_str in apt_deb_hashes:
+        # Нулевой фильтр — файл внутри .deb пакета скачанного через apt download.
+        # Проверяем по имени контейнера в пути, не по хешу —
+        # хеш содержимого не совпадает с хешем самого .deb архива.
+        apt_container = _get_container(path)
+        if apt_container and apt_container in apt_deb_names:
             apt_package_content.append(_make_entry({
                 'package_type': 'deb',
                 'source':       'apt download',
                 'command':      'apt download',
-                'container':    apt_deb_containers.get(h_str, container or ''),
             }))
             continue
 
