@@ -1347,18 +1347,55 @@ def _hash_to_int(h):
 
 def _log_memory(label):
     try:
+        # --- Память процесса (Python) ---
         with open('/proc/self/status', 'r') as f:
             status = f.read()
-        def _get_kb(field):
+        def _get_status_kb(field):
             for line in status.splitlines():
                 if line.startswith(field + ':'):
                     return int(line.split()[1])
             return 0
-        vmrss  = _get_kb('VmRSS')
-        vmvirt = _get_kb('VmSize')
-        vmswap = _get_kb('VmSwap')
-        print(_ts() + "   {}: RSS={:.1f} MB, VIRT={:.1f} MB, SWAP={:.1f} MB".format(
-            label, vmrss/1024, vmvirt/1024, vmswap/1024))
+        vmrss  = _get_status_kb('VmRSS')
+        vmvirt = _get_status_kb('VmSize')
+        vmswap = _get_status_kb('VmSwap')
+
+        # --- Системная память ---
+        sys_info = {}
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0].rstrip(':')
+                    try:
+                        sys_info[key] = int(parts[1])  # в кБ
+                    except ValueError:
+                        pass
+
+        mem_total     = sys_info.get('MemTotal', 0)
+        mem_available = sys_info.get('MemAvailable', 0)
+        mem_used      = mem_total - mem_available
+        mem_cached    = sys_info.get('Cached', 0) + sys_info.get('Buffers', 0)
+        swap_total    = sys_info.get('SwapTotal', 0)
+        swap_free     = sys_info.get('SwapFree', 0)
+        swap_used     = swap_total - swap_free
+
+        print(_ts() + "   [{label}]".format(label=label))
+        print(_ts() + "     Process : RSS={rss:.1f} MB  VIRT={virt:.1f} MB  SWAP={swap:.1f} MB".format(
+            rss=vmrss/1024, virt=vmvirt/1024, swap=vmswap/1024))
+        print(_ts() + "     System  : used={used:.1f}/{total:.1f} GB  available={avail:.1f} GB  "
+              "cache={cache:.1f} GB  swap={swused:.1f}/{swtotal:.1f} GB".format(
+            used=mem_used/1024/1024,
+            total=mem_total/1024/1024,
+            avail=mem_available/1024/1024,
+            cache=mem_cached/1024/1024,
+            swused=swap_used/1024/1024,
+            swtotal=swap_total/1024/1024))
+
+        # Предупреждение если мало свободной памяти
+        if mem_available > 0 and mem_available < mem_total * 0.1:
+            print(_ts() + "     [WARN] Low memory: {:.1f} GB available ({:.0f}% of total)".format(
+                mem_available/1024/1024, mem_available/mem_total*100))
+
     except Exception as e:
         print(_ts() + "   {}: could not read memory: {}".format(label, e))
 
@@ -1979,8 +2016,10 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
         # Объединяем с общим графом
         for out_hi, deps in out_to_deps.items():
-            existing = full_out_to_deps.get(out_hi, [])
-            full_out_to_deps[out_hi] = existing + deps
+            if out_hi in full_out_to_deps:
+                full_out_to_deps[out_hi].extend(deps)
+            else:
+                full_out_to_deps[out_hi] = list(deps)
 
         all_output_hashes.update(output_hashes_seen)
         all_dep_hashes.update(dep_hashes_seen)
@@ -2114,14 +2153,20 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     total_bin = len(bin_entries)
     print(_ts() + "   Pass 4: classifying {} binaries...".format(total_bin))
 
+    # Кэш результатов _get_ext_deps — только real зависимости.
+    # filtered не кэшируем — они нужны только для финальной записи в JSON
+    # и могут быть очень большими (тысячи системных путей).
+    # Для классификации достаточно знать есть ли real зависимости.
+    _ext_deps_real_cache = {}   # hi -> list of real deps (без filtered)
+    _ext_deps_visited_cache = set()  # hi для которых уже известно real=[]
+
     def _get_ext_deps(start_hi):
         """
         Итеративный BFS по графу зависимостей начиная с start_hi.
-        Рекурсия заменена на явную очередь — защита от циклов и глубоких цепочек.
-
         Возвращает dict с двумя списками:
           real     — реально подозрительные внешние зависимости
           filtered — зависимости отфильтрованные как допустимые
+        Кэширует только real зависимости для экономии памяти.
         """
         from collections import deque
 
@@ -2135,6 +2180,13 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
             if hi in visited:
                 continue
             visited.add(hi)
+
+            # Для промежуточных узлов используем кэш real зависимостей
+            if hi != start_hi and hi in _ext_deps_real_cache:
+                real.extend(_ext_deps_real_cache[hi])
+                # filtered для промежуточных узлов пересчитываем на лету
+                # (они не кэшируются — слишком много памяти)
+                continue
 
             for (dep_hi, dep_path, dep_h_str) in full_out_to_deps.get(hi, []):
                 if _is_system_path(dep_path):
@@ -2156,6 +2208,8 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
                         real.append({"hash": dep_h_str, "path": dep_path})
 
         real = _merge_so_aliases(real)
+        # Кэшируем только real для промежуточных узлов
+        _ext_deps_real_cache[start_hi] = real
         return {"real": real, "filtered": filtered}
 
 
@@ -2254,12 +2308,20 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
         filt_ext_deps = deps_result['filtered']
 
         if real_ext_deps:
-            entry = _make_entry({
-                'external_deps': real_ext_deps,
-            })
-            if filt_ext_deps:
-                entry['filtered_deps'] = filt_ext_deps
-            external_built.append(entry)
+            # filtered_deps дедуплицируем по пути — убираем тысячи одинаковых
+            # системных путей, оставляем только уникальные
+            seen_filtered = set()
+            deduped_filtered = []
+            for fd in filt_ext_deps:
+                fp = fd.get('path', '')
+                if fp not in seen_filtered:
+                    seen_filtered.add(fp)
+                    deduped_filtered.append(fd)
+
+            e = _make_entry({'external_deps': real_ext_deps})
+            if deduped_filtered:
+                e['filtered_deps'] = deduped_filtered
+            external_built.append(e)
         else:
             # Все подозрительные зависимости отфильтрованы — бинарь чистый
             if h_str in src_hashes:
