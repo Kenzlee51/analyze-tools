@@ -192,42 +192,9 @@ import array
 import bisect
 import gc
 import sqlite3
+import json
 import sys
 import os
-
-# Пробуем загрузить orjson из локальной папки lib/ рядом со скриптом.
-# orjson в 3-5 раз быстрее стандартного json при парсинге больших файлов.
-# Если не найден или не совместим — используем стандартный json.
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_LIB_DIR    = os.path.join(os.path.dirname(_SCRIPT_DIR), 'lib')
-try:
-    if os.path.isdir(_LIB_DIR):
-        sys.path.insert(0, _LIB_DIR)
-    import orjson as _orjson
-
-    def _json_loads(data):
-        """Парсит JSON строку/байты через orjson."""
-        if isinstance(data, str):
-            data = data.encode('utf-8', errors='replace')
-        return _orjson.loads(data)
-
-    print("[INFO] JSON backend: orjson {} (fast mode)".format(_orjson.__version__), flush=True)
-    _ORJSON_AVAILABLE = True
-
-except (ImportError, Exception) as _e:
-    import json as _json_stdlib
-
-    def _json_loads(data):
-        """Парсит JSON строку через стандартный json."""
-        if isinstance(data, bytes):
-            data = data.decode('utf-8', errors='replace')
-        return _json_stdlib.loads(data, strict=False)
-
-    _ORJSON_AVAILABLE = False
-    _orjson_reason = str(_e) if not isinstance(_e, ImportError) else "not found in {}".format(_LIB_DIR)
-    print("[INFO] JSON backend: stdlib json (orjson unavailable: {})".format(_orjson_reason), flush=True)
-
-import json  # оставляем для совместимости с остальным кодом
 import argparse
 import glob
 import time
@@ -239,28 +206,12 @@ _SCRIPT_START = time.monotonic()
 
 
 def _ts():
-    """Возвращает строку [HH:MM:SS] от начала запуска."""
+    """Возвращает строку [MM:SS] от начала запуска."""
     elapsed = int(time.monotonic() - _SCRIPT_START)
-    h = elapsed // 3600
-    m = (elapsed % 3600) // 60
-    s = elapsed % 60
-    return "[{:02d}:{:02d}:{:02d}]".format(h, m, s)
+    return "[{:02d}:{:02d}]".format(elapsed // 60, elapsed % 60)
 
 # =============================================================================
 # НАСТРАИВАЕМЫЕ ПУТИ
-# =============================================================================
-# Эвристика для Java: если True, .class файлы чьё базовое имя совпадает
-# с .java файлом из src.json считаются собственными (compiled_from_src).
-# Покрывает случай когда трассировщик не видит компиляцию javac.
-# Включает внутренние классы: File$Inner.class → File.java
-# --trust-java в командной строке перекрывает это значение.
-TRUST_JAVA = True
-
-# Шаг прогресса для Pass 4 iter (в процентах).
-# 10 = каждые 10% (11 строк на итерацию)
-# 1  = каждый 1%  (101 строка — подробно)
-# 25 = каждые 25% (5 строк — кратко)
-PASS4_PROGRESS_STEP_PCT = 10
 # =============================================================================
 BASE_DIR         = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDOGRAPHY_DIR = os.path.join(BASE_DIR, "buildography", "builds")
@@ -1449,36 +1400,11 @@ def _log_memory(label):
         print(_ts() + "   {}: could not read memory: {}".format(label, e))
 
 
-# Расширения ресурсных файлов — не являются признаком внешних исходников.
-# Если такой файл попадает в зависимости бинаря — это не делает его external_built.
-RESOURCE_EXTENSIONS = {
-    # Конфигурация и данные
-    '.xml', '.properties', '.yaml', '.yml', '.json', '.toml', '.ini', '.cfg',
-    '.txt', '.csv', '.tsv',
-    # Документация
-    '.md', '.rst', '.html', '.htm', '.css', '.adoc',
-    # Изображения и медиа
-    '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.bmp', '.tiff',
-    '.ttf', '.woff', '.woff2', '.eot', '.otf',
-    '.mp3', '.mp4', '.wav', '.ogg',
-    # Java манифесты и метаданные пакетов
-    '.mf', '.sf',       # MANIFEST.MF, signature files
-    '.dsp', '.dtd', '.xsd', '.xsl', '.xslt',
-    # Скрипты сборки (не исходники)
-    '.bat', '.cmd', '.ps1',
-    # Прочие ресурсы
-    '.sql', '.graphql',
-    '.lock',            # package-lock.json, Cargo.lock и т.д.
-    '.map',             # source maps
-}
-
 SYSTEM_PATH_PREFIXES = (
     '/usr/lib/', '/usr/lib64/', '/lib/', '/lib64/',
     '/usr/include/', '/usr/local/lib/', '/usr/local/include/',
     '/etc/', '/proc/', '/sys/', '/dev/',
     '/usr/share/', '/var/',
-    '/tmp/hsperfdata_',  # JVM performance data
-    '/run/', '/snap/',
     # Cross-compiler sysroots
     '/usr/arm-linux-gnueabi/', '/usr/arm-linux-gnueabihf/',
     '/usr/aarch64-linux-gnu/', '/usr/mips-linux-gnu/',
@@ -1575,36 +1501,8 @@ def _count_cmds(buildography_files):
     return total
 
 
-def _collect_output_hashes(buildography_files):
-    """
-    Быстрый предварительный проход — собирает все output хеши из buildography.
-    Нужен чтобы в _scan_pass корректно определять промежуточные артефакты.
-    """
-    output_hashes = set()
-    for file_path in buildography_files:
-        with open(file_path, 'rb') as f:
-            data = _json_loads(f.read())
-        for cmd in data.get('component_commands', []):
-            outputs = cmd.get('output', {})
-            if isinstance(outputs, dict):
-                for _, h in outputs.items():
-                    hi = _hash_to_int(h.strip() if h else '')
-                    if hi is not None:
-                        output_hashes.add(hi)
-            elif isinstance(outputs, list):
-                for out in outputs:
-                    if isinstance(out, dict):
-                        hi = _hash_to_int(out.get('hash', '').strip())
-                        if hi is not None:
-                            output_hashes.add(hi)
-        del data
-    return output_hashes
-
-
 def _scan_pass(buildography_files, target_hashes, total_cmds, label,
-               compiler_linker_basenames=None,
-               src_hashes_int=None, all_output_hashes=None,
-               progress_step_pct=10):
+               compiler_linker_basenames=None):
     """
     Один проход по buildography.
     Для команд чьи выходы пересекаются с target_hashes —
@@ -1612,53 +1510,29 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label,
 
     compiler_linker_basenames — множество имён компиляторов и линкеров из utilities.yaml.
     Если задано, в out_to_deps попадают только зависимости команд-компиляторов/линкеров.
-
-    src_hashes_int, all_output_hashes — если заданы, фильтруем dep прямо здесь:
-      - системные пути (/usr/lib/, /usr/include/ и т.д.) → отбрасываем
-      - хеши из src.json → отбрасываем (не подозрительные)
-      - допустимые внешние (.h, .so из системных путей) → отбрасываем
-      - промежуточные артефакты (есть в output buildography) → сохраняем для iter2/3
-      - реально подозрительные → сохраняем
-    Это снижает размер out_to_deps на порядок и уменьшает RAM.
+    Зависимости команд типа cp/install/cat/make игнорируются как неподозрительные.
 
     Возвращает:
-      out_to_deps        : dict {out_hash_int -> [(dep_hash_int, dep_path, dep_hash_str)]}
-                           содержит ТОЛЬКО подозрительные dep (не системные, не src, не /tmp/ промежуточные)
-      frontier_hashes    : set хешей промежуточных артефактов для следующей итерации
-                           (dep которые есть в all_output_hashes — нужны для iter2/3)
+      out_to_deps : dict {out_hash_int -> [(dep_hash_int, dep_path, dep_hash_str)]}
       output_hashes_seen : set всех output хешей встреченных в этом проходе
       dep_hashes_seen    : set всех dep хешей встреченных в этом проходе
     """
     out_to_deps        = {}
-    frontier_hashes    = set()  # хеши промежуточных артефактов — только int, без путей
     output_hashes_seen = set()
     dep_hashes_seen    = set()
-
-    # Флаг — применять ли фильтрацию dep
-    do_filter = src_hashes_int is not None and all_output_hashes is not None
 
     # Для раннего выхода: отслеживаем сколько целей из frontier уже найдено
     targets_remaining = set(target_hashes)
 
-    # Статистика фильтрации — для отображения прогресса
-    stat_deps_total    = 0  # всего dep встречено
-    stat_deps_system   = 0  # отброшено: системные пути
-    stat_deps_src      = 0  # отброшено: наши исходники
-    stat_deps_allowed  = 0  # отброшено: допустимые внешние
-    stat_deps_kept     = 0  # сохранено: подозрительные + промежуточные
-    stat_cmds_relevant = 0  # команд у которых output в frontier
-    _last_stat_report  = 0  # когда последний раз печатали статистику
-
     processed = 0
     for file_path in buildography_files:
-        with open(file_path, 'rb') as f:
-            raw = f.read()
-        data = _json_loads(raw)
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            data = json.load(f, strict=False)
         cmds = data.get('component_commands', [])
 
         for cmd in cmds:
             processed += 1
-            progress_log(label, processed, total_cmds, step_pct=progress_step_pct)
+            progress_log(label, processed, total_cmds)
 
             # Выходы
             out_ints = set()
@@ -1686,87 +1560,39 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label,
             targets_remaining -= relevant
 
             # Проверяем является ли команда компилятором/линкером
+            # Если список задан и команда не компилятор/линкер — зависимости не собираем
             if compiler_linker_basenames is not None:
                 cmd_list = cmd.get('command', [])
                 cmd_tool = os.path.basename(cmd_list[0]) if cmd_list else ''
                 is_compiler_or_linker = cmd_tool in compiler_linker_basenames
             else:
-                is_compiler_or_linker = True
+                is_compiler_or_linker = True  # фильтр не задан — берём все
 
-            # Зависимости — с фильтрацией или без
+            # Зависимости
             deps_raw = cmd.get('dependencies', {})
             dep_list = []
-
-            def _process_dep(path, h):
-                """Обрабатывает одну dep запись — фильтрует или добавляет."""
-                nonlocal stat_deps_total, stat_deps_system, stat_deps_src
-                nonlocal stat_deps_allowed, stat_deps_kept
-                hi = _hash_to_int(h)
-                if hi is None:
-                    return
-                dep_hashes_seen.add(hi)
-                stat_deps_total += 1
-                if do_filter:
-                    # Системный путь → выбрасываем (не подозрительно)
-                    if _is_system_path(path):
-                        stat_deps_system += 1
-                        return
-                    # Наш исходник → выбрасываем (не подозрительно)
-                    if hi in src_hashes_int:
-                        stat_deps_src += 1
-                        return
-                    # Ресурсный файл → выбрасываем (не является признаком внешних исходников)
-                    _dep_ext = os.path.splitext(path)[1].lower()
-                    if _dep_ext in RESOURCE_EXTENSIONS:
-                        stat_deps_allowed += 1
-                        return
-                    # Допустимая внешняя зависимость → выбрасываем
-                    if _is_allowed_external_dep(path):
-                        stat_deps_allowed += 1
-                        return
-                    # Промежуточный артефакт (есть в output buildography) →
-                    # добавляем только хеш в frontier, путь не храним
-                    if hi in all_output_hashes:
-                        frontier_hashes.add(hi)
-                        stat_deps_kept += 1
-                        return
-                    # Реально подозрительный → сохраняем полностью
-                stat_deps_kept += 1
-                dep_list.append((hi, path, h))
-
             if isinstance(deps_raw, dict):
                 for path, h in deps_raw.items():
-                    _process_dep(path, h.strip() if h else '')
+                    h = h.strip() if h else ''
+                    hi = _hash_to_int(h)
+                    if hi is not None:
+                        dep_hashes_seen.add(hi)
+                        dep_list.append((hi, path, h))
             elif isinstance(deps_raw, list):
                 for dep in deps_raw:
                     if isinstance(dep, dict):
-                        _process_dep(dep.get('path', ''), dep.get('hash', '').strip())
+                        path = dep.get('path', '')
+                        h = dep.get('hash', '').strip()
+                        hi = _hash_to_int(h)
+                        if hi is not None:
+                            dep_hashes_seen.add(hi)
+                            dep_list.append((hi, path, h))
 
             # Индексируем зависимости только для компиляторов/линкеров
-            if is_compiler_or_linker:
-                stat_cmds_relevant += 1
             if dep_list and is_compiler_or_linker:
                 for out_hi in relevant:
-                    if out_hi in out_to_deps:
-                        out_to_deps[out_hi].extend(dep_list)
-                    else:
-                        out_to_deps[out_hi] = list(dep_list)
-
-            # Периодически выводим статистику фильтрации (каждые 10% или 10000 команд)
-            if do_filter and processed - _last_stat_report >= max(10000, total_cmds // 10):
-                _last_stat_report = processed
-                kept_pct = (stat_deps_kept * 100 // stat_deps_total) if stat_deps_total else 0
-                print(_ts() + "   {} filter stats: cmds={}/{} relevant={} "
-                      "deps_total={} system={}% src={}% allowed={}% kept={}% "
-                      "out_to_deps_keys={}".format(
-                    label, processed, total_cmds, stat_cmds_relevant,
-                    stat_deps_total,
-                    stat_deps_system * 100 // stat_deps_total if stat_deps_total else 0,
-                    stat_deps_src    * 100 // stat_deps_total if stat_deps_total else 0,
-                    stat_deps_allowed* 100 // stat_deps_total if stat_deps_total else 0,
-                    kept_pct,
-                    len(out_to_deps),  # только количество ключей — без итерации по значениям
-                ))
+                    existing = out_to_deps.get(out_hi, [])
+                    out_to_deps[out_hi] = existing + dep_list
 
         # Ранний выход: все цели frontier найдены — дальше читать незачем
         if not targets_remaining:
@@ -1778,21 +1604,7 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label,
         del data, cmds
         gc.collect()
 
-    # Итоговая статистика фильтрации
-    if do_filter and stat_deps_total > 0:
-        print(_ts() + "   {} filter summary: deps_total={} "
-              "system={}% src={}% allowed={}% kept={}% "
-              "out_to_deps_keys={} kept_total={}".format(
-            label, stat_deps_total,
-            stat_deps_system  * 100 // stat_deps_total,
-            stat_deps_src     * 100 // stat_deps_total,
-            stat_deps_allowed * 100 // stat_deps_total,
-            stat_deps_kept    * 100 // stat_deps_total,
-            len(out_to_deps),
-            stat_deps_kept,  # просто счётчик, не итерация
-        ))
-
-    return out_to_deps, frontier_hashes, output_hashes_seen, dep_hashes_seen
+    return out_to_deps, output_hashes_seen, dep_hashes_seen
 
 
 # =============================================================================
@@ -1878,8 +1690,8 @@ def build_external_package_index(buildography_files):
 
     for file_path in buildography_files:
         try:
-            with open(file_path, 'rb') as f:
-                data = _json_loads(f.read())
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f, strict=False)
         except Exception:
             continue
 
@@ -2086,8 +1898,8 @@ def build_apt_download_hashes(buildography_files):
 
     for file_path in buildography_files:
         try:
-            with open(file_path, 'rb') as f:
-                data = _json_loads(f.read())
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f, strict=False)
         except Exception as e:
             print(_ts() + "   build_apt_download_hashes: skip {}: {}".format(
                 os.path.basename(file_path), e))
@@ -2169,13 +1981,6 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
     total_cmds = _count_cmds(buildography_files)
 
-    # Предварительный проход — собираем все output хеши чтобы корректно
-    # определять промежуточные артефакты в _scan_pass
-    print(_ts() + "   Pass 4: pre-collecting all output hashes...")
-    all_output_hashes_pre = _collect_output_hashes(buildography_files)
-    print(_ts() + "   Pass 4: pre-collected {} output hashes".format(
-        len(all_output_hashes_pre)))
-
     # Максимальная глубина итераций — покрывает сценарии:
     # iter1: бинарь ← прямые зависимости
     # iter2: .o/.a ← их зависимости (компиляция из скачанных исходников)
@@ -2183,6 +1988,7 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     MAX_ITERATIONS = 3
     # Максимальный размер frontier — защита от "жирных" команд
     # (линковщики с сотнями тысяч зависимостей)
+    MAX_FRONTIER = 10000
 
     # ==========================================================================
     # Итеративное расширение графа
@@ -2202,16 +2008,10 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
             iteration, MAX_ITERATIONS, len(frontier)))
         _log_memory("Pass 4 iter {} start".format(iteration))
 
-        # Для iter1 используем предварительно собранные хеши
-        # Для iter2+ используем накопленные all_output_hashes
-        _aoh = all_output_hashes_pre if iteration == 1 else all_output_hashes
-        out_to_deps, frontier_hashes, output_hashes_seen, dep_hashes_seen = _scan_pass(
+        out_to_deps, output_hashes_seen, dep_hashes_seen = _scan_pass(
             buildography_files, frontier, total_cmds,
             "Pass 4 iter{}".format(iteration),
-            compiler_linker_basenames=compiler_linker_basenames,
-            src_hashes_int=src_hashes_int,
-            all_output_hashes=_aoh,
-            progress_step_pct=PASS4_PROGRESS_STEP_PCT,
+            compiler_linker_basenames=compiler_linker_basenames
         )
 
         # Объединяем с общим графом
@@ -2230,23 +2030,27 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
               iteration, len(out_to_deps),
               len(all_output_hashes), len(all_dep_hashes)))
 
-        # Новый frontier — берём из frontier_hashes (уже отфильтрованные промежуточные артефакты)
-        # Исключаем те что уже есть в full_out_to_deps
-        print(_ts() + "   Pass 4 iter {}: building new frontier from {} candidates...".format(
-            iteration, len(frontier_hashes)))
-        new_frontier = frontier_hashes - set(full_out_to_deps.keys())
-        print(_ts() + "   Pass 4 iter {}: frontier built: {} hashes".format(
-            iteration, len(new_frontier)))
+        # Новый frontier — промежуточные артефакты
+        new_frontier = set()
+        for deps in out_to_deps.values():
+            for (dep_hi, dep_path, _) in deps:
+                if (dep_hi in all_output_hashes and
+                        dep_hi not in full_out_to_deps and
+                        not _is_system_path(dep_path)):
+                    new_frontier.add(dep_hi)
+
+        # Ограничиваем размер frontier
+        if len(new_frontier) > MAX_FRONTIER:
+            print(_ts() + "   Pass 4 iter {}: frontier truncated {} → {} (MAX_FRONTIER)".format(
+                iteration, len(new_frontier), MAX_FRONTIER))
+            new_frontier = set(list(new_frontier)[:MAX_FRONTIER])
 
         frontier = new_frontier
         print(_ts() + "   Pass 4 iter {}: new frontier size: {}".format(
             iteration, len(frontier)))
 
-        print(_ts() + "   Pass 4 iter {}: merging into full graph...".format(iteration))
-        del out_to_deps, frontier_hashes, output_hashes_seen, dep_hashes_seen
-        print(_ts() + "   Pass 4 iter {}: running gc.collect()...".format(iteration))
+        del out_to_deps, output_hashes_seen, dep_hashes_seen
         gc.collect()
-        print(_ts() + "   Pass 4 iter {}: gc done".format(iteration))
 
     print(_ts() + "   Pass 4: graph expansion done after {} iterations".format(iteration))
     print(_ts() + "   Pass 4: full_out_to_deps={}, all_output_hashes={}, "
@@ -2350,23 +2154,26 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     print(_ts() + "   Pass 4: classifying {} binaries...".format(total_bin))
 
     # Кэш результатов _get_ext_deps — только real зависимости.
-    # Кэш результатов _get_ext_deps — только real зависимости.
-    # filtered не кэшируем — восстанавливаются в постобработке.
-    _ext_deps_cache = {}  # hi -> [real dep entries]
+    # filtered не кэшируем — они нужны только для финальной записи в JSON
+    # и могут быть очень большими (тысячи системных путей).
+    # Для классификации достаточно знать есть ли real зависимости.
+    _ext_deps_real_cache = {}   # hi -> list of real deps (без filtered)
+    _ext_deps_visited_cache = set()  # hi для которых уже известно real=[]
 
     def _get_ext_deps(start_hi):
         """
-        BFS по графу зависимостей с кэшем.
-        Вычисляется только для реально запрошенных бинарей (не для всего графа).
+        Итеративный BFS по графу зависимостей начиная с start_hi.
+        Возвращает dict с двумя списками:
+          real     — реально подозрительные внешние зависимости
+          filtered — зависимости отфильтрованные как допустимые
+        Кэширует только real зависимости для экономии памяти.
         """
-        from collections import deque as _deque2
+        from collections import deque
 
-        if start_hi in _ext_deps_cache:
-            return {"real": _ext_deps_cache[start_hi], "filtered": []}
-
-        real    = []
-        visited = set()
-        queue   = _deque2([start_hi])
+        real     = []
+        filtered = []
+        visited  = set()
+        queue    = deque([start_hi])
 
         while queue:
             hi = queue.popleft()
@@ -2374,30 +2181,36 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
                 continue
             visited.add(hi)
 
-            # Берём из кэша если уже вычислено
-            if hi != start_hi and hi in _ext_deps_cache:
-                real.extend(_ext_deps_cache[hi])
+            # Для промежуточных узлов используем кэш real зависимостей
+            if hi != start_hi and hi in _ext_deps_real_cache:
+                real.extend(_ext_deps_real_cache[hi])
+                # filtered для промежуточных узлов пересчитываем на лету
+                # (они не кэшируются — слишком много памяти)
                 continue
 
             for (dep_hi, dep_path, dep_h_str) in full_out_to_deps.get(hi, []):
-                if dep_hi in src_hashes_int:
-                    continue
                 if _is_system_path(dep_path):
+                    filtered.append({"hash": dep_h_str, "path": dep_path,
+                                      "reason": "system_path"})
                     continue
-                # Ресурсный файл — не является признаком внешних исходников
-                if os.path.splitext(dep_path)[1].lower() in RESOURCE_EXTENSIONS:
-                    continue
-                if _is_allowed_external_dep(dep_path):
+                if dep_hi in src_hashes_int:
                     continue
                 if dep_hi in all_output_hashes:
                     if dep_hi not in visited:
                         queue.append(dep_hi)
                 else:
-                    real.append({"path": dep_path, "hash": dep_h_str})
+                    if _is_allowed_external_dep(dep_path):
+                        reason = "header" if os.path.splitext(dep_path)[1].lower() in (
+                            ".h", ".hpp", ".hxx", ".h++", ".hh") else "allowed_system"
+                        filtered.append({"hash": dep_h_str, "path": dep_path,
+                                          "reason": reason})
+                    else:
+                        real.append({"hash": dep_h_str, "path": dep_path})
 
         real = _merge_so_aliases(real)
-        _ext_deps_cache[start_hi] = real
-        return {"real": real, "filtered": []}
+        # Кэшируем только real для промежуточных узлов
+        _ext_deps_real_cache[start_hi] = real
+        return {"real": real, "filtered": filtered}
 
 
     def _merge_so_aliases(deps):
@@ -2435,10 +2248,8 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
         return merged
 
-    _classify_start = time.monotonic()
     for i, entry in enumerate(bin_entries):
         progress_log("Pass 4 classifying", i + 1, total_bin)
-        _entry_start = time.monotonic()
         path      = entry.get('path', '')
         h_str     = entry.get('hash', '').strip()
         hi        = _hash_to_int(h_str)
@@ -2493,10 +2304,6 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
         # Собран — проверяем цепочку зависимостей
         deps_result   = _get_ext_deps(hi)
-        _entry_elapsed = time.monotonic() - _entry_start
-        if _entry_elapsed > 5.0:
-            print(_ts() + "   [SLOW] classifying {}/{}: {:.1f}s path={}".format(
-                i+1, total_bin, _entry_elapsed, path[:80]))
         real_ext_deps = deps_result['real']
         filt_ext_deps = deps_result['filtered']
 
@@ -2526,71 +2333,6 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
     del src_hashes_int, bin_hashes_int
     gc.collect()
     _log_memory("Pass 4 done")
-
-    # ==========================================================================
-    # Постобработка: восстанавливаем filtered_deps для external_built бинарей
-    # Делаем один проход по buildography только для этих бинарей.
-    # ==========================================================================
-    if external_built:
-        print(_ts() + "   Pass 4: restoring filtered_deps for {} external_built "
-              "binaries...".format(len(external_built)))
-
-        # Строим индекс: out_hash_int → индекс в external_built
-        ext_built_index = {}
-        for idx, e in enumerate(external_built):
-            hi = _hash_to_int(e.get('hash', '').strip())
-            if hi is not None:
-                ext_built_index[hi] = idx
-
-        # Один проход по buildography
-        for file_path in buildography_files:
-            with open(file_path, 'rb') as f:
-                data = _json_loads(f.read())
-            for cmd in data.get('component_commands', []):
-                # Проверяем выходы команды
-                outputs = cmd.get('output', {})
-                out_his = set()
-                if isinstance(outputs, list):
-                    for out in outputs:
-                        if isinstance(out, dict):
-                            hi = _hash_to_int(out.get('hash', '').strip())
-                            if hi is not None:
-                                out_his.add(hi)
-                elif isinstance(outputs, dict):
-                    for _, h in outputs.items():
-                        hi = _hash_to_int(h.strip() if h else '')
-                        if hi is not None:
-                            out_his.add(hi)
-
-                relevant = out_his & set(ext_built_index.keys())
-                if not relevant:
-                    continue
-
-                # Собираем filtered_deps для этой команды
-                filtered = []
-                seen_paths = set()
-                deps_raw = cmd.get('dependencies', {})
-                items = deps_raw.items() if isinstance(deps_raw, dict) else                         [(d.get('path',''), d.get('hash','')) for d in deps_raw
-                         if isinstance(d, dict)]
-                for path, h in items:
-                    if path in seen_paths:
-                        continue
-                    if _is_system_path(path) or _is_allowed_external_dep(path):
-                        seen_paths.add(path)
-                        reason = "header" if os.path.splitext(path)[1].lower() in (
-                            ".h", ".hpp", ".hxx") else "system_path"
-                        filtered.append({"path": path, "hash": h.strip() if h else "",
-                                          "reason": reason})
-
-                # Добавляем filtered_deps к нужным записям
-                for out_hi in relevant:
-                    idx = ext_built_index[out_hi]
-                    if filtered:
-                        external_built[idx]['filtered_deps'] = filtered
-
-            del data
-
-        print(_ts() + "   Pass 4: filtered_deps restored")
 
     print(_ts() + "   Pass 4 done: "
           "compiled_from_src={}, binaries_from_src={}, untraced_from_src={}, "
@@ -2640,7 +2382,7 @@ def write_pass4_txt(output_path, category_label, entries):
 # =============================================================================
 # ОБРАБОТКА ПРОЕКТА
 # =============================================================================
-def process_project(project_name, compiler_basenames, linker_basenames, interpreter_basenames, by_disk=False, keep=False, trust_java=True):
+def process_project(project_name, compiler_basenames, linker_basenames, interpreter_basenames, by_disk=False, keep=False):
     print("\n" + "=" * 50)
     print("Processing project: {}".format(project_name))
     print("=" * 50)
@@ -2894,104 +2636,6 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
         pass4_ran = True
         print(_ts() + "   Pass 4 done. Memory freed: bin_entries, src_hashes")
-
-        # =====================================================================
-        # Java эвристика (TRUST_JAVA)
-        # Если trust_java=True: .class файлы чьё базовое имя совпадает
-        # с .java файлом из src.json → переносим из external_built в compiled_from_src
-        # Покрывает внутренние классы: File$Inner.class → File.java
-        # =====================================================================
-        if trust_java and p4_external_built:
-            print(_ts() + "   Pass 4: applying Java trust heuristic...")
-
-            # Строим индекс java basename → путь из src.json
-            java_basenames = {}
-            for sig in signatures:
-                p = sig.get('path', '')
-                if p.lower().endswith('.java'):
-                    bn = os.path.splitext(os.path.basename(p))[0].lower()
-                    java_basenames[bn] = p
-
-            print(_ts() + "   Pass 4: java_basenames from src.json: {}".format(
-                len(java_basenames)))
-
-            def _is_java_dep_trusted(dep_path):
-                """
-                Возвращает True если dep является .class файлом
-                у которого есть соответствующий .java в src.json.
-                Учитывает внутренние классы: File$Inner.class → File.java
-                """
-                if not dep_path.lower().endswith('.class'):
-                    return False
-                bn   = os.path.basename(dep_path)
-                stem = os.path.splitext(bn)[0]
-                base = stem.split('$')[0].lower()
-                return base in java_basenames
-
-            still_external    = []
-            moved_to_compiled = []
-            deps_filtered     = 0
-
-            for e in p4_external_built:
-                path = e.get('path', '')
-                bn   = os.path.basename(path)
-
-                # Случай 1: сам бинарь — .class файл из src.json
-                if bn.lower().endswith('.class'):
-                    stem = os.path.splitext(bn)[0]
-                    base = stem.split('$')[0].lower()
-                    if base in java_basenames:
-                        new_e = dict(e)
-                        new_e['trust_heuristic'] = True
-                        moved_to_compiled.append(new_e)
-                        continue
-
-                # Случай 2: бинарь имеет external_deps — фильтруем доверенные .class
-                ext_deps = e.get('external_deps', [])
-                if ext_deps:
-                    # Для Java проектов подозрительными считаем ТОЛЬКО .class файлы
-                    # .xml, .properties и другие ресурсы не являются признаком
-                    # внешних исходников — игнорируем их при классификации
-                    CLASS_EXTS = {'.class'}
-
-                    real_suspicious = [
-                        d for d in ext_deps
-                        if (os.path.splitext(d.get('path', ''))[1].lower() in CLASS_EXTS
-                            and not _is_java_dep_trusted(d.get('path', '')))
-                    ]
-                    trusted_removed = len(ext_deps) - len(real_suspicious)
-                    deps_filtered += trusted_removed
-
-                    if not real_suspicious:
-                        # Нет подозрительных .class dep → бинарь чистый
-                        new_e = dict(e)
-                        new_e.pop('external_deps', None)
-                        new_e['trust_heuristic'] = True
-                        new_e['trust_heuristic_deps_removed'] = trusted_removed
-                        moved_to_compiled.append(new_e)
-                        continue
-                    elif trusted_removed > 0:
-                        # Часть dep убрана — остались только подозрительные .class
-                        new_e = dict(e)
-                        new_e['external_deps'] = real_suspicious
-                        new_e['trust_heuristic_deps_removed'] = trusted_removed
-                        still_external.append(new_e)
-                        continue
-
-                still_external.append(e)
-
-            print(_ts() + "   Pass 4: Java heuristic: "
-                  "moved={} external_built→compiled_from_src, "
-                  "deps_filtered={}, still_external={}".format(
-                len(moved_to_compiled), deps_filtered, len(still_external)))
-
-            if moved_to_compiled:
-                p4_compiled_from_src.extend(moved_to_compiled)
-            p4_external_built = still_external
-
-        elif trust_java:
-            print(_ts() + "   Pass 4: Java heuristic: external_built is empty, skipping")
-
     else:
         print(_ts() + "   Pass 4 skipped (no bin entries)")
         p4_compiled_from_src = p4_binaries_from_src = p4_untraced_from_src = \
@@ -3147,70 +2791,6 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         print("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(
             len(p4_external_package_content),
             pct(len(p4_external_package_content), total_bin)))
-    else:
-        total_bin = 0
-
-    # =========================================================================
-    # SUMMARY TXT: записываем сводку в try_dir/summary.txt
-    # =========================================================================
-    def _fmt_elapsed(seconds):
-        """Форматирует секунды в HH:MM:SS."""
-        h = int(seconds) // 3600
-        m = (int(seconds) % 3600) // 60
-        s = int(seconds) % 60
-        return "{:02d}:{:02d}:{:02d}".format(h, m, s)
-
-    _run_elapsed = time.monotonic() - _SCRIPT_START
-    _summary_lines = []
-    _summary_lines.append("=" * 54)
-    _summary_lines.append("  Сводка: {}".format(project_name))
-    _summary_lines.append("  Сгенерировано: {}".format(datetime.now().isoformat()))
-    _summary_lines.append("  Время выполнения: {}".format(_fmt_elapsed(_run_elapsed)))
-    _summary_lines.append("=" * 54)
-
-    _sep = "  " + "-" * 50
-
-    _summary_lines.append("")
-    _summary_lines.append("  Компилируемые исходники ({} файлов)".format(total_source))
-    _summary_lines.append(_sep)
-    _summary_lines.append("  Direct (используются напрямую)                     : {:>7}  ({:.1f}%)".format(len(direct),   pct(len(direct),   total_source)))
-    _summary_lines.append("  Parent (через архив)                               : {:>7}  ({:.1f}%)".format(len(parent),   pct(len(parent),   total_source)))
-    _summary_lines.append("  Not compiled (компилировались, результат не в bin) : {:>7}  ({:.1f}%)".format(n_redundant,  pct(n_redundant,   total_source)))
-
-    _summary_lines.append("")
-    _summary_lines.append("  Интерпретируемые файлы ({} файлов)".format(total_interp))
-    _summary_lines.append(_sep)
-    _summary_lines.append("  Executed (запускаются)                             : {:>7}  ({:.1f}%)".format(len(executed),        pct(len(executed),        total_interp)))
-    _summary_lines.append("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(compiled_used),   pct(len(compiled_used),   total_interp)))
-    _summary_lines.append("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(compiled_unused), pct(len(compiled_unused), total_interp)))
-    _summary_lines.append("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(copied),          pct(len(copied),          total_interp)))
-    _summary_lines.append("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(izb),             pct(len(izb),             total_interp)))
-
-    _summary_lines.append("")
-    _summary_lines.append("  Итого ({} файлов)".format(total_all))
-    _summary_lines.append(_sep)
-    _summary_lines.append("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb, pct(total_all - total_izb, total_all)))
-    _summary_lines.append("  Избыточные (not_compiled + compiled_unused + not_used): {:>7}  ({:.1f}%)".format(total_izb, pct(total_izb, total_all)))
-
-    if pass4_ran:
-        _summary_lines.append("")
-        _summary_lines.append("  Происхождение бинарей дистрибутива ({} файлов)".format(total_bin))
-        _summary_lines.append(_sep)
-        _summary_lines.append("  Compiled from src  (собран из src.json)            : {:>7}  ({:.1f}%)".format(len(p4_compiled_from_src),       pct(len(p4_compiled_from_src),       total_bin)))
-        _summary_lines.append("  Binaries from src  (бинарь из src.json, скопирован): {:>7}  ({:.1f}%)".format(len(p4_binaries_from_src),       pct(len(p4_binaries_from_src),       total_bin)))
-        _summary_lines.append("  Untraced from src  (в src.json, трасс. не видит)   : {:>7}  ({:.1f}%)".format(len(p4_untraced_from_src),       pct(len(p4_untraced_from_src),       total_bin)))
-        _summary_lines.append("  External built     (компил. из внешних исх.)       : {:>7}  ({:.1f}%)".format(len(p4_external_built),           pct(len(p4_external_built),          total_bin)))
-        _summary_lines.append("  External prebuilt  (готовый извне, трасс. видит)   : {:>7}  ({:.1f}%)".format(len(p4_external_prebuilt),        pct(len(p4_external_prebuilt),       total_bin)))
-        _summary_lines.append("  Untraced external  (не в src, трасс. не видит)     : {:>7}  ({:.1f}%)".format(len(p4_untraced_external),        pct(len(p4_untraced_external),       total_bin)))
-        _summary_lines.append("  System binaries    (системные пути в дистрибутиве) : {:>7}  ({:.1f}%)".format(len(p4_system_binaries),          pct(len(p4_system_binaries),         total_bin)))
-        _summary_lines.append("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(len(p4_external_package_content), pct(len(p4_external_package_content),total_bin)))
-
-    _summary_lines.append("=" * 54)
-
-    _summary_path = os.path.join(try_dir, "summary.txt")
-    with open(_summary_path, 'w', encoding='utf-8') as _sf:
-        _sf.write("\n".join(_summary_lines) + "\n")
-    print(_ts() + "   Summary written: {}".format(_summary_path))
 
     # =========================================================================
     # SUMMARY: копируем непустые отчёты в summary{N}/
@@ -3512,27 +3092,7 @@ def main():
              'перезаписи try1. По умолчанию try1 перезаписывается, '
              'а try2, try3, ... удаляются.'
     )
-    parser.add_argument(
-        '--trust-java',
-        action='store_true',
-        default=None,
-        help='Включить Java-эвристику: .class файлы чьё имя совпадает '
-             'с .java из src.json считаются compiled_from_src. '
-             'По умолчанию берётся значение TRUST_JAVA из скрипта.'
-    )
-    parser.add_argument(
-        '--no-trust-java',
-        action='store_true',
-        default=False,
-        help='Отключить Java-эвристику независимо от TRUST_JAVA.'
-    )
     args = parser.parse_args()
-
-    # Определяем финальное значение trust_java
-    if args.no_trust_java:
-        args.trust_java = False
-    elif args.trust_java is None:
-        args.trust_java = TRUST_JAVA
 
     if not os.path.isdir(BUILDOGRAPHY_DIR):
         print(_ts() + " Buildography directory not found: {}".format(BUILDOGRAPHY_DIR))
@@ -3612,13 +3172,10 @@ def main():
     start_time = datetime.now()
     results = {}
 
-    print(_ts() + " Java trust heuristic: {}".format(
-        "ON" if args.trust_java else "OFF"))
-
     for project_name in projects:
         results[project_name] = process_project(
             project_name, compiler_basenames, linker_basenames, interpreter_basenames,
-            by_disk=args.by_disk, keep=args.keep, trust_java=args.trust_java
+            by_disk=args.by_disk, keep=args.keep
         )
 
     elapsed = datetime.now() - start_time
