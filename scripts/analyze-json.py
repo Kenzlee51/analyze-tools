@@ -194,6 +194,7 @@ import gc
 import sqlite3
 import sys
 import os
+import json as _json_stdlib  # всегда доступен — нужен для fallback при ошибках orjson
 
 # Пробуем загрузить orjson из локальной папки lib/ рядом со скриптом.
 # orjson в 3-5 раз быстрее стандартного json при парсинге больших файлов.
@@ -206,16 +207,25 @@ try:
     import orjson as _orjson
 
     def _json_loads(data):
-        """Парсит JSON строку/байты через orjson."""
+        """
+        Парсит JSON строку/байты через orjson.
+        orjson строгий к control character внутри строк (некоторые
+        buildography файлы их содержат) — при ошибке парсинга делаем
+        fallback на стандартный json с strict=False, который их пропускает.
+        """
         if isinstance(data, str):
             data = data.encode('utf-8', errors='replace')
-        return _orjson.loads(data)
+        try:
+            return _orjson.loads(data)
+        except _orjson.JSONDecodeError:
+            text = data.decode('utf-8', errors='replace')
+            return _json_stdlib.loads(text, strict=False)
 
-    print("[INFO] JSON backend: orjson {} (fast mode)".format(_orjson.__version__), flush=True)
+    print("[INFO] JSON backend: orjson {} (fast mode, with stdlib fallback)".format(
+        _orjson.__version__), flush=True)
     _ORJSON_AVAILABLE = True
 
 except (ImportError, Exception) as _e:
-    import json as _json_stdlib
 
     def _json_loads(data):
         """Парсит JSON строку через стандартный json."""
