@@ -5,50 +5,66 @@ svace-analyze.py — Анализ проектов через Svace
 =============================================================================
 
 ОПИСАНИЕ:
-    Анализирует проекты из unpacked/PROJ/src с помощью Svace.
-    Для каждого проекта создаётся рабочая директория svace/PROJ.
-    Языки Python и JavaScript передаются всегда.
+    Последовательно (один за другим) прогоняет полный локальный анализ
+    Svace для проектов из unpacked/PROJ/src:
+
+        svace init  <svace_dir>
+        svace build --svace-dir <svace_dir> [--python SRC] [--javascript SRC]
+        svace analyze --svace-dir <svace_dir>
+
+    Языки Python и JavaScript определяются автоматически по наличию файлов
+    в исходниках проекта. По умолчанию анализируются оба языка сразу (если
+    файлы найдены) и все проекты, найденные в unpacked/.
+
+    Если на каком-то шаге для проекта происходит ошибка — она пишется в
+    лог-файл этого проекта, и скрипт переходит к следующему проекту
+    (весь прогон не прерывается).
 
 ИСПОЛЬЗОВАНИЕ:
     python3 svace-analyze.py [OPTIONS]
 
 ОПЦИИ:
-    --single-project NAME   Анализировать только указанный проект
-    --fast                  Режим "build+analyze" последовательно для каждого проекта
-                            (по умолчанию: сначала все build, затем все analyze)
-    -h, --help              Показать справку
+    --project NAME       Анализировать только указанный проект.
+                          Можно указать несколько раз: --project A --project B
+                          (по умолчанию: все проекты, найденные в unpacked/)
+    --only-python         Собирать/анализировать только Python
+                          (даже если в проекте есть JS/TS файлы)
+    --only-javascript      Собирать/анализировать только JavaScript/TypeScript
+                          (даже если в проекте есть Python файлы)
+    --svace-bin PATH      Путь/имя исполняемого файла svace
+                          (по умолчанию: переменная окружения SVACE_BIN,
+                          иначе системный "svace" из PATH)
+    -h, --help            Показать справку
 
 ПРИМЕРЫ:
     python3 svace-analyze.py
-    python3 svace-analyze.py --single-project PROJ1
-    python3 svace-analyze.py --fast
+    python3 svace-analyze.py --project my-project
+    python3 svace-analyze.py --project proj1 --project proj2
+    python3 svace-analyze.py --only-python
+    python3 svace-analyze.py --svace-bin /opt/svace/bin/svace
 
-ОЖИДАЕМАЯ СТРУКТУРА:
-    BASE_DIR/
+ОЖИДАЕМАЯ СТРУКТУРА (скрипт лежит в scripts/, запускается оттуда же):
+    analyze-tools/
     ├── scripts/
     │   └── svace-analyze.py
     ├── unpacked/
     │   └── PROJ/
-    │       └── src/              ← анализируемые исходники
+    │       └── src/                  ← анализируемые исходники
     ├── svace/
-    │   └── PROJ/                 ← рабочая директория svace (.svace-dir)
-    ├── logs/
-    │   └── svace-analyze/
-    │       ├── run_YYYYMMDD_HHMMSS.log
-    │       └── projects/
-    │           └── PROJ.log
-    └── results/
+    │   └── PROJ/                     ← рабочая директория svace (.svace-dir)
+    └── logs/
         └── svace/
-            └── svace-projects.json   ← БД проектов
+            └── PROJ/                 ← лог проекта
+                └── PROJ.log
 
 ЗАВИСИМОСТИ:
-    Python 3.6+, svace
+    Python 3.6+, svace (init/build/analyze) доступен в PATH или через
+    --svace-bin / переменную окружения SVACE_BIN
 =============================================================================
 """
 
 import os
 import sys
-import json
 import shutil
 import argparse
 import subprocess
@@ -59,405 +75,305 @@ from datetime import datetime
 # =============================================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-SVACE_BIN  = os.environ.get("SVACE_BIN", "svace")
-SVACER_BIN = os.environ.get("SVACER_BIN", "svacer")
-
-# Таймаут на каждую команду svace (секунды). 0 = без таймаута.
-SVACE_TIMEOUT = 0
-
 UNPACKED_DIR   = os.path.join(BASE_DIR, "unpacked")
-SVACE_WORK_DIR = os.path.join(BASE_DIR, "svace")          # рабочая папка для svace
-RESULTS_DIR    = os.path.join(BASE_DIR, "results")
-SVACE_DB_DIR   = os.path.join(RESULTS_DIR, "svace")
-SVACE_PROJECTS_DB = os.path.join(SVACE_DB_DIR, "svace-projects.json")
-LOG_DIR        = os.path.join(BASE_DIR, "logs", "svace-analyze")
-# =============================================================================
+SVACE_WORK_DIR = os.path.join(BASE_DIR, "svace")
+LOG_DIR        = os.path.join(BASE_DIR, "logs", "svace")
+
+DEFAULT_SVACE_BIN = os.environ.get("SVACE_BIN", "svace")
+
+# Расширения файлов для автоопределения языка проекта
+PYTHON_EXTENSIONS = ('.py', '.pyw')
+JS_EXTENSIONS      = ('.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs')
 
 # =============================================================================
-# ЛОГИРОВАНИЕ
-# =============================================================================
-class Logger(object):
-    def __init__(self, run_log, project_log=None):
-        self.run_log = run_log
-        self.project_log = project_log
 
-    def _write(self, message, log_path):
+
+# =============================================================================
+# ЛОГИРОВАНИЕ (один файл на проект, дописывается)
+# =============================================================================
+class ProjectLogger(object):
+    def __init__(self, project_name):
+        self.project_name = project_name
+        # ИЗМЕНЕНИЕ: лог сохраняется в подпапке проекта
+        self.path = os.path.join(LOG_DIR, project_name, "{}.log".format(project_name))
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+
+    def _write(self, text):
         try:
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(message + '\n')
+            with open(self.path, 'a', encoding='utf-8') as f:
+                f.write(text + '\n')
         except Exception as e:
-            print("[LOG ERROR] {}: {}".format(log_path, e))
+            print("[LOG ERROR] {}: {}".format(self.path, e))
 
-    def _log(self, level, message):
-        line = "[{}] [{}] {}".format(datetime.now().strftime('%H:%M:%S'), level, message)
-        print(line)
-        self._write(line, self.run_log)
-        if self.project_log:
-            self._write(line, self.project_log)
+    def start_run(self):
+        self._write("")
+        self._write("=" * 70)
+        self._write("RUN START: {}".format(datetime.now().isoformat(timespec='seconds')))
+        self._write("=" * 70)
 
-    def info(self, message):  self._log("INFO",  message)
-    def warn(self, message):  self._log("WARN",  message)
-    def error(self, message): self._log("ERROR", message)
+    def end_run(self, status):
+        self._write("-" * 70)
+        self._write("RUN END: {}  status={}".format(
+            datetime.now().isoformat(timespec='seconds'), status))
+        self._write("=" * 70)
 
-    def raw(self, message):
-        if self.project_log:
-            self._write(message, self.project_log)
+    def info(self, message):
+        line = "[{}] [INFO] {}".format(datetime.now().strftime('%H:%M:%S'), message)
+        print("    {}".format(message))
+        self._write(line)
 
-    def set_project_log(self, path):
-        self.project_log = path
+    def error(self, message):
+        line = "[{}] [ERROR] {}".format(datetime.now().strftime('%H:%M:%S'), message)
+        print("    \u274c {}".format(message))
+        self._write(line)
 
-
-# =============================================================================
-# БД ПРОЕКТОВ
-# =============================================================================
-def load_db():
-    if not os.path.exists(SVACE_PROJECTS_DB):
-        return {"projects": {}}
-    try:
-        with open(SVACE_PROJECTS_DB, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        print("[WARN] Failed to load DB: {}".format(e))
-        return {"projects": {}}
-
-
-def save_db(db):
-    db["updated_at"] = datetime.now().isoformat()
-    os.makedirs(SVACE_DB_DIR, exist_ok=True)
-    try:
-        with open(SVACE_PROJECTS_DB, 'w', encoding='utf-8') as f:
-            json.dump(db, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print("[ERROR] Failed to save DB: {}".format(e))
-
-
-def update_db(db, project_name, source_path, svace_dir,
-              status, error_message=None):
-    """Обновляет запись проекта в БД."""
-    existing = db["projects"].get(project_name, {})
-    snapshot_status      = existing.get("snapshot_status", "never")
-    snapshot_uploaded_at = existing.get("snapshot_uploaded_at", "")
-    snapshot_project_name = existing.get("snapshot_project_name", "")
-
-    db["projects"][project_name] = {
-        "project_name":         project_name,
-        "source_path":          source_path,
-        "svace_dir":            svace_dir,
-        "languages":            ["python", "javascript"],  # всегда оба
-        "status":               status,
-        "analyzed_at":          datetime.now().isoformat(),
-        "error_message":        error_message or "",
-        "snapshot_status":       snapshot_status,
-        "snapshot_uploaded_at":  snapshot_uploaded_at,
-        "snapshot_project_name": snapshot_project_name,
-    }
-    save_db(db)
+    def raw(self, text):
+        self._write(text)
 
 
 # =============================================================================
-# ЗАПУСК КОМАНДЫ
+# ЗАПУСК КОМАНДЫ SVACE
 # =============================================================================
-def run_cmd(cmd, cwd, log, name, timeout=None):
-    log.info("Running: {}".format(' '.join(cmd)))
-    log.raw("--- {} ---".format(name))
+def run_cmd(svace_bin, cmd, cwd, log, step_name):
+    log.info("Запуск: {}".format(' '.join(cmd)))
+    log.raw("--- {} ---".format(step_name))
     log.raw("CMD: {}".format(' '.join(cmd)))
     log.raw("CWD: {}".format(cwd))
 
     try:
-        kwargs = dict(
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        result = subprocess.run(
+            cmd, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        if timeout:
-            kwargs["timeout"] = timeout
-
-        result = subprocess.run(cmd, **kwargs)
-
-        stdout = result.stdout.decode('utf-8', errors='replace')
-        stderr = result.stderr.decode('utf-8', errors='replace')
-
-        if stdout:
-            log.raw("--- stdout ---")
-            log.raw(stdout)
-        if stderr:
-            log.raw("--- stderr ---")
-            log.raw(stderr)
-        log.raw("--- return code: {} ---".format(result.returncode))
-
-        if result.returncode == 0:
-            log.info("{}: OK (code 0)".format(name))
-            return True, stdout
-        else:
-            log.error("{}: FAILED (code {})".format(name, result.returncode))
-            return False, stdout
-
-    except subprocess.TimeoutExpired:
-        log.error("{}: TIMEOUT ({}s)".format(name, timeout))
-        return False, ""
-    except OSError:
-        log.error("{}: binary not found: {}".format(name, cmd[0]))
-        log.error("Set SVACE_BIN/SVACER_BIN variables to correct paths")
-        return False, ""
+    except FileNotFoundError:
+        log.error("{}: бинарь не найден: {}".format(step_name, cmd[0]))
+        log.raw("Проверьте --svace-bin / переменную окружения SVACE_BIN")
+        return False
     except Exception as e:
-        log.error("{}: unexpected error: {}".format(name, e))
-        return False, ""
-
-
-# =============================================================================
-# ПРОВЕРКА SVACE
-# =============================================================================
-def check_svace(log):
-    log.info("Checking svace availability...")
-    try:
-        r = subprocess.run([SVACE_BIN, '--version'],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout = r.stdout.decode('utf-8', errors='replace').strip()
-        log.info("svace: {}".format(stdout[:80] if stdout else "ok"))
-    except OSError:
-        log.error("svace not found: {}".format(SVACE_BIN))
-        return False
-    return True
-
-
-# =============================================================================
-# ОБРАБОТКА ОДНОГО ПРОЕКТА (build + analyze)
-# =============================================================================
-def process_project_build_and_analyze(project_name, db, log, fast_mode=False):
-    """
-    Выполняет build и analyze для одного проекта.
-    Если fast_mode=False, только build.
-    Если fast_mode=True, build+analyze сразу.
-    Возвращает (build_ok, analyze_ok)
-    """
-    source_path = os.path.join(UNPACKED_DIR, project_name, "src")
-    svace_dir   = os.path.join(SVACE_WORK_DIR, project_name)
-
-    log.info("Source path: {}".format(source_path))
-    log.info("Svace dir  : {}".format(svace_dir))
-
-    if not os.path.isdir(source_path):
-        log.error("Source directory not found: {}".format(source_path))
-        update_db(db, project_name, source_path, svace_dir,
-                  "failed", "Source directory not found")
-        return False, False
-
-    # Очищаем рабочую директорию svace
-    os.makedirs(svace_dir, exist_ok=True)
-    if os.listdir(svace_dir):
-        log.info("Cleaning svace dir: {}".format(svace_dir))
-        try:
-            shutil.rmtree(svace_dir)
-            os.makedirs(svace_dir, exist_ok=True)
-        except Exception as e:
-            log.error("Failed to clean svace dir: {}".format(e))
-            update_db(db, project_name, source_path, svace_dir,
-                      "failed", str(e))
-            return False, False
-
-    timeout = SVACE_TIMEOUT if SVACE_TIMEOUT > 0 else None
-
-    # --- svace init ---
-    ok, _ = run_cmd(
-        [SVACE_BIN, 'init', '--svace-dir', svace_dir],
-        source_path, log, "svace init", timeout
-    )
-    if not ok:
-        update_db(db, project_name, source_path, svace_dir,
-                  "failed", "svace init failed")
-        return False, False
-
-    # --- svace build (всегда оба языка) ---
-    build_cmd = [SVACE_BIN, 'build', '--svace-dir', svace_dir,
-                 '--python', source_path,
-                 '--javascript', source_path]
-    ok, _ = run_cmd(build_cmd, source_path, log, "svace build", timeout)
-    if not ok:
-        update_db(db, project_name, source_path, svace_dir,
-                  "failed", "svace build failed")
-        return False, False
-
-    if not fast_mode:
-        # Только build, analyze будет позже
-        update_db(db, project_name, source_path, svace_dir,
-                  "build_done")
-        return True, False
-
-    # --- svace analyze (fast mode) ---
-    ok, _ = run_cmd(
-        [SVACE_BIN, 'analyze', '--svace-dir', svace_dir],
-        source_path, log, "svace analyze", timeout
-    )
-    if ok:
-        update_db(db, project_name, source_path, svace_dir, "success")
-        return True, True
-    else:
-        update_db(db, project_name, source_path, svace_dir,
-                  "failed", "svace analyze failed")
-        return True, False
-
-
-def process_project_analyze(project_name, db, log):
-    """Запускает analyze для уже построенного проекта."""
-    source_path = os.path.join(UNPACKED_DIR, project_name, "src")
-    svace_dir   = os.path.join(SVACE_WORK_DIR, project_name)
-
-    if not os.path.isdir(svace_dir):
-        log.error("Svace dir not found (build probably skipped): {}".format(svace_dir))
-        update_db(db, project_name, source_path, svace_dir,
-                  "failed", "Svace dir missing before analyze")
+        log.error("{}: непредвиденная ошибка запуска: {}".format(step_name, e))
         return False
 
-    timeout = SVACE_TIMEOUT if SVACE_TIMEOUT > 0 else None
-    ok, _ = run_cmd(
-        [SVACE_BIN, 'analyze', '--svace-dir', svace_dir],
-        source_path, log, "svace analyze", timeout
-    )
-    if ok:
-        update_db(db, project_name, source_path, svace_dir, "success")
+    stdout = result.stdout.decode('utf-8', errors='replace')
+    stderr = result.stderr.decode('utf-8', errors='replace')
+
+    if stdout.strip():
+        log.raw("--- stdout ---")
+        log.raw(stdout.rstrip())
+    if stderr.strip():
+        log.raw("--- stderr ---")
+        log.raw(stderr.rstrip())
+    log.raw("--- код возврата: {} ---".format(result.returncode))
+
+    if result.returncode == 0:
+        log.info("{}: OK".format(step_name))
         return True
     else:
-        update_db(db, project_name, source_path, svace_dir,
-                  "failed", "svace analyze failed")
+        log.error("{}: завершился с кодом {}".format(step_name, result.returncode))
         return False
+
+
+def check_svace_available(svace_bin, log_print=print):
+    try:
+        r = subprocess.run([svace_bin, '--version'],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        version = r.stdout.decode('utf-8', errors='replace').strip()
+        log_print("\u2705 svace доступен: {}".format(version or "версия неизвестна"))
+        return True
+    except FileNotFoundError:
+        log_print("\u274c svace не найден: '{}'".format(svace_bin))
+        log_print("   Укажите --svace-bin PATH или переменную окружения SVACE_BIN")
+        return False
+
+
+# =============================================================================
+# ОПРЕДЕЛЕНИЕ ЯЗЫКОВ ПРОЕКТА
+# =============================================================================
+def has_files_with_extensions(root_dir, extensions):
+    # ИЗМЕНЕНИЕ: убрана фильтрация служебных каталогов
+    for root, dirs, files in os.walk(root_dir):
+        for f in files:
+            if f.endswith(extensions):
+                return True
+    return False
+
+
+def detect_languages(src_dir, only_python, only_javascript):
+    languages = []
+    if not only_javascript and has_files_with_extensions(src_dir, PYTHON_EXTENSIONS):
+        languages.append('python')
+    if not only_python and has_files_with_extensions(src_dir, JS_EXTENSIONS):
+        languages.append('javascript')
+    return languages
+
+
+# =============================================================================
+# ОБРАБОТКА ОДНОГО ПРОЕКТА: init -> build -> analyze
+# =============================================================================
+def process_project(project_name, svace_bin, only_python, only_javascript):
+    log = ProjectLogger(project_name)
+    log.start_run()
+
+    src_dir   = os.path.join(UNPACKED_DIR, project_name, "src")
+    svace_dir = os.path.join(SVACE_WORK_DIR, project_name)
+
+    print("\n{}".format("=" * 60))
+    print("\U0001F3AF Проект: {}".format(project_name))
+    log.info("Источник        : {}".format(src_dir))
+    log.info("Рабочая папка svace: {}".format(svace_dir))
+
+    if not os.path.isdir(src_dir):
+        log.error("Директория исходников не найдена: {}".format(src_dir))
+        log.end_run("FAILED (нет src)")
+        return "failed"
+
+    languages = detect_languages(src_dir, only_python, only_javascript)
+    if not languages:
+        if only_python:
+            reason = "не найдено файлов Python ({})".format(', '.join(PYTHON_EXTENSIONS))
+        elif only_javascript:
+            reason = "не найдено файлов JavaScript/TypeScript ({})".format(', '.join(JS_EXTENSIONS))
+        else:
+            reason = "не найдено файлов Python или JavaScript/TypeScript"
+        log.error("Пропуск проекта: {}".format(reason))
+        log.end_run("SKIPPED")
+        return "skipped"
+
+    log.info("Обнаруженные языки: {}".format(', '.join(languages)))
+
+    # Очищаем рабочую директорию svace перед прогоном
+    if os.path.isdir(svace_dir):
+        log.info("Очистка рабочей директории: {}".format(svace_dir))
+        try:
+            shutil.rmtree(svace_dir)
+        except Exception as e:
+            log.error("Не удалось очистить {}: {}".format(svace_dir, e))
+            log.end_run("FAILED (очистка рабочей директории)")
+            return "failed"
+    os.makedirs(svace_dir, exist_ok=True)
+
+    # 1. svace init
+    if not run_cmd(svace_bin, [svace_bin, 'init', svace_dir], src_dir, log, "svace init"):
+        log.end_run("FAILED (init)")
+        return "failed"
+
+    # 2. svace build
+    build_cmd = [svace_bin, 'build', '--svace-dir', svace_dir]
+    if 'python' in languages:
+        build_cmd += ['--python', src_dir]
+    if 'javascript' in languages:
+        build_cmd += ['--javascript', src_dir]
+
+    if not run_cmd(svace_bin, build_cmd, src_dir, log, "svace build"):
+        log.end_run("FAILED (build)")
+        return "failed"
+
+    # 3. svace analyze
+    analyze_cmd = [svace_bin, 'analyze', '--svace-dir', svace_dir]
+    if not run_cmd(svace_bin, analyze_cmd, src_dir, log, "svace analyze"):
+        log.end_run("FAILED (analyze)")
+        return "failed"
+
+    log.end_run("SUCCESS")
+    return "success"
 
 
 # =============================================================================
 # ОСНОВНОЙ ЦИКЛ
 # =============================================================================
+def discover_all_projects():
+    if not os.path.isdir(UNPACKED_DIR):
+        return []
+    return sorted([
+        p for p in os.listdir(UNPACKED_DIR)
+        if os.path.isdir(os.path.join(UNPACKED_DIR, p, "src"))
+    ])
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Svace analysis script')
-    parser.add_argument('--single-project', metavar='NAME',
-                        help='Analyze only one project')
-    parser.add_argument('--fast', action='store_true',
-                        help='Run build+analyze sequentially per project')
+    parser = argparse.ArgumentParser(
+        description='Последовательный анализ проектов через Svace (init + build + analyze)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--project', metavar='NAME', action='append', default=None,
+                         help='Проект для анализа (можно указывать несколько раз). '
+                              'По умолчанию — все проекты из unpacked/')
+    parser.add_argument('--only-python', action='store_true',
+                         help='Анализировать только Python, даже если есть JS/TS')
+    parser.add_argument('--only-javascript', action='store_true',
+                         help='Анализировать только JavaScript/TypeScript, даже если есть Python')
+    parser.add_argument('--svace-bin', metavar='PATH', default=DEFAULT_SVACE_BIN,
+                         help='Путь/имя исполняемого файла svace '
+                              '(по умолчанию: $SVACE_BIN или системный "svace")')
     args = parser.parse_args()
 
-    # --- Инициализация директорий ---
-    os.makedirs(LOG_DIR, exist_ok=True)
-    os.makedirs(os.path.join(LOG_DIR, "projects"), exist_ok=True)
-    os.makedirs(SVACE_WORK_DIR, exist_ok=True)
-    os.makedirs(SVACE_DB_DIR, exist_ok=True)
+    if args.only_python and args.only_javascript:
+        parser.error("--only-python и --only-javascript нельзя использовать одновременно")
 
-    run_log_path = os.path.join(
-        LOG_DIR,
-        "run_{}.log".format(datetime.now().strftime('%Y%m%d_%H%M%S'))
-    )
-    with open(run_log_path, 'w', encoding='utf-8') as f:
-        f.write("Svace analyze run started: {}\n".format(datetime.now().isoformat()))
-        f.write("BASE_DIR: {}\n".format(BASE_DIR))
-        f.write("SVACE_BIN: {}\n".format(SVACE_BIN))
-        f.write("SVACER_BIN: {}\n".format(SVACER_BIN))
-        f.write("=" * 60 + "\n\n")
+    print("Svace analyze")
+    print("BASE_DIR : {}".format(BASE_DIR))
+    print("SVACE_BIN: {}".format(args.svace_bin))
 
-    log = Logger(run_log_path)
-    log.info("BASE_DIR  : {}".format(BASE_DIR))
-    log.info("SVACE_BIN : {}".format(SVACE_BIN))
-    log.info("SVACER_BIN: {}".format(SVACER_BIN))
-
-    if not check_svace(log):
-        log.error("Svace not available. Aborting.")
+    if not check_svace_available(args.svace_bin):
         sys.exit(1)
 
-    db = load_db()
-    log.info("Loaded DB: {} projects".format(len(db.get("projects", {}))))
-
     # --- Список проектов ---
-    if args.single_project:
-        src_dir = os.path.join(UNPACKED_DIR, args.single_project, "src")
-        if not os.path.isdir(src_dir):
-            log.error("Project source not found: {}".format(src_dir))
+    if args.project:
+        projects = args.project
+        missing = [p for p in projects
+                   if not os.path.isdir(os.path.join(UNPACKED_DIR, p, "src"))]
+        if missing:
+            print("\u274c Не найдены исходники для проектов: {}".format(', '.join(missing)))
+            print("   Ожидался путь: {}".format(
+                os.path.join(UNPACKED_DIR, "<PROJECT>", "src")))
             sys.exit(1)
-        projects = [args.single_project]
     else:
-        if not os.path.isdir(UNPACKED_DIR):
-            log.error("Unpacked directory not found: {}".format(UNPACKED_DIR))
-            sys.exit(1)
-        projects = sorted([
-            p for p in os.listdir(UNPACKED_DIR)
-            if os.path.isdir(os.path.join(UNPACKED_DIR, p, "src"))
-        ])
+        projects = discover_all_projects()
         if not projects:
-            log.error("No projects with src/ found in: {}".format(UNPACKED_DIR))
+            print("\u2139\ufe0f Не найдено проектов с src/ в {}".format(UNPACKED_DIR))
             sys.exit(1)
 
-    log.info("Projects to analyze: {}".format(len(projects)))
-    log.info("Projects: {}".format(', '.join(projects)))
-    if args.fast:
-        log.info("Mode: --fast (build+analyze per project)")
+    print("Проектов к анализу: {}".format(len(projects)))
+    print("Список: {}".format(', '.join(projects)))
+    if args.only_python:
+        print("Режим: только Python")
+    elif args.only_javascript:
+        print("Режим: только JavaScript/TypeScript")
     else:
-        log.info("Mode: two-pass (all builds, then all analyzes)")
+        print("Режим: Python + JavaScript/TypeScript (авто)")
 
     start_time = datetime.now()
     results = {}
 
-    if args.fast:
-        # Режим --fast: каждый проект обрабатываем полностью сразу
-        for proj in projects:
-            proj_log_path = os.path.join(LOG_DIR, "projects", "{}.log".format(proj))
-            log.set_project_log(proj_log_path)
-            log.info("=" * 50)
-            log.info("Processing project: {} (fast mode)".format(proj))
-            log.info("=" * 50)
-
-            build_ok, analyze_ok = process_project_build_and_analyze(proj, db, log, fast_mode=True)
-            results[proj] = analyze_ok  # для статистики считаем успешным если analyze ok
-            log.set_project_log(None)
-    else:
-        # Двухпроходный режим: сначала все build
-        log.info("=== PHASE 1: svace build for all projects ===")
-        build_results = {}  # project -> (build_ok, need_analyze)
-        for proj in projects:
-            proj_log_path = os.path.join(LOG_DIR, "projects", "{}.log".format(proj))
-            log.set_project_log(proj_log_path)
-            log.info("=" * 50)
-            log.info("Building project: {}".format(proj))
-            log.info("=" * 50)
-
-            build_ok, _ = process_project_build_and_analyze(proj, db, log, fast_mode=False)
-            build_results[proj] = build_ok
-            log.set_project_log(None)
-
-        # Затем все analyze для успешно построенных
-        log.info("=== PHASE 2: svace analyze for all projects ===")
-        for proj in projects:
-            if not build_results.get(proj, False):
-                log.info("Skipping analyze for {} (build failed)".format(proj))
-                results[proj] = False
-                continue
-
-            proj_log_path = os.path.join(LOG_DIR, "projects", "{}.log".format(proj))
-            log.set_project_log(proj_log_path)
-            log.info("=" * 50)
-            log.info("Analyzing project: {}".format(proj))
-            log.info("=" * 50)
-
-            analyze_ok = process_project_analyze(proj, db, log)
-            results[proj] = analyze_ok
-            log.set_project_log(None)
+    for project_name in projects:
+        results[project_name] = process_project(
+            project_name, args.svace_bin, args.only_python, args.only_javascript
+        )
 
     elapsed = datetime.now() - start_time
-    success_count = sum(1 for v in results.values() if v)
-    fail_count    = len(results) - success_count
+    success = [p for p, s in results.items() if s == "success"]
+    failed  = [p for p, s in results.items() if s == "failed"]
+    skipped = [p for p, s in results.items() if s == "skipped"]
 
-    log.info("")
-    log.info("=" * 50)
-    log.info("Analysis complete!")
-    log.info("=" * 50)
-    log.info("Total projects : {}".format(len(projects)))
-    log.info("Successful     : {}".format(success_count))
-    log.info("Failed         : {}".format(fail_count))
-    log.info("Time elapsed   : {}".format(elapsed))
-    log.info("DB             : {}".format(SVACE_PROJECTS_DB))
-    log.info("Run log        : {}".format(run_log_path))
+    print("\n{}".format("=" * 60))
+    print("Анализ завершён!")
+    print("Всего проектов : {}".format(len(projects)))
+    print("Успешно        : {}".format(len(success)))
+    print("Ошибка         : {}".format(len(failed)))
+    print("Пропущено      : {}".format(len(skipped)))
+    print("Время          : {}".format(elapsed))
+    print("Логи           : {}".format(LOG_DIR))
 
-    if fail_count > 0:
-        log.info("Failed projects:")
-        for name, ok in results.items():
-            if not ok:
-                log.error("  - {}".format(name))
+    if failed:
+        print("\nПроекты с ошибкой (см. лог каждого проекта в {}):".format(LOG_DIR))
+        for p in failed:
+            print("  - {}  ->  {}".format(p, os.path.join(LOG_DIR, p, "{}.log".format(p))))
 
-    sys.exit(0 if fail_count == 0 else 1)
+    if skipped:
+        print("\nПропущенные проекты (нет подходящих файлов):")
+        for p in skipped:
+            print("  - {}".format(p))
+
+    sys.exit(0 if not failed else 1)
 
 
 if __name__ == '__main__':
