@@ -312,7 +312,7 @@ BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECTS_DIR="$BASE_DIR/src"
 UNPACKED_DIR="$BASE_DIR/unpacked"
 LOG_DIR="$BASE_DIR/logs/unpack"
-ERROR_LOG="$LOG_DIR/errors_unpack.txt"
+# Ошибки теперь пишутся per-project: $LOG_DIR/<project_name>/error.log
 SKIPPED_LOG="$LOG_DIR/skipped_archives.txt"
 NORMALIZE_PY="$BASE_DIR/lib/normalize.py"
 
@@ -323,21 +323,37 @@ fi
 
 mkdir -p "$UNPACKED_DIR"
 mkdir -p "$LOG_DIR"
-> "$ERROR_LOG"
 > "$SKIPPED_LOG"
+
+# Возвращает путь к error.log конкретного проекта и гарантирует
+# существование директории. Файл на этот запуск обнуляется.
+init_project_error_log() {
+    local project_name="$1"
+    local log_path="$LOG_DIR/$project_name/error.log"
+    mkdir -p "$(dirname "$log_path")"
+    > "$log_path"
+    echo "$log_path"
+}
 
 log_header() {
     local project="$1"
-    {
-        flock 200
-        printf "==============================\n%s\n==============================\n\n" "$project" >> "$ERROR_LOG"
-    } 200>"$ERROR_LOG.lock"
+    local log_path="$2"
+    printf "==============================\n%s\n==============================\n\n" "$project" >> "$log_path"
     echo "=== Processing project: $project ==="
 }
 
+# Пишет блок ошибки в error.log проекта. Принимает текст либо аргументом,
+# либо через stdin (для многострочного вывода команд).
+# Использование: log_error "$error_log" "однострочное сообщение"
+#            или: cmd_output | log_error "$error_log"
 log_error() {
-    { flock 200; echo "$1" >> "$ERROR_LOG"; } 200>"$ERROR_LOG.lock"
-    echo "[ERROR] $1"
+    local log_path="$1"
+    local msg="${2:-}"
+    if [[ -z "$msg" && ! -t 0 ]]; then
+        msg="$(cat)"
+    fi
+    printf '%s\n' "$msg" >> "$log_path"
+    echo "[ERROR] $(printf '%s\n' "$msg" | head -1)"
 }
 
 log_skipped() {
@@ -428,114 +444,183 @@ run_batch_file() {
     done < <(file "${files[@]}" 2>/dev/null || true)
 }
 
+
+# --- Таблица методов распаковки -------------------------------------------
+# Каждый "метод" — это одна конкретная команда. Составные случаи (gzip и
+# т.п. могут быть как plain-файлом, так и tar-потоком внутри) реализованы
+# как ДВА метода: сначала пробуем как tar, потом как обычное сжатие.
+
+# Возвращает (в stdout, через пробел) список методов-кандидатов на основе
+# расширения файла, в порядке приоритета.
+_candidate_methods_for_ext() {
+    local lower="$1"
+    case "$lower" in
+        *.tar.gz|*.tgz)   echo "tar_gz" ;;
+        *.tar.bz2|*.tbz2) echo "tar_bz2" ;;
+        *.tar.xz|*.txz)   echo "tar_xz" ;;
+        *.tar.zst)        echo "tar_zst" ;;
+        *.tar.z)          echo "tar_z" ;;
+        *.tar.lz4)        echo "tar_lz4" ;;
+        *.tar.lzma)       echo "tar_lzma" ;;
+        *.tar)            echo "tar_plain" ;;
+        *.gz)             echo "tar_gz gzip_plain" ;;
+        *.bz2)            echo "tar_bz2 bzip2_plain" ;;
+        *.xz)             echo "tar_xz xz_plain" ;;
+        *.zst)            echo "tar_zst zstd_plain" ;;
+        *.z)              echo "compress" ;;
+        *.zip|*.whl|*.egg|*.jar|*.war|*.ear|*.apk|*.ipa|*.xpi|*.crx|*.nupkg|*.epub|*.aar)
+                          echo "zip" ;;
+        *.rar)            echo "rar" ;;
+        *.7z)             echo "7z" ;;
+        *.iso)            echo "iso" ;;
+        *.rpm)            echo "rpm" ;;
+        *.deb)            echo "deb" ;;
+        *.cab)            echo "cab" ;;
+        *.msi)            echo "msi" ;;
+        *.squashfs)       echo "squashfs" ;;
+        *.pkg)            echo "pkg" ;;
+        *)                echo "" ;;
+    esac
+}
+
+# То же самое, но на основе реального типа файла (вывод `file -b`).
+_candidate_methods_for_magic() {
+    local ftype="$1"
+    case "$ftype" in
+        *"Zip archive"*)               echo "zip" ;;
+        *"RAR archive"*)               echo "rar" ;;
+        *"7-zip archive"*)             echo "7z" ;;
+        *"tar archive"*)               echo "tar_plain" ;;
+        *"gzip compressed"*)           echo "tar_gz gzip_plain" ;;
+        *"bzip2 compressed"*)          echo "tar_bz2 bzip2_plain" ;;
+        *"XZ compressed"*)             echo "tar_xz xz_plain" ;;
+        *"Zstandard compressed"*)      echo "tar_zst zstd_plain" ;;
+        *"compress'd data"*)           echo "compress" ;;
+        *"cpio archive"*)              echo "cpio" ;;
+        *"ISO 9660"*)                  echo "iso" ;;
+        *"RPM"*)                       echo "rpm" ;;
+        *"Debian binary package"*)     echo "deb" ;;
+        *"Microsoft Cabinet archive"*) echo "cab" ;;
+        *"MSI Installer"*)             echo "msi" ;;
+        *"Squashfs filesystem"*)       echo "squashfs" ;;
+        *"Apple pkg archive"*)         echo "pkg" ;;
+        *)                              echo "" ;;
+    esac
+}
+
+# Выполняет один конкретный метод распаковки. НЕ подавляет stderr —
+# вызывающий код сам решает, что делать с выводом (обычно захватывает его
+# через `$(... 2>&1)`).
+_run_extract_method() {
+    local method="$1" file="$2" dir="$3" base="$4"
+    case "$method" in
+        tar_gz)      tar -xzf "$file" -C "$dir" ;;
+        tar_bz2)     tar -xjf "$file" -C "$dir" ;;
+        tar_xz)      tar -xJf "$file" -C "$dir" ;;
+        tar_zst)     tar -x --zstd -f "$file" -C "$dir" ;;
+        tar_z)       tar -xZf "$file" -C "$dir" ;;
+        tar_lz4)     lz4 -d "$file" -c | tar -x -C "$dir" ;;
+        tar_lzma)    tar -x --lzma -f "$file" -C "$dir" ;;
+        tar_plain)   tar -xf "$file" -C "$dir" ;;
+        gzip_plain)  gunzip -c "$file" > "$dir/${base%.gz}" ;;
+        bzip2_plain) bunzip2 -c "$file" > "$dir/${base%.bz2}" ;;
+        xz_plain)    unxz -c "$file" > "$dir/${base%.xz}" ;;
+        zstd_plain)  unzstd -q -o "$dir/${base%.zst}" "$file" ;;
+        compress)    uncompress -c "$file" > "$dir/${base%.Z}" ;;
+        zip)         unzip -q "$file" -d "$dir" ;;
+        rar)         unrar x -o+ "$file" "$dir/" ;;
+        7z)          7z x -y "$file" -o"$dir" ;;
+        iso)         7z x -y "$file" -o"$dir" ;;
+        rpm)         rpm2cpio "$file" | (cd "$dir" && cpio -idm) ;;
+        deb)         dpkg-deb -R "$file" "$dir" ;;
+        cab)         cabextract -d "$dir" "$file" ;;
+        msi)         msiextract -C "$dir" "$file" ;;
+        squashfs)    unsquashfs -d "$dir" "$file" ;;
+        pkg)         bsdtar -xf "$file" -C "$dir" ;;
+        cpio)        (cd "$dir" && cpio -idm < "$file") ;;
+        *)           return 127 ;;
+    esac
+}
+
 extract_archive() {
     local file="$1"
+    local error_log="$2"
     local dir="${file}_dir"
     mkdir -p "$dir"
     echo "Extracting: $file" >&2
 
-    local base lower ok=0
+    local base lower
     base=$(basename "$file")
     lower="${base,,}"
 
-    case "$lower" in
-        *.tar.gz|*.tgz)
-            tar -xzf "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *.tar.bz2|*.tbz2)
-            tar -xjf "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *.tar.xz|*.txz)
-            tar -xJf "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *.tar.zst)
-            tar -x --zstd -f "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *.tar.z)
-            tar -xZf "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *.tar.lz4)
-            lz4 -d "$file" -c 2>/dev/null | tar -x -C "$dir" 2>/dev/null && ok=1 ;;
-        *.tar.lzma)
-            tar -x --lzma -f "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *.tar)
-            tar -xf "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *.gz)
-            tar -xzf "$file" -C "$dir" 2>/dev/null && ok=1 || \
-            { gunzip -c "$file" > "$dir/${base%.gz}" 2>/dev/null && ok=1; } ;;
-        *.bz2)
-            tar -xjf "$file" -C "$dir" 2>/dev/null && ok=1 || \
-            { bunzip2 -c "$file" > "$dir/${base%.bz2}" 2>/dev/null && ok=1; } ;;
-        *.xz)
-            tar -xJf "$file" -C "$dir" 2>/dev/null && ok=1 || \
-            { unxz -c "$file" > "$dir/${base%.xz}" 2>/dev/null && ok=1; } ;;
-        *.zst)
-            tar -x --zstd -f "$file" -C "$dir" 2>/dev/null && ok=1 || \
-            { unzstd -q -o "$dir/${base%.zst}" "$file" 2>/dev/null && ok=1; } ;;
-        *.z)
-            uncompress -c "$file" > "$dir/${base%.Z}" 2>/dev/null && ok=1 ;;
-        *.zip|*.whl|*.egg|*.jar|*.war|*.ear|*.apk|*.ipa|*.xpi|*.crx|*.nupkg|*.epub|*.aar)
-            unzip -q "$file" -d "$dir" 2>/dev/null && ok=1 ;;
-        *.rar)
-            unrar x -o+ "$file" "$dir/" 2>/dev/null && ok=1 ;;
-        *.7z)
-            7z x -y "$file" -o"$dir" >/dev/null 2>&1 && ok=1 ;;
-        *.iso)
-            7z x -y "$file" -o"$dir" >/dev/null 2>&1 && ok=1 ;;
-        *.rpm)
-            rpm2cpio "$file" | (cd "$dir" && cpio -idm 2>/dev/null) && ok=1 ;;
-        *.deb)
-            dpkg-deb -R "$file" "$dir" 2>/dev/null && ok=1 ;;
-        *.cab)
-            cabextract -d "$dir" "$file" >/dev/null 2>&1 && ok=1 ;;
-        *.msi)
-            msiextract -C "$dir" "$file" >/dev/null 2>&1 && ok=1 ;;
-        *.squashfs)
-            unsquashfs -d "$dir" "$file" >/dev/null 2>&1 && ok=1 ;;
-        *.pkg)
-            bsdtar -xf "$file" -C "$dir" 2>/dev/null && ok=1 ;;
-        *)
-            local ftype="${FILE_TYPE_CACHE[$file]:-}"
-            if [[ -z "$ftype" ]]; then
-                ftype=$(file -b "$file" 2>/dev/null || echo "")
+    local -a tried=()
+    local combined_err=""
+    local ok=0
+    local ftype=""
+
+    # --- Попытка №1: по расширению файла ---
+    local -a candidates=()
+    read -ra candidates <<< "$(_candidate_methods_for_ext "$lower")"
+
+    local m out rc
+    for m in "${candidates[@]}"; do
+        [[ -z "$m" ]] && continue
+        tried+=("$m")
+        out=$(_run_extract_method "$m" "$file" "$dir" "$base" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]]; then
+            ok=1
+            break
+        fi
+        combined_err+=$'\n'"--- method '$m' (by extension) failed, rc=$rc ---"$'\n'"$out"
+    done
+
+    # --- Попытка №2: расширение не помогло (или файла с такой ext-логикой
+    # нет вовсе) — определяем реальный формат по magic-байтам и пробуем
+    # подходящий инструмент, даже если расширение указывало на другое ---
+    if [[ $ok -eq 0 ]]; then
+        ftype="${FILE_TYPE_CACHE[$file]:-}"
+        if [[ -z "$ftype" ]]; then
+            ftype=$(file -b "$file" 2>/dev/null || echo "")
+        fi
+
+        local -a magic_candidates=()
+        read -ra magic_candidates <<< "$(_candidate_methods_for_magic "$ftype")"
+
+        for m in "${magic_candidates[@]}"; do
+            [[ -z "$m" ]] && continue
+            # не повторяем метод, который уже пробовали на шаге 1
+            local already=0 tm
+            for tm in "${tried[@]}"; do
+                [[ "$tm" == "$m" ]] && already=1 && break
+            done
+            [[ $already -eq 1 ]] && continue
+
+            tried+=("$m")
+            out=$(_run_extract_method "$m" "$file" "$dir" "$base" 2>&1); rc=$?
+            if [[ $rc -eq 0 ]]; then
+                ok=1
+                break
             fi
-            if [[ -n "$ftype" ]]; then
-                if [[ "$ftype" == *"Zip archive"* ]]; then
-                    unzip -q "$file" -d "$dir" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"RAR archive"* ]]; then
-                    unrar x -o+ "$file" "$dir/" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"7-zip archive"* ]]; then
-                    7z x -y "$file" -o"$dir" >/dev/null 2>&1 && ok=1
-                elif [[ "$ftype" == *"tar archive"* ]]; then
-                    tar -xf "$file" -C "$dir" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"gzip compressed"* ]]; then
-                    tar -xzf "$file" -C "$dir" 2>/dev/null && ok=1 || \
-                    gunzip -c "$file" > "$dir/$base" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"bzip2 compressed"* ]]; then
-                    bunzip2 -c "$file" > "$dir/$base" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"XZ compressed"* ]]; then
-                    unxz -c "$file" > "$dir/$base" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"Zstandard compressed"* ]]; then
-                    unzstd -q -o "$dir/$base" "$file" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"cpio archive"* ]]; then
-                    (cd "$dir" && cpio -idm < "$file" 2>/dev/null) && ok=1
-                elif [[ "$ftype" == *"ISO 9660"* ]]; then
-                    7z x -y "$file" -o"$dir" >/dev/null 2>&1 && ok=1
-                elif [[ "$ftype" == *"RPM"* ]]; then
-                    rpm2cpio "$file" | (cd "$dir" && cpio -idm 2>/dev/null) && ok=1
-                elif [[ "$ftype" == *"Debian binary package"* ]]; then
-                    dpkg-deb -R "$file" "$dir" 2>/dev/null && ok=1
-                elif [[ "$ftype" == *"Microsoft Cabinet archive"* ]]; then
-                    cabextract -d "$dir" "$file" >/dev/null 2>&1 && ok=1
-                elif [[ "$ftype" == *"Squashfs filesystem"* ]]; then
-                    unsquashfs -d "$dir" "$file" >/dev/null 2>&1 && ok=1
-                elif [[ "$ftype" == *"Apple pkg archive"* ]]; then
-                    bsdtar -xf "$file" -C "$dir" 2>/dev/null && ok=1
-                fi
-            fi
-            ;;
-    esac
+            combined_err+=$'\n'"--- method '$m' (by magic: ${ftype:-unknown}) failed, rc=$rc ---"$'\n'"$out"
+        done
+
+        if [[ ${#magic_candidates[@]} -eq 0 || -z "${magic_candidates[0]}" ]]; then
+            combined_err+=$'\n'"file(1) did not match any known archive signature: ${ftype:-<file -b returned nothing>}"
+        fi
+    fi
 
     if [[ $ok -eq 1 ]]; then
         echo "Done: $file" >&2
         echo "$dir"
     else
-        log_error "Failed to extract: $file" >&2
+        {
+            echo "Failed to extract: $file"
+            echo "  extension-guessed methods tried: ${tried[*]:-<none>}"
+            echo "  detected type (file -b): ${ftype:-<not checked, extension attempt succeeded... n/a>}"
+            echo "  --- combined output ---"
+            printf '%s\n' "$combined_err"
+            echo ""
+        } | log_error "$error_log"
         rm -rf "$dir"
         echo ""
     fi
@@ -571,7 +656,10 @@ process_project() {
     local proj_start_ts
     proj_start_ts=$(now_ns)
 
-    log_header "$project_name"
+    local error_log
+    error_log=$(init_project_error_log "$project_name")
+
+    log_header "$project_name" "$error_log"
 
     local unpack_dir="$UNPACKED_DIR/${project_name}"
 
@@ -752,7 +840,7 @@ process_project() {
                 local t_extract
                 t_extract=$(now_ns)
                 local new_dir
-                new_dir=$(extract_archive "$phys_file")
+                new_dir=$(extract_archive "$phys_file" "$error_log")
                 echo "[TIME] [$project_name] extract $(basename "$phys_file"): $(format_duration $(( $(now_ns) - t_extract )))"
 
                 if [[ -n "$new_dir" && -d "$new_dir" ]]; then
@@ -864,7 +952,7 @@ for pid in "${pids[@]}"; do
     fi
 done
 
-rm -f "$ERROR_LOG.lock" "$SKIPPED_LOG.lock"
+rm -f "$SKIPPED_LOG.lock"
 
 SCRIPT_TOTAL=$(( $(now_ns) - SCRIPT_START_TS ))
 echo ""
@@ -872,7 +960,7 @@ echo "=================================================="
 echo "Unpacking complete."
 echo "Total time : $(format_duration $SCRIPT_TOTAL)"
 echo "Output     : $UNPACKED_DIR"
-echo "Errors     : $ERROR_LOG"
+echo "Errors     : $LOG_DIR/<project>/error.log (по одному файлу на проект)"
 echo "Skipped    : $SKIPPED_LOG"
 echo "=================================================="
 
