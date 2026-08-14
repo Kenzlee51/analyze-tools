@@ -102,7 +102,7 @@ analyze-json.py — Анализ происхождения файлов сбо�
   Из redundant выделяются компилируемые файлы и проверяется были ли
   они на входе у компиляторов (gcc, g++, rustc и др. из utilities.yaml).
 
-  {project}_not_compiled.json / .txt
+  {project}_compiled_not_copied_to_distr.json / .txt
       Компилируемые файлы (.c, .cpp, .rs, .go и др.) которые не попали
       в дистрибутив — компилировались, но результат не нужен.
       Поля: path, hash, source (direct|parent)
@@ -607,6 +607,99 @@ def load_buildography_data(paths):
     return hashes, raw_cmds
 
 
+# Компиляторы фронтенды которые пишут вывод в пайп (stdout) а не в файл.
+# Они читают .c/.cpp/.cc и знают целевой .o (в аргументах), но сам .o
+# создаёт следующая в цепочке команда 'as' (ассемблер).
+_COMPILER_FRONTENDS = {'cc1', 'cc1plus'}
+# Обёртки которые тоже могут иметь исходник на входе и .o в аргументах
+_COMPILER_WRAPPERS  = {'gcc', 'g++', 'cc', 'c++'}
+_ASSEMBLER_TOOLS    = {'as'}
+
+
+def link_compiler_to_assembler(raw_cmds):
+    """
+    Восстанавливает разорванную цепочку компиляции C/C++.
+
+    Проблема: g++/cc1plus компилируют .cpp, но пишут ассемблерный вывод
+    в пайп (-o -), поэтому у них output=0. Ассемблер 'as' создаёт .o,
+    но читает .s из пайпа и не имеет .cpp в зависимостях. В результате
+    связь .cpp -> .o теряется и .cpp попадает в not_compiled.
+
+    Решение через дерево процессов (parent_id):
+      g++ (id=P)
+        ├─ cc1plus (parent_id=P)  компилирует .cpp
+        └─ as      (parent_id=P)  создаёт .o
+    cc1plus и as — братья с общим parent_id. Находим для каждого cc1plus
+    его брата 'as' по parent_id и копируем hash .o из as в output cc1plus.
+
+    Это надёжнее сопоставления по basename: имена .o могут совпадать
+    в разных модулях (build_operator/logger.o и build_client/logger.o),
+    но parent_id уникален для каждого вызова компилятора.
+
+    Модифицирует raw_cmds на месте. Возвращает количество связанных пар.
+    """
+    # Индекс: parent_id -> список output .o (path, hash) от команд 'as'
+    parent_to_as_output = {}
+    for cmd in raw_cmds:
+        cl = cmd.get('command', [])
+        if not cl:
+            continue
+        tool = os.path.basename(str(cl[0]))
+        if tool not in _ASSEMBLER_TOOLS:
+            continue
+        pid = cmd.get('parent_id')
+        if pid is None:
+            continue
+        outputs = cmd.get('output', {})
+        items = outputs.items() if isinstance(outputs, dict) else \
+                [(o.get('path', ''), o.get('hash', '')) for o in outputs
+                 if isinstance(o, dict)]
+        for path, h in items:
+            h = h.strip() if h else ''
+            if path.endswith('.o') and h:
+                parent_to_as_output.setdefault(pid, []).append((path, h))
+
+    if not parent_to_as_output:
+        return 0
+
+    linked = 0
+    for cmd in raw_cmds:
+        cl = cmd.get('command', [])
+        if not cl:
+            continue
+        tool = os.path.basename(str(cl[0]))
+        if tool not in _COMPILER_FRONTENDS:
+            continue
+
+        # Уже есть output? Пропускаем — цепочка не разорвана.
+        existing_out = cmd.get('output', {})
+        has_output = (isinstance(existing_out, dict) and existing_out) or \
+                     (isinstance(existing_out, list) and existing_out)
+        if has_output:
+            continue
+
+        pid = cmd.get('parent_id')
+        if pid is None:
+            continue
+
+        # Находим брата 'as' с тем же parent_id
+        as_outputs = parent_to_as_output.get(pid)
+        if not as_outputs:
+            continue
+
+        # Копируем output .o из as в output cc1plus.
+        # Обычно один .o на пару, но копируем все на случай нескольких.
+        synth = []
+        for path, h in as_outputs:
+            synth.append({'path': path, 'hash': h,
+                          'synthesized': 'cc1plus_as_link'})
+        if synth:
+            cmd['output'] = synth
+            linked += 1
+
+    return linked
+
+
 # =============================================================================
 # ФУНКЦИИ ДЛЯ ПРОХОДА 2 (КОМПИЛИРУЕМЫЕ) – ТРАНЗИТИВНАЯ ВЕРСИЯ С ПОДДЕРЖКОЙ ХЕШЕЙ
 # =============================================================================
@@ -833,12 +926,15 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys):
     for entry in direct:
         if is_compiled_extension(entry.get('path', '')):
             if not was_compiled(entry):
+                # Файл БЫЛ в buildography (он direct), компилировался,
+                # но результат не попал в дистрибутив → not_compiled.
+                # НЕ добавляем в redundant — эти категории исключают друг друга:
+                # redundant-by-hash = файлы которых НЕТ в buildography.
                 not_compiled.append({
                     'path': entry['path'],
                     'hash': entry['hash'],
                     'source': 'direct',
                 })
-                redundant.append({'path': entry['path'], 'hash': entry['hash']})
                 moved_count += 1
                 continue
         direct_out.append(entry)
@@ -846,13 +942,15 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys):
     for entry in parent:
         if is_compiled_extension(entry.get('path', '')):
             if not was_compiled(entry):
+                # Файл БЫЛ в buildography (он parent), компилировался,
+                # но результат не попал в дистрибутив → not_compiled.
+                # НЕ добавляем в redundant (см. комментарий выше).
                 not_compiled.append({
                     'path': entry['path'],
                     'hash': entry['hash'],
                     'parent_hash': entry.get('parent_hash', ''),
                     'source': 'parent',
                 })
-                redundant.append({'path': entry['path'], 'hash': entry['hash']})
                 moved_count += 1
                 continue
         parent_out.append(entry)
@@ -2682,6 +2780,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     try:
         signatures = load_signatures(signatures_files)
         buildography_hashes, raw_cmds = load_buildography_data(buildography_files)
+
+        # Восстанавливаем разорванную цепочку компиляции C/C++:
+        # cc1plus компилирует .cpp но пишет в пайп (output=0), а .o создаёт
+        # 'as'. Связываем их по basename .o чтобы .cpp не попал в not_compiled.
+        _linked = link_compiler_to_assembler(raw_cmds)
+        if _linked:
+            print(_ts() + "   Linked compiler->assembler chains: {} .cpp->.o pairs".format(_linked))
+
         bin_hashes, bin_paths = load_bin_signatures(project_name)
     except Exception as e:
         print(_ts() + "   Failed to load data: {}".format(e))
@@ -3054,8 +3160,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     # --- Pass 2 ---
     print(_ts() + "   Writing pass 2 results...")
-    jt(pass2_dir, "not_compiled", "not_compiled", not_compiled,
-       summary_src_files, "not_compiled")
+    jt(pass2_dir, "compiled_not_copied_to_distr", "compiled_not_copied_to_distr", not_compiled,
+       summary_src_files, "compiled_not_copied_to_distr")
 
     # --- Pass 3 ---
     print(_ts() + "   Writing pass 3 results...")
@@ -3098,17 +3204,19 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         return (n / total * 100) if total else 0
 
     # Компилируемые исходники
-    total_source   = len(direct) + len(parent) + len(redundant)
-    # not_compiled — подмножество redundant (файлы перемещённые из direct/parent)
-    # redundant уже включает not_compiled, поэтому избыточные = redundant
+    # redundant и not_compiled теперь непересекающиеся категории:
+    #   redundant     — файлов НЕТ в buildography (истинно избыточные по хешу)
+    #   not_compiled  — файлы БЫЛИ в buildography, но результат не в дистрибутиве
+    total_source   = len(direct) + len(parent) + len(redundant) + len(not_compiled)
     n_redundant    = len(redundant)
+    n_not_compiled = len(not_compiled)
 
     # Интерпретируемые файлы
     total_interp   = len(executed) + len(compiled_used) + len(compiled_unused) + len(copied) + len(izb)
 
     # Итого
     total_all      = total_source + total_interp
-    total_izb      = n_redundant + len(compiled_unused) + len(izb)
+    total_izb      = n_redundant + n_not_compiled + len(compiled_unused) + len(izb)
 
     sep = "  " + "-" * 48
 
@@ -3118,7 +3226,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     print(sep)
     print("  Direct (используются напрямую)                     : {:>7}  ({:.1f}%)".format(len(direct),       pct(len(direct),       total_source)))
     print("  Parent (через архив)                               : {:>7}  ({:.1f}%)".format(len(parent),       pct(len(parent),       total_source)))
-    print("  Not compiled (компилировались, результат не в bin) : {:>7}  ({:.1f}%)".format(n_redundant,       pct(n_redundant,       total_source)))
+    print("  Redundant-by-hash (нет в buildography)             : {:>7}  ({:.1f}%)".format(n_redundant,       pct(n_redundant,       total_source)))
+    print("  Compiled not copied (в buildography, не в bin)     : {:>7}  ({:.1f}%)".format(n_not_compiled,    pct(n_not_compiled,    total_source)))
 
     print("\n  Интерпретируемые файлы ({} файлов)".format(total_interp))
     print(sep)
@@ -3185,7 +3294,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     _summary_lines.append(_sep)
     _summary_lines.append("  Direct (используются напрямую)                     : {:>7}  ({:.1f}%)".format(len(direct),   pct(len(direct),   total_source)))
     _summary_lines.append("  Parent (через архив)                               : {:>7}  ({:.1f}%)".format(len(parent),   pct(len(parent),   total_source)))
-    _summary_lines.append("  Not compiled (компилировались, результат не в bin) : {:>7}  ({:.1f}%)".format(n_redundant,  pct(n_redundant,   total_source)))
+    _summary_lines.append("  Redundant-by-hash (нет в buildography)             : {:>7}  ({:.1f}%)".format(n_redundant,   pct(n_redundant,   total_source)))
+    _summary_lines.append("  Compiled not copied (в buildography, не в bin)     : {:>7}  ({:.1f}%)".format(n_not_compiled, pct(n_not_compiled, total_source)))
 
     _summary_lines.append("")
     _summary_lines.append("  Интерпретируемые файлы ({} файлов)".format(total_interp))
@@ -3268,7 +3378,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "Файлы из репозитория исходников которые не найдены в buildography\n"
             "  и отсутствуют в дистрибутиве."
         ),
-        "not_compiled": (
+        "compiled_not_copied_to_distr": (
             "src/",
             "Компилируемые файлы результат которых не в дистрибутиве",
             "Исходные файлы компилируемых языков (.c, .cpp, .rs, .go и др.)\n"
@@ -3291,7 +3401,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         "external_built": (
             "bin/",
             "Бинари, в которые попали сторонние исходные тексты",
-            ""
+            "Бинари дистрибутива собранные с использованием исходных текстов\n"
+            "  которых нет в переданных исходниках (src.json)."
         ),
         "external_prebuilt": (
             "bin/",
@@ -3301,7 +3412,9 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         "untraced_external": (
             "bin/",
             "Бинари полностью неизвестного происхождения",
-            ""
+            "Бинари дистрибутива происхождение которых не установлено: их нет\n"
+            "  в исходниках (src.json), и трассировщик не видел ни их сборки,\n"
+            "  ни их получения через пакетные менеджеры."
         ),
         "external_package_content": (
             "bin/",
@@ -3312,17 +3425,20 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         "binaries_from_src": (
             "bin/",
             "Бинари хранящиеся прямо в исходниках",
-            ""
+            "Готовые ELF/PE бинари, которые хранятся прямо в исходниках\n"
+            "  (src.json) и скопированы в дистрибутив без сборки."
         ),
         "binaries_in_src": (
             "bin/",
             "Полный список ELF/PE бинарей в переданных исходных текстах",
-            ""
+            "Полный список всех ELF/PE бинарей обнаруженных в переданных\n"
+            "  исходных текстах."
         ),
         "system_binaries": (
             "bin/",
             "Системные бинари, обнаруженные в дистрибутиве.",
-            ""
+            "Бинари расположенные по системным путям внутри дистрибутива\n"
+            "  (/usr/, /lib/ и т.д.)."
         ),
     }
 
@@ -3455,7 +3571,7 @@ def run_pass5(try_dir, project_name,
     # --- SRC ---
     src_categories = [
         ("redundant-by-hash", "redundant",         redundant),
-        ("not_compiled",      "not_compiled",       not_compiled),
+        ("compiled_not_copied_to_distr", "compiled_not_copied_to_distr", not_compiled),
         ("not_used",          "interpreted_not_used", not_used),
         ("compiled_unused",   "interpreted_compiled_unused", compiled_unused),
     ]
