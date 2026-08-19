@@ -191,14 +191,14 @@ _build_find_name_args() {
     local first=true
     for pat in "${_ARCHIVE_NAMES[@]}"; do
         if $first; then
-            args+=( -name "$pat" )
+            args+=( -iname "$pat" )
             first=false
         else
-            args+=( -o -name "$pat" )
+            args+=( -o -iname "$pat" )
         fi
     done
     for ext in "${AMBIGUOUS_EXTENSIONS[@]}"; do
-        args+=( -o -name "*.$ext" )
+        args+=( -o -iname "*.$ext" )
     done
     printf '%s\0' "${args[@]}"
 }
@@ -455,18 +455,18 @@ run_batch_file() {
 _candidate_methods_for_ext() {
     local lower="$1"
     case "$lower" in
-        *.tar.gz|*.tgz)   echo "tar_gz" ;;
-        *.tar.bz2|*.tbz2) echo "tar_bz2" ;;
-        *.tar.xz|*.txz)   echo "tar_xz" ;;
-        *.tar.zst)        echo "tar_zst" ;;
-        *.tar.z)          echo "tar_z" ;;
+        *.tar.gz|*.tgz)   echo "tar_gz gzip_plain" ;;
+        *.tar.bz2|*.tbz2) echo "tar_bz2 bzip2_plain" ;;
+        *.tar.xz|*.txz)   echo "tar_xz xz_plain" ;;
+        *.tar.zst)        echo "tar_zst zstd_plain" ;;
+        *.tar.z)          echo "tar_z compress" ;;
         *.tar.lz4)        echo "tar_lz4" ;;
         *.tar.lzma)       echo "tar_lzma" ;;
         *.tar)            echo "tar_plain" ;;
-        *.gz)             echo "tar_gz gzip_plain" ;;
-        *.bz2)            echo "tar_bz2 bzip2_plain" ;;
-        *.xz)             echo "tar_xz xz_plain" ;;
-        *.zst)            echo "tar_zst zstd_plain" ;;
+        *.gz)             echo "gzip_plain tar_gz" ;;
+        *.bz2)            echo "bzip2_plain tar_bz2" ;;
+        *.xz)             echo "xz_plain tar_xz" ;;
+        *.zst)            echo "zstd_plain tar_zst" ;;
         *.z)              echo "compress" ;;
         *.zip|*.whl|*.egg|*.jar|*.war|*.ear|*.apk|*.ipa|*.xpi|*.crx|*.nupkg|*.epub|*.aar)
                           echo "zip" ;;
