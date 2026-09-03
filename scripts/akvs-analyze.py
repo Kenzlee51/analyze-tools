@@ -281,10 +281,44 @@ def auth_args(cfg):
 
 
 def akvs_delete_project(cfg, project, log):
-    """Удаление проекта на сервере (тихо — не роняет прогон)."""
+    """Удаление одного проекта по имени (тихо — не роняет прогон)."""
     cmd = [cfg['java'], '-jar', cfg['jar'], 'project', 'delete'] \
         + auth_args(cfg) + ['-n', project]
     run_cmd(cmd, BASE_DIR, log, "project delete")
+
+
+def akvs_list_projects(cfg, log):
+    """Возвращает список имён проектов на сервере (или [] при ошибке)."""
+    cmd = [cfg['java'], '-jar', cfg['jar'], 'project', 'list'] + auth_args(cfg)
+    try:
+        result = subprocess.run(cmd, cwd=BASE_DIR,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        log.error("project list: ошибка запуска: {}".format(e))
+        return []
+    out = result.stdout.decode('utf-8', errors='replace')
+    # Формат вывода:
+    #   [INFO] Projects:
+    #   - name1
+    #   - name2
+    names = []
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith('- '):
+            name = s[2:].strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def akvs_purge_slot(cfg, log):
+    """Освобождает слот: удаляет ВСЕ проекты на сервере (сервер однопроектный)."""
+    names = akvs_list_projects(cfg, log)
+    if not names:
+        return
+    log.info("На сервере найдены проекты: {} — удаляю все".format(', '.join(names)))
+    for name in names:
+        akvs_delete_project(cfg, name, log)
 
 
 def akvs_download_server_log(cfg, project, stage, log):
@@ -355,8 +389,9 @@ def process_project(project, cfg, keep_raw):
     status = "success"
     stage = None
     try:
-        # Страховка: убираем возможный висящий проект прошлого прогона
-        akvs_delete_project(cfg, project, log)
+        # Освобождаем слот: сервер держит один проект за раз, поэтому
+        # удаляем ВСЁ, что осталось от прошлых прогонов/тестов.
+        akvs_purge_slot(cfg, log)
 
         # ---------- 1. СТАТИКА ----------
         stage = "static"
