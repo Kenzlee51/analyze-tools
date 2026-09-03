@@ -1,13 +1,15 @@
 #!/bin/bash
 # ============================================================
 # INSTALLER FOR DIRECTORY WATCHER DAEMON
-# Version: 1.0
+# Version: 1.1
 # ============================================================
 #
 # DESCRIPTION:
 #   This script installs and configures a daemon that automatically
 #   creates 'src' and 'bin' subdirectories inside any new folder
 #   created in the ./src directory.
+#
+#   If run again, it will stop the old daemon and reinstall.
 #
 # INSTALLATION:
 #   1. Make this script executable:
@@ -55,6 +57,7 @@ DAEMON_SCRIPT="$DAEMON_DIR/watcher_daemon_dir.sh"
 DAEMON_CONFIG="$DAEMON_DIR/watcher_daemon_dir.conf"
 LOG_DIR="$PROJECT_ROOT/logs/daemons/watcher_daemon_dir"
 WATCH_BASE="$PROJECT_ROOT/src"
+PID_FILE="$PROJECT_ROOT/watcher.pid"
 
 # --- FUNCTIONS ---
 
@@ -107,6 +110,59 @@ install_inotify() {
         echo "[ERROR] Failed to install inotify-tools"
         return 1
     fi
+}
+
+stop_old_daemon() {
+    echo "[INFO] Stopping old daemon if running..."
+    
+    # По PID файлу
+    if [[ -f "$PID_FILE" ]]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "[INFO] Killing process $pid"
+            kill "$pid" 2>/dev/null
+            sleep 1
+            kill -9 "$pid" 2>/dev/null
+        fi
+        rm -f "$PID_FILE"
+    fi
+    
+    # По имени процесса
+    local pids=$(pgrep -f "watcher_daemon_dir" 2>/dev/null)
+    if [[ -n "$pids" ]]; then
+        echo "[INFO] Killing remaining processes: $pids"
+        pkill -f "watcher_daemon_dir" 2>/dev/null
+        sleep 1
+    fi
+    
+    # Systemd сервис
+    if systemctl is-active --quiet watcher_daemon_dir 2>/dev/null; then
+        echo "[INFO] Stopping systemd service"
+        sudo systemctl stop watcher_daemon_dir 2>/dev/null
+    fi
+    
+    echo "[OK] Old daemon stopped"
+}
+
+remove_old_files() {
+    echo "[INFO] Removing old files..."
+    
+    # Удаляем старый скрипт если есть
+    rm -f "$DAEMON_SCRIPT" 2>/dev/null
+    
+    # Удаляем старый конфиг если есть
+    rm -f "$DAEMON_CONFIG" 2>/dev/null
+    
+    # Удаляем старую папку если есть (от неправильной установки)
+    rm -rf "$DAEMON_DIR/watcher_daemon_dir" 2>/dev/null
+    
+    # Очищаем логи при переустановке
+    if [[ -f "$LOG_DIR/log.log" ]]; then
+        echo "[INFO] Old log found, moving to log.log.old"
+        mv "$LOG_DIR/log.log" "$LOG_DIR/log.log.old" 2>/dev/null
+    fi
+    
+    echo "[OK] Old files removed"
 }
 
 create_directories() {
@@ -377,6 +433,12 @@ main() {
     echo "  Watcher Daemon Installer"
     echo "  Name: watcher_daemon_dir"
     echo "=========================================="
+    echo ""
+    
+    # Сначала останавливаем старый демон и удаляем файлы
+    echo "[STEP 0] Cleaning up old installation..."
+    stop_old_daemon
+    remove_old_files
     echo ""
     
     echo "[1/6] Checking dependencies..."
