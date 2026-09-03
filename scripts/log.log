@@ -1,0 +1,12 @@
+user@user-VM:~/akvs2/analyze-tools$ ./lib/daemons/watcher_daemon_dir/install_watcher.sh 
+==========================================
+  Watcher Daemon Installer
+  Name: watcher_daemon_dir
+==========================================
+
+[STEP 0] Cleaning up old installation...
+[INFO] Stopping old daemon if running...
+[INFO] Killing remaining processes: 1528682
+1528685
+Terminated
+

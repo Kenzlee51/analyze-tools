@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # INSTALLER FOR DIRECTORY WATCHER DAEMON
-# Version: 1.1
+# Version: 1.2
 # ============================================================
 #
 # DESCRIPTION:
@@ -12,11 +12,10 @@
 #   If run again, it will stop the old daemon and reinstall.
 #
 # INSTALLATION:
-#   1. Make this script executable:
-#      chmod +x install_watcher.sh
+#   This script is meant to be run from its current location:
+#     ./lib/daemons/watcher_daemon_dir/install_watcher.sh
 #
-#   2. Run the installer:
-#      ./install_watcher.sh
+#   Or from anywhere, it will detect the project root automatically.
 #
 # USAGE AFTER INSTALLATION:
 #   Start daemon:
@@ -51,7 +50,11 @@
 #
 # ============================================================
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# --- FIX: Properly detect project root from anywhere ---
+# This script is located at lib/daemons/watcher_daemon_dir/install_watcher.sh
+# We need to go up 3 levels to reach the project root.
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+
 DAEMON_DIR="$PROJECT_ROOT/lib/daemons"
 DAEMON_SCRIPT="$DAEMON_DIR/watcher_daemon_dir.sh"
 DAEMON_CONFIG="$DAEMON_DIR/watcher_daemon_dir.conf"
