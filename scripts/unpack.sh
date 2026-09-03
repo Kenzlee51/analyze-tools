@@ -15,7 +15,7 @@
 # ОПЦИИ:
 #   -p, --single-project NAME   Обработать только один указанный проект
 #   -a, --all                   Распаковывать все архивы включая исключения
-#                               (по умолчанию .jar и .deb не распаковываются)
+#                               (по умолчанию .jar не распаковывается)
 #   -j, --parallel N            Количество параллельных проектов (default: 1)
 #                               Рекомендации: HDD → 1, SSD → 2-4, NVMe → 4-8
 #   -b, --batch-size N          Файлов в один вызов file(1) (default: 500)
@@ -23,8 +23,19 @@
 #                               Пример: -s node_modules -s /m2_repo
 #   -f, --full-file-check       Проверять все файлы через file(1) независимо
 #                               от расширения (медленно но надёжно)
-#   -c, --check-deps            Только проверить наличие зависимостей и выйти
+#   -c, --clean                 Распаковывать без суффикса _dir, удалять архивы
+#   --filter LANG[,LANG...]     Оставить только исходные тексты указанных языков
+#                               Пример: --filter python,java
+#                               Список доступных языков см. ниже
+#   --filter-bin LANG[,LANG...] Оставить только бинарные файлы указанных языков
+#                               Пример: --filter-bin cpp,go
+#                               Список доступных языков см. ниже
 #   -h, --help                  Показать эту справку
+#
+# ЗАВИСИМОСТИ ПРОВЕРЯЮТСЯ АВТОМАТИЧЕСКИ:
+#   При каждом запуске скрипт сам проверяет наличие всех необходимых утилит
+#   и сообщает, каких не хватает (для обязательных — с остановкой запуска,
+#   для опциональных — только предупреждением).
 #
 # ПРИМЕРЫ:
 #   ./unpack.sh
@@ -34,6 +45,9 @@
 #   ./unpack.sh -a
 #   ./unpack.sh -s node_modules
 #   ./unpack.sh -f -j 2
+#   ./unpack.sh --clean --filter python
+#   ./unpack.sh --filter cpp --filter-bin cpp
+#   ./unpack.sh --filter js,java --filter-bin cpp,go
 #
 # ОЖИДАЕМАЯ СТРУКТУРА:
 #   BASE_DIR/
@@ -47,8 +61,10 @@
 #   │   └── PROJ2/
 #   └── logs/
 #       └── unpack/
-#           ├── errors_unpack.txt
-#           └── skipped_archives.txt
+#           ├── PROJ1/
+#           │   └── PROJ1.log
+#           └── PROJ2/
+#               └── PROJ2.log
 #
 # ЗАВИСИМОСТИ:
 #   Обязательные : bash 4+, file, find, stat, sort, grep, awk, date, bc
@@ -65,10 +81,12 @@ set -euo pipefail
 # =============================================================================
 UNPACK_ALL=false
 MAX_PARALLEL=1
+UNPACK_CLEAN=false
+FILTER_LANGS=""
+FILTER_BIN_LANGS=""
 
 # Расширения которые НЕ распаковываются по умолчанию.
 # При --all эти ограничения снимаются.
-#SKIP_EXTENSIONS=(jar deb)
 SKIP_EXTENSIONS=(jar)
 FILE_BATCH_SIZE=500
 SKIP_PATH_PATTERN=""
@@ -79,6 +97,108 @@ AMBIGUOUS_EXTENSIONS=(
     bin dat img image raw dump pak
     data bak old orig tmp temp
 )
+
+# =============================================================================
+# ТАБЛИЦЫ РАСШИРЕНИЙ ДЛЯ ФИЛЬТРОВ
+# =============================================================================
+
+# Исходные тексты (source code)
+declare -A SOURCE_EXTS=(
+    ["python"]=".py .pyx .pxd .pyi"
+    ["java"]=".java .groovy .kt .scala"
+    ["cpp"]=".c .h .cpp .cc .cxx .hpp .hh .hxx .c++ .h++"
+    ["csharp"]=".cs .csx"
+    ["go"]=".go"
+    ["rust"]=".rs"
+    ["javascript"]=".js .mjs .cjs .jsx"
+    ["typescript"]=".ts .tsx"
+    ["php"]=".php .php3 .php4 .php5 .php7 .phtml"
+    ["ruby"]=".rb .rake .gemspec .ru"
+    ["swift"]=".swift"
+    ["kotlin"]=".kt .kts"
+    ["scala"]=".scala .sc"
+    ["perl"]=".pl .pm .t .pod"
+    ["lua"]=".lua"
+    ["r"]=".r .rdata .rds"
+    ["matlab"]=".m .mat"
+    ["sql"]=".sql .ddl .dml"
+    ["html"]=".html .htm .xhtml .xml .svg"
+    ["css"]=".css .scss .sass .less .styl"
+    ["shell"]=".sh .bash .zsh .fish .csh .ksh"
+    ["make"]="Makefile .mk"
+    ["cmake"]="CMakeLists.txt .cmake"
+    ["docker"]="Dockerfile .dockerignore"
+    ["yaml"]=".yaml .yml"
+    ["json"]=".json .jsonl"
+    ["toml"]=".toml"
+    ["ini"]=".ini .cfg .conf"
+    ["markdown"]=".md .markdown .mdown"
+    ["tex"]=".tex .cls .sty .bib .bst"
+    ["fortran"]=".f .for .f90 .f95 .f03 .f08"
+    ["vb"]=".vb .bas .cls"
+    ["powershell"]=".ps1 .psm1 .psd1"
+    ["julia"]=".jl"
+    ["erlang"]=".erl .hrl .escript"
+    ["elixir"]=".ex .exs"
+    ["clojure"]=".clj .cljs .cljc .edn"
+    ["haskell"]=".hs .lhs .cabal"
+    ["dart"]=".dart"
+    ["nim"]=".nim .nimble"
+    ["crystal"]=".cr"
+    ["zig"]=".zig"
+    ["v"]=".v"
+    ["ada"]=".adb .ads"
+    ["pascal"]=".pas .pp .inc"
+    ["delphi"]=".pas .dpr .dpk"
+    ["objectivec"]=".m .mm .h"
+    ["vue"]=".vue"
+    ["svelte"]=".svelte"
+    ["webassembly"]=".wat .wast"
+    ["protobuf"]=".proto"
+    ["thrift"]=".thrift"
+    ["graphql"]=".graphql .gql"
+    ["terraform"]=".tf .tfvars"
+    ["vim"]=".vim .vimrc"
+    ["emacs"]=".el .emacs"
+)
+
+# Бинарные/скомпилированные файлы
+declare -A BINARY_EXTS=(
+    ["cpp"]=".o .obj .a .so .dylib .dll .exe"
+    ["c"]=".o .obj .a .so .dylib .dll .exe"
+    ["rust"]=".rlib .rmeta .a .so .dylib .dll .exe"
+    ["go"]=".a .so .dylib .dll .exe"
+    ["java"]=".class .jar .war .ear .jmod"
+    ["kotlin"]=".class .jar .klib"
+    ["scala"]=".class .jar .war"
+    ["csharp"]=".dll .exe .pdb"
+    ["python"]=".pyc .pyo .pyd .so"
+    ["haskell"]=".o .hi .a .so .dylib .dll"
+    ["fortran"]=".o .mod .a .so .dylib .dll .exe"
+    ["swift"]=".swiftmodule .o .a .so .dylib .dll .exe"
+    ["zig"]=".o .obj .a .so .dylib .dll .exe"
+    ["nim"]=".o .a .so .dylib .dll .exe"
+    ["d"]=".o .obj .a .so .dll .exe"
+    ["v"]=".o .a .so .dylib .dll .exe"
+    ["crystal"]=".o .a .so .dylib .dll .exe"
+    ["ada"]=".o .ali .a .so .dylib .dll .exe"
+    ["pascal"]=".o .ppu .a .so .dylib .dll .exe"
+    ["delphi"]=".dcu .dcp .bpl .dll .exe"
+    ["ocaml"]=".cmo .cmx .cma .cmxa .o .a .so"
+    ["erlang"]=".beam .app"
+    ["elixir"]=".beam .app"
+    ["clojure"]=".class .jar"
+    ["julia"]=".ji .so .dylib .dll"
+    ["lua"]=".so .dylib .dll"
+    ["perl"]=".so .dylib .dll"
+    ["ruby"]=".so .bundle .dylib .dll"
+    ["php"]=".so .dylib .dll"
+    ["r"]=".so .dylib .dll .rdx"
+    ["matlab"]=".mex .mexw64 .mexmac"
+    ["dart"]=".aot .snapshot .so .dylib .dll .exe"
+    ["webassembly"]=".wasm"
+)
+
 # =============================================================================
 
 # =============================================================================
@@ -141,7 +261,6 @@ check_dependencies() {
         echo ""
         echo "[DEPS] [ERROR] Missing REQUIRED tools: ${missing_required[*]}"
         echo "[DEPS] Install with:"
-        # Убираем дубликаты пакетов
         local unique_pkgs
         unique_pkgs=$(printf '%s\n' "${missing_pkgs_required[@]}" | sort -u | tr '\n' ' ')
         echo ""
@@ -223,7 +342,7 @@ format_duration() {
 now_ns() { date +%s%N; }
 
 # =============================================================================
-# Разбор аргументов
+# РАЗБОР АРГУМЕНТОВ
 # =============================================================================
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -281,12 +400,61 @@ while [[ $# -gt 0 ]]; do
             echo "[INFO] Full file check enabled"
             shift
             ;;
-        -c|--check-deps)
-            check_dependencies
-            exit $?
+        -c|--clean)
+            UNPACK_CLEAN=true
+            echo "[INFO] Clean mode enabled (no _dir suffix, remove archives)"
+            shift
+            ;;
+        --filter)
+            if [[ -n "${2:-}" ]]; then
+                FILTER_LANGS="$2"
+                echo "[INFO] Filter source languages: $FILTER_LANGS"
+                shift 2
+            else
+                echo "[ERROR] --filter requires language list argument"
+                exit 1
+            fi
+            ;;
+        --filter-bin)
+            if [[ -n "${2:-}" ]]; then
+                FILTER_BIN_LANGS="$2"
+                echo "[INFO] Filter binary languages: $FILTER_BIN_LANGS"
+                shift 2
+            else
+                echo "[ERROR] --filter-bin requires language list argument"
+                exit 1
+            fi
             ;;
         -h|--help)
-            grep "^#" "$0" | head -75 | sed 's/^# \{0,1\}//'
+            # Показываем основную справку из комментариев (первые 85 строк)
+            grep "^#" "$0" | grep -v "^#!" | sed 's/^# \{0,1\}//' | head -85
+            echo ""
+            echo "AVAILABLE LANGUAGES FOR --filter (source files):"
+            langs=($(printf '%s\n' "${!SOURCE_EXTS[@]}" | sort))
+            printf '%s' "  "
+            for i in "${!langs[@]}"; do
+                if [[ $i -eq $((${#langs[@]} - 1)) ]]; then
+                    printf '%s' "${langs[$i]}"
+                else
+                    printf '%s, ' "${langs[$i]}"
+                fi
+            done
+            echo ""
+            echo ""
+            echo "AVAILABLE LANGUAGES FOR --filter-bin (binary files):"
+            langs=($(printf '%s\n' "${!BINARY_EXTS[@]}" | sort))
+            printf '%s' "  "
+            for i in "${!langs[@]}"; do
+                if [[ $i -eq $((${#langs[@]} - 1)) ]]; then
+                    printf '%s' "${langs[$i]}"
+                else
+                    printf '%s, ' "${langs[$i]}"
+                fi
+            done
+            echo ""
+            echo ""
+            echo "NOTE: Languages with the same extensions (e.g., c/cpp for binaries)"
+            echo "      may have overlapping definitions."
             exit 0
             ;;
         *)
@@ -312,8 +480,6 @@ BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECTS_DIR="$BASE_DIR/src"
 UNPACKED_DIR="$BASE_DIR/unpacked"
 LOG_DIR="$BASE_DIR/logs/unpack"
-# Ошибки теперь пишутся per-project: $LOG_DIR/<project_name>/error.log
-SKIPPED_LOG="$LOG_DIR/skipped_archives.txt"
 NORMALIZE_PY="$BASE_DIR/lib/normalize.py"
 
 if [[ ! -d "$PROJECTS_DIR" ]]; then
@@ -323,42 +489,205 @@ fi
 
 mkdir -p "$UNPACKED_DIR"
 mkdir -p "$LOG_DIR"
-> "$SKIPPED_LOG"
 
-# Возвращает путь к error.log конкретного проекта и гарантирует
-# существование директории. Файл на этот запуск обнуляется.
-init_project_error_log() {
+# Возвращает путь к логу конкретного проекта и гарантирует существование директории
+init_project_log() {
     local project_name="$1"
-    local log_path="$LOG_DIR/$project_name/error.log"
+    local log_path="$LOG_DIR/$project_name/$project_name.log"
     mkdir -p "$(dirname "$log_path")"
     > "$log_path"
     echo "$log_path"
 }
 
-log_header() {
-    local project="$1"
-    local log_path="$2"
-    printf "==============================\n%s\n==============================\n\n" "$project" >> "$log_path"
-    echo "=== Processing project: $project ==="
-}
-
-# Пишет блок ошибки в error.log проекта. Принимает текст либо аргументом,
-# либо через stdin (для многострочного вывода команд).
-# Использование: log_error "$error_log" "однострочное сообщение"
-#            или: cmd_output | log_error "$error_log"
-log_error() {
+log_to_file() {
     local log_path="$1"
     local msg="${2:-}"
     if [[ -z "$msg" && ! -t 0 ]]; then
         msg="$(cat)"
     fi
     printf '%s\n' "$msg" >> "$log_path"
-    echo "[ERROR] $(printf '%s\n' "$msg" | head -1)"
+    # ВАЖНО: пишем дублирующий вывод в stderr, а не в stdout.
+    # extract_archive() возвращает результат (путь к директории) именно
+    # через stdout и захватывается через $(...) — если сюда попадёт
+    # что-то кроме самого пути, вызывающий код перестанет узнавать
+    # успешные распаковки (new_dir перестаёт быть валидной директорией).
+    echo "$msg" >&2
 }
 
-log_skipped() {
-    { flock 200; echo "$1"; } 200>"$SKIPPED_LOG.lock" >> "$SKIPPED_LOG"
+log_header() {
+    local project="$1"
+    local log_path="$2"
+    {
+        printf "==============================\n"
+        printf "%s\n" "$project"
+        printf "==============================\n\n"
+    } >> "$log_path"
+    echo "=== Processing project: $project ==="
 }
+
+log_summary() {
+    local project="$1"
+    local log_path="$2"
+    local processed="$3"
+    local extracted="$4"
+    local removed="$5"
+    local kept="$6"
+    local duration="$7"
+    {
+        echo ""
+        echo "=== SUMMARY ==="
+        echo "Processed files: $processed"
+        echo "Extracted archives: $extracted"
+        if [[ -n "$FILTER_LANGS" || -n "$FILTER_BIN_LANGS" ]]; then
+            echo "Filtered removed: $removed"
+            echo "Filtered kept: $kept"
+        fi
+        echo "Total time: $(format_duration $duration)"
+        echo "=============================="
+    } >> "$log_path"
+}
+
+# =============================================================================
+# ФУНКЦИИ ФИЛЬТРАЦИИ
+# =============================================================================
+
+# Получить расширения для языков из указанной таблицы
+# Использование: get_extensions_for_langs "python,java" SOURCE_EXTS
+get_extensions_for_langs() {
+    local langs="$1"
+    local -n ext_table="$2"
+    local result=()
+    
+    IFS=',' read -ra lang_array <<< "$langs"
+    for lang in "${lang_array[@]}"; do
+        lang="${lang,,}"  # to lowercase
+        if [[ -n "${ext_table[$lang]:-}" ]]; then
+            # Разбиваем строку расширений и добавляем в массив
+            local exts="${ext_table[$lang]}"
+            for ext in $exts; do
+                result+=("$ext")
+            done
+        else
+            echo "[WARN] Unknown language: $lang" >&2
+        fi
+    done
+    
+    # Выводим уникальные расширения через пробел
+    printf '%s\n' "${result[@]}" | sort -u | tr '\n' ' '
+}
+
+# Применяет фильтры к распакованной директории
+apply_filters() {
+    local unpack_dir="$1"
+    local log_path="$2"
+    local project_name="$3"
+    
+    # Если фильтры не указаны - ничего не делаем
+    if [[ -z "$FILTER_LANGS" && -z "$FILTER_BIN_LANGS" ]]; then
+        return 0
+    fi
+    
+    local keep_exts=()
+    local ext_str=""
+    
+    # Собираем расширения из фильтров
+    if [[ -n "$FILTER_LANGS" ]]; then
+        ext_str=$(get_extensions_for_langs "$FILTER_LANGS" SOURCE_EXTS)
+        keep_exts+=($ext_str)
+        log_to_file "$log_path" "[FILTER] Source extensions kept: $ext_str"
+    fi
+    
+    if [[ -n "$FILTER_BIN_LANGS" ]]; then
+        ext_str=$(get_extensions_for_langs "$FILTER_BIN_LANGS" BINARY_EXTS)
+        keep_exts+=($ext_str)
+        log_to_file "$log_path" "[FILTER] Binary extensions kept: $ext_str"
+    fi
+    
+    # Удаляем дубликаты
+    keep_exts=($(printf '%s\n' "${keep_exts[@]}" | sort -u))
+    
+    if [[ ${#keep_exts[@]} -eq 0 ]]; then
+        log_to_file "$log_path" "[FILTER] WARNING: No valid extensions found, skipping filter"
+        return 0
+    fi
+    
+    log_to_file "$log_path" "[FILTER] Keeping extensions: ${keep_exts[*]}"
+
+    # .nimcache — целиком директория с бинарниками Nim. Если nim указан
+    # среди --filter-bin языков, сохраняем всё её содержимое целиком,
+    # независимо от расширений отдельных файлов внутри.
+    local keep_nimcache=false
+    if [[ -n "$FILTER_BIN_LANGS" ]]; then
+        local -a bin_lang_array=()
+        IFS=',' read -ra bin_lang_array <<< "$FILTER_BIN_LANGS"
+        local blang
+        for blang in "${bin_lang_array[@]}"; do
+            if [[ "${blang,,}" == "nim" ]]; then
+                keep_nimcache=true
+                break
+            fi
+        done
+    fi
+
+    local total_files=0
+    local kept_files=0
+    local removed_files=0
+
+    # ВАЖНО: обходим только ФАЙЛЫ (-type f), а не директории.
+    # У директории нет расширения, поэтому раньше она всегда попадала в
+    # "не подходит под фильтр" и удалялась через `rm -rf` — это уничтожало
+    # всё её содержимое, включая файлы, которые должны были быть сохранены,
+    # ещё до того как они успевали пройти индивидуальную проверку.
+    # Теперь удаляем только конкретные файлы, а опустевшие директории
+    # подчищаем отдельным шагом после основного прохода.
+    while IFS= read -r -d '' file; do
+        (( total_files++ )) || true
+
+        if [[ "$keep_nimcache" == true && "$file" == */.nimcache/* ]]; then
+            (( kept_files++ )) || true
+            continue
+        fi
+
+        local keep=false
+        local filename
+        filename=$(basename "$file")
+
+        # Проверяем по расширению
+        for ext in "${keep_exts[@]}"; do
+            # Для специальных файлов (Makefile, Dockerfile) проверяем точное совпадение
+            if [[ "$ext" == "Makefile" || "$ext" == "CMakeLists.txt" || "$ext" == "Dockerfile" ]]; then
+                if [[ "$filename" == "$ext" ]]; then
+                    keep=true
+                    break
+                fi
+            else
+                # Обычное расширение
+                if [[ "$filename" == *"$ext" ]]; then
+                    keep=true
+                    break
+                fi
+            fi
+        done
+
+        if [[ "$keep" == true ]]; then
+            (( kept_files++ )) || true
+        else
+            rm -f "$file"
+            (( removed_files++ )) || true
+        fi
+    done < <(find "$unpack_dir" -mindepth 1 -type f -print0 2>/dev/null || true)
+
+    # Удаляем директории, опустевшие после фильтрации (снизу вверх,
+    # -depth гарантирует что дети обрабатываются раньше родителей)
+    find "$unpack_dir" -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
+
+    log_to_file "$log_path" "[FILTER] Total: $total_files files, Kept: $kept_files, Removed: $removed_files"
+    echo "[FILTER] [$project_name] Kept: $kept_files, Removed: $removed_files"
+}
+
+# =============================================================================
+# ФУНКЦИИ РАСПАКОВКИ
+# =============================================================================
 
 # Возвращает 0 если расширение файла в списке SKIP_EXTENSIONS и --all не задан
 is_skipped_ext() {
@@ -366,7 +695,6 @@ is_skipped_ext() {
     local base lower ext
     base=$(basename "$1")
     lower="${base,,}"
-    # Убираем составные расширения типа .tar.gz — нас интересует только последнее
     ext="${lower##*.}"
     local skip_ext
     for skip_ext in "${SKIP_EXTENSIONS[@]}"; do
@@ -444,14 +772,8 @@ run_batch_file() {
     done < <(file "${files[@]}" 2>/dev/null || true)
 }
 
-
 # --- Таблица методов распаковки -------------------------------------------
-# Каждый "метод" — это одна конкретная команда. Составные случаи (gzip и
-# т.п. могут быть как plain-файлом, так и tar-потоком внутри) реализованы
-# как ДВА метода: сначала пробуем как tar, потом как обычное сжатие.
 
-# Возвращает (в stdout, через пробел) список методов-кандидатов на основе
-# расширения файла, в порядке приоритета.
 _candidate_methods_for_ext() {
     local lower="$1"
     case "$lower" in
@@ -483,7 +805,6 @@ _candidate_methods_for_ext() {
     esac
 }
 
-# То же самое, но на основе реального типа файла (вывод `file -b`).
 _candidate_methods_for_magic() {
     local ftype="$1"
     case "$ftype" in
@@ -508,9 +829,47 @@ _candidate_methods_for_magic() {
     esac
 }
 
-# Выполняет один конкретный метод распаковки. НЕ подавляет stderr —
-# вызывающий код сам решает, что делать с выводом (обычно захватывает его
-# через `$(... 2>&1)`).
+# Составные ("двойные") расширения архивов — их нужно срезать целиком,
+# а не только последний "._ext", иначе получится "name.tar" вместо "name".
+_COMPOUND_ARCHIVE_EXTS=(
+    ".tar.gz" ".tar.bz2" ".tar.xz" ".tar.zst" ".tar.z" ".tar.lz4" ".tar.lzma"
+)
+
+# Возвращает (в stdout) путь без архивного расширения — с учётом составных
+# расширений вида .tar.gz. Обычные одиночные расширения (.zip, .7z, ...)
+# срезаются штатным ${file%.*}.
+_strip_archive_ext() {
+    local file="$1"
+    local lower="${file,,}"
+    local ce
+    for ce in "${_COMPOUND_ARCHIVE_EXTS[@]}"; do
+        if [[ "$lower" == *"$ce" ]]; then
+            echo "${file:0:$(( ${#file} - ${#ce} ))}"
+            return 0
+        fi
+    done
+    echo "${file%.*}"
+}
+
+# Находит свободное имя директории, добавляя суффикс _2, _3, ... если
+# директория с таким именем уже существует и не пуста (коллизия имён
+# в режиме --clean, например foo.zip и foo.tar.gz распаковались бы в
+# одну и ту же папку "foo").
+_resolve_clean_dir_collision() {
+    local base_dir="$1"
+    local log_path="$2"
+    local dir="$base_dir"
+    local n=2
+    while [[ -e "$dir" && -n "$(ls -A "$dir" 2>/dev/null)" ]]; do
+        dir="${base_dir}_${n}"
+        (( n++ )) || true
+    done
+    if [[ "$dir" != "$base_dir" ]]; then
+        log_to_file "$log_path" "[CLEAN] Directory name collision for '$base_dir', using '$dir' instead"
+    fi
+    echo "$dir"
+}
+
 _run_extract_method() {
     local method="$1" file="$2" dir="$3" base="$4"
     case "$method" in
@@ -522,11 +881,16 @@ _run_extract_method() {
         tar_lz4)     lz4 -d "$file" -c | tar -x -C "$dir" ;;
         tar_lzma)    tar -x --lzma -f "$file" -C "$dir" ;;
         tar_plain)   tar -xf "$file" -C "$dir" ;;
-        gzip_plain)  gunzip -c "$file" > "$dir/${base%.gz}" ;;
-        bzip2_plain) bunzip2 -c "$file" > "$dir/${base%.bz2}" ;;
-        xz_plain)    unxz -c "$file" > "$dir/${base%.xz}" ;;
-        zstd_plain)  unzstd -q -o "$dir/${base%.zst}" "$file" ;;
-        compress)    uncompress -c "$file" > "$dir/${base%.Z}" ;;
+        # Срез суффикса регистронезависимый (символьные классы [gG][zZ] и
+        # т.п.) — кандидат-метод выбирается case-insensitive (по "lower"),
+        # а $base приходит в исходном регистре файла. Например, для файла
+        # "archive.z" (маленькая z) срез только по ".Z" не сработал бы,
+        # и результат назывался бы "archive.z" вместо "archive".
+        gzip_plain)  gunzip -c "$file" > "$dir/${base%.[gG][zZ]}" ;;
+        bzip2_plain) bunzip2 -c "$file" > "$dir/${base%.[bB][zZ]2}" ;;
+        xz_plain)    unxz -c "$file" > "$dir/${base%.[xX][zZ]}" ;;
+        zstd_plain)  unzstd -q -o "$dir/${base%.[zZ][sS][tT]}" "$file" ;;
+        compress)    uncompress -c "$file" > "$dir/${base%.[zZ]}" ;;
         zip)         unzip -q "$file" -d "$dir" ;;
         rar)         unrar x -o+ "$file" "$dir/" ;;
         7z)          7z x -y "$file" -o"$dir" ;;
@@ -544,10 +908,25 @@ _run_extract_method() {
 
 extract_archive() {
     local file="$1"
-    local error_log="$2"
-    local dir="${file}_dir"
-    mkdir -p "$dir"
-    echo "Extracting: $file" >&2
+    local log_path="$2"
+    local project_name="$3"
+    local dir
+    
+    # Определяем директорию для распаковки
+    if [[ "$UNPACK_CLEAN" == true ]]; then
+        # Распаковываем прямо в папку с архивом (удаляем расширение архива,
+        # включая составные вида .tar.gz/.tar.bz2/.tar.xz/.tar.zst/.tar.z/
+        # .tar.lz4/.tar.lzma)
+        local clean_base_dir
+        clean_base_dir="$(_strip_archive_ext "$file")"
+        dir="$(_resolve_clean_dir_collision "$clean_base_dir" "$log_path")"
+        mkdir -p "$dir"
+    else
+        dir="${file}_dir"
+        mkdir -p "$dir"
+    fi
+    
+    log_to_file "$log_path" "[EXTRACT] Extracting: $file -> $dir"
 
     local base lower
     base=$(basename "$file")
@@ -574,9 +953,7 @@ extract_archive() {
         combined_err+=$'\n'"--- method '$m' (by extension) failed, rc=$rc ---"$'\n'"$out"
     done
 
-    # --- Попытка №2: расширение не помогло (или файла с такой ext-логикой
-    # нет вовсе) — определяем реальный формат по magic-байтам и пробуем
-    # подходящий инструмент, даже если расширение указывало на другое ---
+    # --- Попытка №2: magic ---
     if [[ $ok -eq 0 ]]; then
         ftype="${FILE_TYPE_CACHE[$file]:-}"
         if [[ -z "$ftype" ]]; then
@@ -588,7 +965,6 @@ extract_archive() {
 
         for m in "${magic_candidates[@]}"; do
             [[ -z "$m" ]] && continue
-            # не повторяем метод, который уже пробовали на шаге 1
             local already=0 tm
             for tm in "${tried[@]}"; do
                 [[ "$tm" == "$m" ]] && already=1 && break
@@ -610,17 +986,24 @@ extract_archive() {
     fi
 
     if [[ $ok -eq 1 ]]; then
-        echo "Done: $file" >&2
+        log_to_file "$log_path" "[EXTRACT] Done: $file"
+
+        # Если clean mode - удаляем архив после успешной распаковки
+        if [[ "$UNPACK_CLEAN" == true ]]; then
+            rm -f "$file"
+            log_to_file "$log_path" "[CLEAN] Removed archive: $file"
+        fi
+        
         echo "$dir"
     else
         {
             echo "Failed to extract: $file"
             echo "  extension-guessed methods tried: ${tried[*]:-<none>}"
-            echo "  detected type (file -b): ${ftype:-<not checked, extension attempt succeeded... n/a>}"
+            echo "  detected type (file -b): ${ftype:-<not checked>}"
             echo "  --- combined output ---"
             printf '%s\n' "$combined_err"
             echo ""
-        } | log_error "$error_log"
+        } | log_to_file "$log_path"
         rm -rf "$dir"
         echo ""
     fi
@@ -649,6 +1032,10 @@ ask_repack() {
     [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
 }
 
+# =============================================================================
+# ОСНОВНАЯ ФУНКЦИЯ ОБРАБОТКИ ПРОЕКТА
+# =============================================================================
+
 process_project() {
     local project="$1"
     local project_name
@@ -656,15 +1043,14 @@ process_project() {
     local proj_start_ts
     proj_start_ts=$(now_ns)
 
-    local error_log
-    error_log=$(init_project_error_log "$project_name")
+    local log_path
+    log_path=$(init_project_log "$project_name")
 
-    log_header "$project_name" "$error_log"
+    log_header "$project_name" "$log_path"
 
     local unpack_dir="$UNPACKED_DIR/${project_name}"
 
     # Проверяем src/ и bin/ подпапки в unpacked/PROJ/
-    # Для каждой: если уже содержит что-то — спрашиваем перераспаковывать ли
     local do_src=true
     local do_bin=true
 
@@ -677,63 +1063,58 @@ process_project() {
 
     if (( src_count > 0 )); then
         if ask_repack "unpacked/$project_name/src" "$src_count"; then
-            echo "[INFO] [$project_name] Перераспаковываем src/"
+            log_to_file "$log_path" "[INFO] Перераспаковываем src/"
             rm -rf "$src_unpacked"
         else
-            echo "[INFO] [$project_name] Пропускаем src/ (уже распакован)"
+            log_to_file "$log_path" "[INFO] Пропускаем src/ (уже распакован)"
             do_src=false
         fi
     fi
 
     if (( bin_count > 0 )); then
         if ask_repack "unpacked/$project_name/bin" "$bin_count"; then
-            echo "[INFO] [$project_name] Перераспаковываем bin/"
+            log_to_file "$log_path" "[INFO] Перераспаковываем bin/"
             rm -rf "$bin_unpacked"
         else
-            echo "[INFO] [$project_name] Пропускаем bin/ (уже распакован)"
+            log_to_file "$log_path" "[INFO] Пропускаем bin/ (уже распакован)"
             do_bin=false
         fi
     fi
 
-    # Если оба пропускаем — ничего не делаем
     if [[ "$do_src" == false && "$do_bin" == false ]]; then
-        echo "[INFO] [$project_name] Ничего не распаковывается — оба каталога уже есть."
+        log_to_file "$log_path" "[INFO] Ничего не распаковывается — оба каталога уже есть."
         return 0
     fi
 
     local t0
     t0=$(now_ns)
 
-    # Копируем только нужные подкаталоги
     mkdir -p "$unpack_dir"
     if [[ "$do_src" == true && -d "$project/src" ]]; then
-        echo "Copying $project/src -> $src_unpacked"
+        log_to_file "$log_path" "[INFO] Copying $project/src -> $src_unpacked"
         cp -a "$project/src" "$src_unpacked"
     fi
     if [[ "$do_bin" == true && -d "$project/bin" ]]; then
-        echo "Copying $project/bin -> $bin_unpacked"
+        log_to_file "$log_path" "[INFO] Copying $project/bin -> $bin_unpacked"
         cp -a "$project/bin" "$bin_unpacked"
     fi
-    # Если нет разделения src/bin — копируем всё как раньше
     if [[ ! -d "$project/src" && ! -d "$project/bin" ]]; then
-        echo "Copying $project -> $unpack_dir (no src/bin split)"
+        log_to_file "$log_path" "[INFO] Copying $project -> $unpack_dir (no src/bin split)"
         rm -rf "$unpack_dir"
         cp -a "$project" "$unpack_dir"
     fi
 
-    echo "[TIME] [$project_name] cp -a: $(format_duration $(( $(now_ns) - t0 )))"
+    log_to_file "$log_path" "[TIME] cp -a: $(format_duration $(( $(now_ns) - t0 )))"
 
     # Нормализация имён файлов и папок ДО распаковки
-    # Только восстановление сломанной кодировки — без транслитерации
     if [[ -f "$NORMALIZE_PY" ]]; then
         t0=$(now_ns)
-        echo "[INFO] [$project_name] Normalizing filenames..."
-        python3 "$NORMALIZE_PY" --content-dir "$unpack_dir"
-        echo "[TIME] [$project_name] normalize: $(format_duration $(( $(now_ns) - t0 )))"
+        log_to_file "$log_path" "[INFO] Normalizing filenames..."
+        python3 "$NORMALIZE_PY" --content-dir "$unpack_dir" 2>&1 | log_to_file "$log_path"
+        log_to_file "$log_path" "[TIME] normalize: $(format_duration $(( $(now_ns) - t0 )))"
     else
-        echo ""
-        echo "[WARN] [$project_name] normalize.py не найден: $NORMALIZE_PY"
-        echo "[WARN] Без нормализации файлы с некорректными именами могут не распаковаться."
+        log_to_file "$log_path" "[WARN] normalize.py не найден: $NORMALIZE_PY"
+        log_to_file "$log_path" "[WARN] Без нормализации файлы с некорректными именами могут не распаковаться."
         local answer_norm
         if [[ -t 0 ]]; then
             read -r -p "[?] Продолжить без нормализации? [y/N]: " answer_norm
@@ -741,17 +1122,17 @@ process_project() {
             answer_norm="n"
         fi
         if [[ "${answer_norm,,}" != "y" && "${answer_norm,,}" != "yes" ]]; then
-            echo "[INFO] [$project_name] Отменено пользователем."
+            log_to_file "$log_path" "[INFO] Отменено пользователем."
             return 1
         fi
-        echo "[INFO] [$project_name] Продолжаем без нормализации."
+        log_to_file "$log_path" "[INFO] Продолжаем без нормализации."
     fi
 
     t0=$(now_ns)
     local -a queue=()
     if [[ -n "$SKIP_PATH_PATTERN" ]]; then
         while IFS= read -r -d '' skipped_file; do
-            { flock 200; echo "$skipped_file"; } 200>"$SKIPPED_LOG.lock" >> "$SKIPPED_LOG"
+            log_to_file "$log_path" "[SKIP-PATH] $skipped_file"
         done < <(
             find "$unpack_dir" -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0 \
                 | grep -zZE "$SKIP_PATH_PATTERN" 2>/dev/null || true
@@ -768,14 +1149,14 @@ process_project() {
         fi
     )
     local total_files=${#queue[@]}
-    echo "[TIME] [$project_name] initial find ($total_files files): $(format_duration $(( $(now_ns) - t0 )))"
+    log_to_file "$log_path" "[TIME] initial find ($total_files files): $(format_duration $(( $(now_ns) - t0 )))"
 
     local total_extracted=0
     local processed=0
     local file_calls=0
     FILE_TYPE_CACHE=()
 
-    echo "[INFO] [$project_name] Initial queue: $total_files files"
+    log_to_file "$log_path" "[INFO] Initial queue: $total_files files"
 
     t0=$(now_ns)
     local head=0
@@ -805,7 +1186,7 @@ process_project() {
 
         if (( batch_num % PROGRESS_EVERY == 0 )); then
             local remaining=$(( ${#queue[@]} - head ))
-            echo "[PROGRESS] [$project_name] $(date +%H:%M:%S) | batch: $batch_num | extracted: $total_extracted | queue remaining: $remaining"
+            log_to_file "$log_path" "[PROGRESS] $(date +%H:%M:%S) | batch: $batch_num | extracted: $total_extracted | queue remaining: $remaining"
         fi
 
         if [[ ${#unknown_ext_batch[@]} -gt 0 ]]; then
@@ -833,15 +1214,14 @@ process_project() {
                 local fsize
                 fsize=$(stat -c%s "$phys_file" 2>/dev/null || echo 0)
                 if (( fsize < 22 )); then
-                    echo "[SKIP] [$project_name] too small (${fsize}b): $(basename "$phys_file")"
-                    { flock 200; echo "$phys_file  [too small: ${fsize}b]"; } 200>"$SKIPPED_LOG.lock" >> "$SKIPPED_LOG"
+                    log_to_file "$log_path" "[SKIP] too small (${fsize}b): $(basename "$phys_file")"
                     continue
                 fi
                 local t_extract
                 t_extract=$(now_ns)
                 local new_dir
-                new_dir=$(extract_archive "$phys_file" "$error_log")
-                echo "[TIME] [$project_name] extract $(basename "$phys_file"): $(format_duration $(( $(now_ns) - t_extract )))"
+                new_dir=$(extract_archive "$phys_file" "$log_path" "$project_name")
+                log_to_file "$log_path" "[TIME] extract $(basename "$phys_file"): $(format_duration $(( $(now_ns) - t_extract )))"
 
                 if [[ -n "$new_dir" && -d "$new_dir" ]]; then
                     (( total_extracted++ )) || true
@@ -856,7 +1236,7 @@ process_project() {
             queue_before=${#queue[@]}
             if [[ -n "$SKIP_PATH_PATTERN" ]]; then
                 while IFS= read -r -d '' skipped_file; do
-                    { flock 200; echo "$skipped_file"; } 200>"$SKIPPED_LOG.lock" >> "$SKIPPED_LOG"
+                    log_to_file "$log_path" "[SKIP-PATH] $skipped_file"
                 done < <(
                     find "${new_dirs_batch[@]}" -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0 2>/dev/null \
                         | grep -zZE "$SKIP_PATH_PATTERN" || true
@@ -874,22 +1254,43 @@ process_project() {
             )
             local added=$(( ${#queue[@]} - queue_before ))
             local remaining=$(( ${#queue[@]} - head ))
-            echo "[TIME] [$project_name] batched find (${#new_dirs_batch[@]} dirs → +${added} new files): $(format_duration $(( $(now_ns) - t_find )))"
-            echo "[INFO] [$project_name] extracted: $total_extracted | queue remaining: $remaining | total queued: ${#queue[@]}"
+            log_to_file "$log_path" "[TIME] batched find (${#new_dirs_batch[@]} dirs → +${added} new files): $(format_duration $(( $(now_ns) - t_find )))"
+            log_to_file "$log_path" "[INFO] extracted: $total_extracted | queue remaining: $remaining | total queued: ${#queue[@]}"
         fi
     done
 
     local t_loop_dur=$(( $(now_ns) - t0 ))
-    echo "[TIME] [$project_name] main loop: $(format_duration $t_loop_dur) | file(1) calls: $file_calls"
+    log_to_file "$log_path" "[TIME] main loop: $(format_duration $t_loop_dur) | file(1) calls: $file_calls"
 
+    # Удаляем битые симлинки (-xtype l матчит именно те симлинки, чья цель
+    # не резолвится — валидные симлинки, указывающие на существующие файлы,
+    # не трогаем; -type l удалял бы вообще ВСЕ симлинки, включая рабочие)
     t0=$(now_ns)
-    find "$unpack_dir" -type l -delete 2>/dev/null || true
-    echo "[TIME] [$project_name] symlink cleanup: $(format_duration $(( $(now_ns) - t0 )))"
+    find "$unpack_dir" -xtype l -delete 2>/dev/null || true
+    log_to_file "$log_path" "[TIME] symlink cleanup: $(format_duration $(( $(now_ns) - t0 )))"
+
+    # Применяем фильтры, если они указаны
+    local removed_count=0
+    local kept_count=0
+    if [[ -n "$FILTER_LANGS" || -n "$FILTER_BIN_LANGS" ]]; then
+        # Перед фильтрацией подсчитываем количество файлов
+        local before_count
+        before_count=$(find "$unpack_dir" -type f | wc -l)
+        log_to_file "$log_path" "[FILTER] Files before filtering: $before_count"
+        
+        apply_filters "$unpack_dir" "$log_path" "$project_name"
+        
+        local after_count
+        after_count=$(find "$unpack_dir" -type f | wc -l)
+        removed_count=$(( before_count - after_count ))
+        kept_count=$after_count
+        log_to_file "$log_path" "[FILTER] Files after filtering: $after_count"
+    fi
 
     local proj_total=$(( $(now_ns) - proj_start_ts ))
-    local skipped_count
-    skipped_count=$(grep -c "/$project_name/" "$SKIPPED_LOG" 2>/dev/null || echo 0)
-    echo "=== Done: $project_name | processed: $processed | extracted: $total_extracted | skipped: $skipped_count | time: $(format_duration $proj_total) ==="
+    log_summary "$project_name" "$log_path" "$processed" "$total_extracted" "$removed_count" "$kept_count" "$proj_total"
+
+    echo "=== Done: $project_name | processed: $processed | extracted: $total_extracted | time: $(format_duration $proj_total) ==="
 }
 
 # =============================================================================
@@ -923,36 +1324,55 @@ echo "[INFO] Projects: $(basename -a "${projects[@]}" | tr '\n' ' ')"
 [[ "$UNPACK_ALL" == false ]] && echo "[INFO] Skipping extensions by default: ${SKIP_EXTENSIONS[*]}"
 [[ "$FULL_FILE_CHECK" == true ]] && echo "[INFO] Mode: --full-file-check"
 [[ -n "$SKIP_PATH_PATTERN" ]] && echo "[INFO] Skip pattern: $SKIP_PATH_PATTERN"
+[[ "$UNPACK_CLEAN" == true ]] && echo "[INFO] Mode: --clean (no _dir suffix, remove archives)"
+[[ -n "$FILTER_LANGS" ]] && echo "[INFO] Filter source languages: $FILTER_LANGS"
+[[ -n "$FILTER_BIN_LANGS" ]] && echo "[INFO] Filter binary languages: $FILTER_BIN_LANGS"
 echo ""
 
+# pids/pid_names — строго параллельные массивы в порядке FIFO (кто раньше
+# запущен — тот раньше и в начале массива). Раньше здесь использовался
+# `wait -n 2>/dev/null || wait` для освобождения слота: код возврата
+# завершившегося процесса нигде не проверялся, а сам pid тут же вычищался
+# из "pids" по `kill -0` — то есть при сбое проекта, "реапнутого" именно
+# в этой throttling-ветке (а не в самом последнем финальном цикле), ошибка
+# полностью терялась и итоговый exit_code скрипта мог остаться 0 даже при
+# реальном падении одного из проектов.
+#
+# Теперь вместо "жди кого угодно" явно ждём САМЫЙ СТАРЫЙ из отслеживаемых
+# процессов (pids[0]) — это детерминированно и гарантированно сохраняет
+# его код возврата, не зависит от версии bash (в отличие от `wait -n`,
+# которая появилась только в bash 4.3+) и позволяет точно сопоставить
+# упавший pid с именем проекта для внятного сообщения об ошибке.
 pids=()
+pid_names=()
 exit_code=0
 
 for project_dir in "${projects[@]}"; do
     if [[ ${#pids[@]} -ge $MAX_PARALLEL ]]; then
         echo "[INFO] Reached max parallel jobs ($MAX_PARALLEL), waiting..."
-        wait -n 2>/dev/null || wait
-        new_pids=()
-        for pid in "${pids[@]}"; do
-            kill -0 "$pid" 2>/dev/null && new_pids+=("$pid")
-        done
-        pids=("${new_pids[@]}")
+        oldest_pid="${pids[0]}"
+        oldest_name="${pid_names[0]}"
+        if ! wait "$oldest_pid"; then
+            echo "[ERROR] Project '$oldest_name' (pid $oldest_pid) failed"
+            exit_code=1
+        fi
+        pids=("${pids[@]:1}")
+        pid_names=("${pid_names[@]:1}")
     fi
 
     echo "[INFO] Starting: $(basename "$project_dir") (running: ${#pids[@]}/$MAX_PARALLEL)"
     process_project "$project_dir" &
     pids+=($!)
+    pid_names+=("$(basename "$project_dir")")
 done
 
 echo "[INFO] Waiting for all remaining projects to complete..."
-for pid in "${pids[@]}"; do
-    if ! wait "$pid"; then
-        echo "[ERROR] Process $pid failed"
+for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+        echo "[ERROR] Project '${pid_names[$i]}' (pid ${pids[$i]}) failed"
         exit_code=1
     fi
 done
-
-rm -f "$SKIPPED_LOG.lock"
 
 SCRIPT_TOTAL=$(( $(now_ns) - SCRIPT_START_TS ))
 echo ""
@@ -960,8 +1380,7 @@ echo "=================================================="
 echo "Unpacking complete."
 echo "Total time : $(format_duration $SCRIPT_TOTAL)"
 echo "Output     : $UNPACKED_DIR"
-echo "Errors     : $LOG_DIR/<project>/error.log (по одному файлу на проект)"
-echo "Skipped    : $SKIPPED_LOG"
+echo "Logs       : $LOG_DIR/<project>/<project>.log"
 echo "=================================================="
 
 exit "$exit_code"
