@@ -16,14 +16,6 @@
 #   2. Run the installer:
 #      ./install_watcher.sh
 #
-#   3. The script will:
-#      - Detect your OS and install inotify-tools if needed
-#      - Create directory structure (lib/daemons/, logs/)
-#      - Generate daemon script in lib/daemons/watcher_daemon_dir.sh
-#      - Create configuration file in lib/daemons/watcher_daemon_dir.conf
-#      - Setup systemd service (if supported)
-#      - Start the daemon immediately
-#
 # USAGE AFTER INSTALLATION:
 #   Start daemon:
 #     ./lib/daemons/watcher_daemon_dir.sh start
@@ -54,31 +46,6 @@
 #
 #   Disable autostart:
 #     sudo systemctl disable watcher_daemon_dir
-#
-# TESTING:
-#   Create a test folder:
-#     mkdir src/TEST/0001-01
-#
-#   Check that subfolders were created:
-#     ls -la src/TEST/0001-01/
-#     # Should show: bin/  src/
-#
-#   Check logs:
-#     tail -f logs/daemons/watcher_daemon_dir/log.log
-#
-# UNINSTALL:
-#   1. Stop the daemon:
-#      ./lib/daemons/watcher_daemon_dir.sh stop
-#
-#   2. Disable systemd service (if used):
-#      sudo systemctl disable watcher_daemon_dir
-#      sudo rm /etc/systemd/system/watcher_daemon_dir.service
-#      sudo systemctl daemon-reload
-#
-#   3. Remove files:
-#      rm -rf lib/daemons/
-#      rm -f watcher.pid
-#      rm -rf logs/daemons/
 #
 # ============================================================
 
@@ -161,7 +128,7 @@ create_daemon_script() {
     cat > "$DAEMON_SCRIPT" << 'EOF'
 #!/bin/bash
 # ============================================================
-# WATCHER DAEMON - watcher_daemon_dir
+# DIRECTORY WATCHER DAEMON
 # Automatically creates src/ and bin/ subdirectories
 # Version: 1.0
 # ============================================================
@@ -180,7 +147,6 @@ create_daemon_script() {
 #
 # ============================================================
 
-# Get the absolute path of this script
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_PATH/../.." && pwd)"
 WATCH_BASE="$PROJECT_ROOT/src"
