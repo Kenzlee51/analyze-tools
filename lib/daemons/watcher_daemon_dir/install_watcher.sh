@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # INSTALLER FOR DIRECTORY WATCHER DAEMON
-# Version: 1.2
+# Version: 1.3
 # ============================================================
 #
 # DESCRIPTION:
@@ -51,8 +51,6 @@
 # ============================================================
 
 # --- FIX: Properly detect project root from anywhere ---
-# This script is located at lib/daemons/watcher_daemon_dir/install_watcher.sh
-# We need to go up 3 levels to reach the project root.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 DAEMON_DIR="$PROJECT_ROOT/lib/daemons"
@@ -117,12 +115,13 @@ install_inotify() {
 
 stop_old_daemon() {
     echo "[INFO] Stopping old daemon if running..."
+    local current_pid=$$
     
-    # По PID файлу
+    # 1. По PID файлу
     if [[ -f "$PID_FILE" ]]; then
         local pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "[INFO] Killing process $pid"
+        if [[ "$pid" != "$current_pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "[INFO] Killing process from PID file: $pid"
             kill "$pid" 2>/dev/null
             sleep 1
             kill -9 "$pid" 2>/dev/null
@@ -130,15 +129,36 @@ stop_old_daemon() {
         rm -f "$PID_FILE"
     fi
     
-    # По имени процесса
-    local pids=$(pgrep -f "watcher_daemon_dir" 2>/dev/null)
+    # 2. По имени процесса, но исключаем текущий процесс и родительские оболочки
+    local pids=$(pgrep -f "watcher_daemon_dir" 2>/dev/null | grep -v "^$current_pid$" | tr '\n' ' ')
     if [[ -n "$pids" ]]; then
-        echo "[INFO] Killing remaining processes: $pids"
-        pkill -f "watcher_daemon_dir" 2>/dev/null
-        sleep 1
+        # Дополнительно фильтруем, чтобы не убить самого себя (если вдруг)
+        local filtered_pids=""
+        for p in $pids; do
+            # Проверяем, что это не процесс install_watcher.sh
+            local cmd=$(ps -p "$p" -o comm= 2>/dev/null)
+            if [[ "$cmd" != "install_watcher.sh" ]] && [[ "$cmd" != "bash" ]] && [[ "$cmd" != "sh" ]]; then
+                filtered_pids="$filtered_pids $p"
+            fi
+        done
+        if [[ -n "$filtered_pids" ]]; then
+            echo "[INFO] Killing remaining processes: $filtered_pids"
+            for pid in $filtered_pids; do
+                if [[ "$pid" != "$current_pid" ]]; then
+                    kill "$pid" 2>/dev/null
+                fi
+            done
+            sleep 1
+            # Добиваем
+            for pid in $filtered_pids; do
+                if [[ "$pid" != "$current_pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    kill -9 "$pid" 2>/dev/null
+                fi
+            done
+        fi
     fi
     
-    # Systemd сервис
+    # 3. Systemd сервис
     if systemctl is-active --quiet watcher_daemon_dir 2>/dev/null; then
         echo "[INFO] Stopping systemd service"
         sudo systemctl stop watcher_daemon_dir 2>/dev/null
@@ -150,16 +170,10 @@ stop_old_daemon() {
 remove_old_files() {
     echo "[INFO] Removing old files..."
     
-    # Удаляем старый скрипт если есть
     rm -f "$DAEMON_SCRIPT" 2>/dev/null
-    
-    # Удаляем старый конфиг если есть
     rm -f "$DAEMON_CONFIG" 2>/dev/null
-    
-    # Удаляем старую папку если есть (от неправильной установки)
     rm -rf "$DAEMON_DIR/watcher_daemon_dir" 2>/dev/null
     
-    # Очищаем логи при переустановке
     if [[ -f "$LOG_DIR/log.log" ]]; then
         echo "[INFO] Old log found, moving to log.log.old"
         mv "$LOG_DIR/log.log" "$LOG_DIR/log.log.old" 2>/dev/null
@@ -170,11 +184,9 @@ remove_old_files() {
 
 create_directories() {
     echo "[INFO] Creating directory structure..."
-    
     mkdir -p "$DAEMON_DIR"
     mkdir -p "$LOG_DIR"
     mkdir -p "$WATCH_BASE"
-    
     echo "[OK] Directories created:"
     echo "  - $DAEMON_DIR"
     echo "  - $LOG_DIR"
@@ -438,7 +450,6 @@ main() {
     echo "=========================================="
     echo ""
     
-    # Сначала останавливаем старый демон и удаляем файлы
     echo "[STEP 0] Cleaning up old installation..."
     stop_old_daemon
     remove_old_files
