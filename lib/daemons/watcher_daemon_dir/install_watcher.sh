@@ -180,7 +180,7 @@ create_daemon_script() {
 # ============================================================
 # DIRECTORY WATCHER DAEMON
 # Automatically creates src/ and bin/ subdirectories
-# Installed: 2026-09-03
+# Version: 1.0
 # ============================================================
 #
 # USAGE:
@@ -202,8 +202,10 @@ create_daemon_script() {
 #
 # ============================================================
 
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
-WATCH_BASE="${WATCH_BASE:-$PROJECT_ROOT/src}"
+# Get the absolute path of this script
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_PATH/../.." && pwd)"
+WATCH_BASE="$PROJECT_ROOT/src"
 EXCLUDE_DIRS=("src" "bin" "lib" "logs" "results" "test")
 LOG_DIR="$PROJECT_ROOT/logs"
 LOG_FILE="$LOG_DIR/watcher.log"
@@ -265,6 +267,9 @@ process_existing_dirs() {
 }
 
 start_daemon() {
+    # Create log directory if it doesn't exist
+    mkdir -p "$LOG_DIR"
+    
     log "[INFO] Starting watcher daemon"
     log "  Base: $WATCH_BASE"
     log "  Depth: $MAX_DEPTH"
@@ -300,6 +305,8 @@ stop_daemon() {
         else
             rm -f "$PID_FILE"
         fi
+    else
+        echo "[INFO] PID file not found, daemon may not be running"
     fi
 }
 
@@ -307,13 +314,13 @@ status_daemon() {
     if [[ -f "$PID_FILE" ]]; then
         local pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
-            log "[OK] Daemon is running (PID: $pid)"
+            echo "[OK] Daemon is running (PID: $pid)"
             return 0
         else
             rm -f "$PID_FILE"
         fi
     fi
-    log "[INFO] Daemon is not running"
+    echo "[INFO] Daemon is not running"
     return 1
 }
 
