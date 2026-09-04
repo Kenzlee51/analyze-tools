@@ -69,8 +69,13 @@ akvs-analyze.py — Анализ проектов через АК-ВС (REST-cli
     ├── akvs/
     │   └── PROJ/                     ← рабочая папка (in/ out/ dyn/), временная
     ├── results/
-    │   └── PROJ/
-    │       └── akvs/                 ← ИТОГОВЫЙ распакованный отчёт
+    │   ├── PROJ/
+    │   │   └── akvs/                 ← ИТОГОВЫЙ распакованный отчёт
+    │   └── summary/
+    │       └── akvs/
+    │           └── PROJ/             ← копия отчёта (чистая пачка: index.html, data/, static/)
+    │                                    только для успешных проектов; папку summary/akvs
+    │                                    можно целиком скопировать и раздать
     └── logs/
         └── akvs/
             └── PROJ/
@@ -85,6 +90,7 @@ akvs-analyze.py — Анализ проектов через АК-ВС (REST-cli
 """
 
 import os
+import re
 import sys
 import shutil
 import zipfile
@@ -114,6 +120,7 @@ DYNAMIC_DOWNLOAD = ["html", "data"]   # html — база отчёта, data —
 BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNPACKED_DIR = os.path.join(BASE_DIR, "unpacked")
 RESULTS_DIR  = os.path.join(BASE_DIR, "results")
+SUMMARY_DIR  = os.path.join(RESULTS_DIR, "summary", "akvs")  # чистая пачка готовых отчётов
 LOG_DIR      = os.path.join(BASE_DIR, "logs", "akvs")
 WORK_ROOT    = os.path.join(BASE_DIR, "akvs")
 LIB_DIR      = os.path.join(BASE_DIR, LIB_SUBDIR)
@@ -260,6 +267,36 @@ def find_file(root, name):
         if name in filenames:
             return os.path.join(dirpath, name)
     return None
+
+
+def fix_empty_without_def(dyn_dir, log):
+    """Чинит раздел 'Неопределённые ФО' при нулевом количестве.
+
+    end.py при 0 выводимых ФО генерирует битый data/fo_without_def/0.js
+    (akvs_fo_without_def[0] = };) и папку fo_without_def/ — из-за этого
+    страница отчёта виснет на вечной загрузке. Сам сервер при count=0
+    папку fo_without_def НЕ создаёт (отчёт открывается). Поэтому при
+    count=0 просто удаляем папку — приводим к валидному серверному виду.
+    (Когда появится формула с N>0, генерация чанка будет чиниться в end.py.)
+    """
+    data = os.path.join(dyn_dir, "data")
+    fo_js = os.path.join(data, "fo_withoutdef.js")
+    count = None
+    try:
+        with open(fo_js, encoding='utf-8', errors='replace') as f:
+            m = re.search(r"akvs_fo_without_def_count\s*=\s*(\d+)", f.read())
+        if m:
+            count = int(m.group(1))
+    except Exception as e:
+        log.error("fo_withoutdef.js не прочитан ({}) — фикс раздела пропущен".format(e))
+        return
+
+    if count == 0:
+        fo_dir = os.path.join(data, "fo_without_def")
+        if os.path.isdir(fo_dir):
+            shutil.rmtree(fo_dir)
+            log.info("Неопределённые ФО = 0 — удалена папка fo_without_def "
+                     "(валидный пустой раздел, как у сервера)")
 
 
 def fresh_copytree(src, dst):
@@ -447,13 +484,31 @@ def process_project(project, cfg, keep_raw):
         else:
             log.error("metrics.json не найден в выгрузке — end.py может упасть")
 
+        # У «тривиальных» проектов (нет неопределённых ФО) сервер не создаёт
+        # папку data/fo_without_def, а end.py её ожидает. Создаём пустую:
+        # end.py всё равно выводит 0 неопределённых ФО (numberUncertainFO=0),
+        # так что результат идентичен обычному прогону.
+        fo_wd = os.path.join(dyn_dir, "data", "fo_without_def")
+        if not os.path.isdir(fo_wd):
+            os.makedirs(fo_wd)
+            log.info("data/fo_without_def отсутствует (нет неопределённых ФО) — "
+                     "создана пустая папка для end.py")
+
         if not run_cmd([sys.executable, END_PY], work, log, "end.py"):
             raise StageError(stage, "end.py завершился с ошибкой")
 
-        # ---------- 5. Итоговый отчёт -> results/PROJ/akvs ----------
+        # Чиним раздел «Неопределённые ФО» (битый пустой чанк -> зависание отчёта)
+        fix_empty_without_def(dyn_dir, log)
+
+        # ---------- 5. Итоговый отчёт -> results/PROJ/akvs + summary ----------
+        # На успешном прогоне обе папки проекта перезатираются (fresh_copytree).
         result_dir = os.path.join(RESULTS_DIR, project, "akvs")
         fresh_copytree(dyn_dir, result_dir)
         log.info("Готовый отчёт : {}".format(result_dir))
+
+        summary_dir = os.path.join(SUMMARY_DIR, project)
+        fresh_copytree(dyn_dir, summary_dir)
+        log.info("Копия в summary: {}".format(summary_dir))
 
     except StageError as e:
         status = "failed"
@@ -572,6 +627,7 @@ def main():
     print("Пропущено      : {}".format(len(skipped)))
     print("Время          : {}".format(elapsed))
     print("Отчёты         : {}".format(RESULTS_DIR))
+    print("Сводка (summary): {}".format(SUMMARY_DIR))
     print("Логи           : {}".format(LOG_DIR))
 
     if failed:
