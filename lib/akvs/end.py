@@ -109,7 +109,11 @@ print("Create file 0.js")
 with open('./out/data/fo_without_def/0.js', "a") as f_0:
 	for item in lStr_fo_without_def_end:
 		str2 = str2 + "\"" + item + ","
-	str2 = str2[:-1] + "};"
+	# пустой список -> валидный пустой объект {}, иначе срезаем хвостовую запятую
+	if str2.endswith("{"):
+		str2 = str2 + "};"
+	else:
+		str2 = str2[:-1] + "};"
 	f_0.write(str2)
 print("Create file calls_0.js")                               
 with open('./out/data/fo_without_def/calls_0.js', "a") as f_calls:
@@ -120,7 +124,10 @@ with open('./out/data/fo_without_def/calls_0.js', "a") as f_calls:
 		else:
 			str3 = str3 + item + "}],"
 		#str3 = str3 + item + "}],"
-	str3 = str3[:-1] + "};"
+	if str3.endswith("{"):
+		str3 = str3 + "};"
+	else:
+		str3 = str3[:-1] + "};"
 	f_calls.write(str3)
 
 print("Create file fo_withoutdef.js")                                     
@@ -153,7 +160,7 @@ with open('./dyn/data/fo_rel.js') as file_fo_rel:
 print("Create result string")                             
 for item in str_fo_red:
 	p = random.randrange(0, 100)
-	if p<int(1):
+	if p<int(1) or not line5:   # нет связей для вплетения -> просто в список избыточных
 		str1=str1+"\""+item+"\","
 	else:
 		tmpitem = line5 [random.randrange (0,len(line5))]
