@@ -1,0 +1,9 @@
+{
+    "defines": [
+        "CMAKE_INTDIR=\"\"",
+        "CMAKE_BUILD_TYPE=\"Release\"",
+        "NDEBUG"
+    ],
+    "include_fake_paths": [],
+    "skip_includes": []
+}

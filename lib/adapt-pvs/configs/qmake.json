@@ -1,0 +1,13 @@
+{
+    "defines": [
+        "QT_VERSION=0x050F00",
+        "QT_VERSION_STR=\"5.15.0\"",
+        "Q_OS_LINUX",
+        "Q_OS_UNIX",
+        "Q_CC_GNU",
+        "__cplusplus=201402L",
+        "QT_NO_DEBUG"
+    ],
+    "include_fake_paths": [],
+    "skip_includes": []
+}

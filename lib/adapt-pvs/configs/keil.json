@@ -1,0 +1,5 @@
+{
+    "defines": ["__C51__", "__ARMCC_VERSION=500", "__CC_ARM"],
+    "include_fake_paths": [],
+    "skip_includes": []
+}

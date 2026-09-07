@@ -1,0 +1,14 @@
+{
+    "defines": ["__WATCOMC__", "__386__", "__STDC__=0"],
+    "include_fake_paths": [
+        "./H",
+        "./graphics",
+        "./system",
+        "./hardware",
+        "./Purga/H",
+        "./Metel-55/H",
+        "./Sheksna-90/H",
+        "./Raduga-22350/H"
+    ],
+    "skip_includes": []
+}

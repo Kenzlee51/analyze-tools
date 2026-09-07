@@ -1,0 +1,12 @@
+{
+    "defines": [
+        "__ARMCC_VERSION=500",
+        "__CC_ARM",
+        "__ARM_ARCH_7M__",
+        "__ARMVFP__",
+        "__cplusplus=201103L",
+        "__MICROLIB"
+    ],
+    "include_fake_paths": [],
+    "skip_includes": []
+}

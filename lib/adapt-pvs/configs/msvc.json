@@ -1,0 +1,14 @@
+{
+    "defines": [
+        "_MSC_VER=1900",
+        "_MSC_FULL_VER=190023918",
+        "_WIN32",
+        "_WIN64",
+        "_DEBUG",
+        "UNICODE",
+        "_UNICODE",
+        "__cplusplus=199711L"
+    ],
+    "include_fake_paths": [],
+    "skip_includes": []
+}

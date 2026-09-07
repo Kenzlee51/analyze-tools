@@ -1,0 +1,11 @@
+{
+    "defines": [
+        "__BORLANDC__=0x560",
+        "__TURBOC__",
+        "_WIN32",
+        "__cplusplus",
+        "__STDC__=1"
+    ],
+    "include_fake_paths": [],
+    "skip_includes": []
+}

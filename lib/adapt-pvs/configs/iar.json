@@ -1,0 +1,11 @@
+{
+    "defines": [
+        "__IAR_SYSTEMS_ICC__",
+        "__ICCARM__",
+        "__ARM_ARCH_7M__",
+        "__ARM_COMPILER_VERSION=1000000",
+        "__cplusplus=201103L"
+    ],
+    "include_fake_paths": [],
+    "skip_includes": []
+}
