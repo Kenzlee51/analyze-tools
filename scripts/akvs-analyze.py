@@ -254,11 +254,26 @@ def find_reports_data(root):
 
 
 def find_report_root(root):
-    """Корень html-отчёта — папка, содержащая index.html."""
+    """Корень html-отчёта.
+
+    Клиент распаковывает html-отчёт в папку с именем '<project>.report' ->
+    '<project>-report'. Ищем именно её по суффиксу '-report', потому что в
+    выгрузке данных (-sd data) лежат исходники проекта, где могут быть свои
+    index.html (веб-проекты, node_modules и т.п.) — по index.html легко
+    зацепить чужой каталог. Дополнительно убеждаемся, что внутри есть
+    index.html (это действительно отчёт).
+    """
+    candidates = []
     for dirpath, dirnames, filenames in os.walk(root):
-        if "index.html" in filenames:
-            return dirpath
-    return None
+        for d in dirnames:
+            if d.endswith("-report"):
+                full = os.path.join(dirpath, d)
+                if os.path.isfile(os.path.join(full, "index.html")):
+                    candidates.append(full)
+    if not candidates:
+        return None
+    # если вдруг несколько — берём самый короткий путь (ближе к корню выгрузки)
+    return sorted(candidates, key=len)[0]
 
 
 def find_file(root, name):
