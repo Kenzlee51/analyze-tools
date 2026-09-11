@@ -1211,6 +1211,12 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
         izb.append({'path': path, 'hash': h})
 
     # Добавляем выходные файлы интерпретатора которых нет в signatures
+    # Добавляем выходные файлы интерпретатора которых нет в signatures.
+    # ВАЖНО: в этом цикле обрабатываются АРТЕФАКТЫ интерпретаторов (не файлы
+    # из src.json). Отчёт compiled_unused должен содержать только исходные
+    # файлы из src.json, поэтому сюда артефакты НЕ добавляем — только в
+    # compiled_used (если артефакт попал в bin, это подтверждает использование
+    # исходника, и такой артефакт полезно видеть в списке использованных).
     for out in output_files:
         path = out.get('path', '')
         p_norm = out.get('path_norm', '')
@@ -1221,26 +1227,9 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             in_bin = (h and h in bin_hashes_set) or (p_norm and p_norm in bin_paths_set)
             if in_bin:
                 compiled_used.append({'path': path, 'hash': h})
-            else:
-                # Проверяем, не используется ли этот файл как вход хорошей команды
-                is_used = False
-                if h and h in input_hashes:
-                    cmd_indices = input_by_hash.get(h, set())
-                    for idx in cmd_indices:
-                        if cmd_has_bin_output[idx]:
-                            is_used = True
-                            break
-                elif p_norm and p_norm in input_paths_norm:
-                    cmd_indices = input_by_path.get(p_norm, set())
-                    for idx in cmd_indices:
-                        if cmd_has_bin_output[idx]:
-                            is_used = True
-                            break
-                if is_used:
-                    compiled_used.append({'path': path, 'hash': h})
-                else:
-                    compiled_unused.append({'path': path, 'hash': h})
-            added_compiled_paths.add(p_norm)
+                added_compiled_paths.add(p_norm)
+            # else: артефакт не в дистрибутиве — НЕ пишем в compiled_unused,
+            # так как это не исходный файл из src.json
 
     return executed, compiled_used, compiled_unused, copied, izb
 
