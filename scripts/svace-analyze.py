@@ -271,6 +271,13 @@ def process_project(project_name, mode, svace_bin, available_languages):
     languages = [lang for lang in MODE_LANGUAGES[mode] if lang in available_languages]
     if not languages:
         log.error("Пропуск: {}".format(skip_reason(mode)))
+        # Удаляем результаты прошлых прогонов, чтобы их не выгрузили как актуальные
+        if os.path.isdir(svace_dir):
+            try:
+                shutil.rmtree(svace_dir)
+                log.info("Удалена устаревшая папка режима: {}".format(svace_dir))
+            except Exception as e:
+                log.error("Не удалось удалить устаревшую папку {}: {}".format(svace_dir, e))
         log.end_run("SKIPPED")
         return "skipped"
 
