@@ -1,43 +1,44 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-svace-upload.py — Выгрузка результатов Svace в Svacer с дедупликацией
+svace-upload.py — Выгрузка результатов Svace (OB) в Svacer с дедупликацией
 =============================================================================
 
 ОПИСАНИЕ:
-    Выгружает результаты svace-analyze.py из svace/PROJ/{OB,PY,JS}/ на сервер
-    Svacer, назначая номер итерации и не допуская дублей.
+    Выгружает общий анализ (Python + JavaScript) из svace/PROJ/OB/ на сервер
+    Svacer как снапшот PROJ_ob_vN и ведёт хронологию итераций по версиям
+    исходного кода. Выгрузка этапов (PY, JS и др.) скриптом не выполняется —
+    такие снапшоты выгружаются вручную.
 
     Формат имени снапшота:
-        <Изделие>[_<Этап>]_ob_v<N>[_rc]
-    Режимы (как в svace-analyze.py):
-        (без флагов)       -> svace/PROJ/OB/  -> PROJ_ob_vN
-        --only-python      -> svace/PROJ/PY/  -> PROJ_PY_ob_vN
-        --only-javascript  -> svace/PROJ/JS/  -> PROJ_JS_ob_vN
-        --separate         -> PY и JS         -> PROJ_PY_ob_vN, PROJ_JS_ob_vN
+        <Изделие>[_<Этап>]_(b|ob)_v<N>[_rc]
 
-    Учитываются только ob-снапшоты изделия (без этапа, PY, JS, прочие этапы).
-    b-снапшоты нумеруются независимо и не рассматриваются.
+УЧИТЫВАЕМЫЕ СНАПШОТЫ:
+    PROJ_ob_vN              — итерации скрипта (N_max и проверка на дубль)
+    PROJ_ob_vN_rc           — разметка разработчика (N_max, закрывает итерацию)
+    PROJ_<Этап>_ob_vN_rc    — разметка разработчика любого этапа (то же)
+    Игнорируются: PROJ_<Этап>_ob_vN без _rc, все PROJ_..._b_...
 
-АЛГОРИТМ (по снимку состояния сервера, снятому один раз на изделие):
-    1. ob-снапшотов нет                         -> v1.
-    2. N_max = максимум N по ob-снапшотам, включая _rc.
-    3. На уровне N_max есть _rc                  -> новая итерация N_max+1.
-       Если _rc есть только у других этапов, а не у выгружаемых,
-       разметка не будет перенесена ресивером -> BLOCKED (обход: --force).
-    4. _rc нет — для каждого режима сравнение со снапшотом того же этапа
-       на N_max (версия svace, хэши исходников, срабатывания):
-         - хоть один режим отличается           -> N_max+1, все режимы;
-         - все режимы совпали                   -> SKIP (дубль);
-         - части режимов нет на N_max           -> если исходники совпадают
-           с итерацией N_max, недостающие добавляются в N_max,
-           иначе (или проверить нельзя)         -> N_max+1, все режимы.
+АЛГОРИТМ (по снимку сервера, снятому один раз на изделие):
+    1. Учитываемых снапшотов нет                  -> PROJ_ob_v1.
+    2. N_max — старшая версия среди учитываемых.
+    3. На N_max есть любой _rc                    -> PROJ_ob_v(N_max+1), без проверки на дубль.
+    4. Иначе проверка на дубль с PROJ_ob_vN_max:
+         совпадает                                -> пропуск (SKIPPED);
+         отличается                               -> PROJ_ob_v(N_max+1).
 
-    Хэши исходников (ГОСТ Р 34.11-2012 256 бит и MD5) считаются для Python и
-    JavaScript и записываются в custom_fields каждого снапшота:
+    Дубль — совпадают версия svace, исходники и срабатывания.
+    Исходники: хэши ГОСТ Р 34.11-2012 (256 бит) и MD5 деревьев Python и JS,
+    записываются в custom_fields каждого снапшота:
         src_py_gost12_256, src_py_md5, src_js_gost12_256, src_js_md5, dedup_mode
-    Хэш дерева: строки "<хэш файла>  <отн. путь>\\n", отсортированные по
-    байтам пути, хэшированные тем же алгоритмом.
+    Хэш дерева: строки "<хэш файла>  <отн. путь>\\n", отсортированные по байтам
+    пути, хэшированные тем же алгоритмом.
+    Если у ob_vN хэшей нет (выгружен ранее), исходники проверяются по .snap
+    (svacer server export): множество md5 файлов снапшота против файлов src.
+    Если проверить нельзя — сравнение только по срабатываниям с [WARN].
+
+    Разметка из PROJ_<Этап>_ob_vN_rc ресивером в PROJ_ob_v(N+1) не переносится
+    (ресивер ищет PROJ_ob_vN_rc) — в этом случае выводится [WARN].
 
     При старте выполняется самопроверка алгоритмов на эталонном файле
     test/ensure-natural-number-value.js. ГОСТ считается через rhash
@@ -48,13 +49,10 @@ svace-upload.py — Выгрузка результатов Svace в Svacer с �
 
 ОПЦИИ:
     --project NAME         Изделие (можно несколько раз). По умолчанию все
-                           изделия из svace/, где есть результаты режима.
-    --only-python          Режим PY
-    --only-javascript,
-    --only-js              Режим JS
-    --separate             Режимы PY и JS
+                           изделия, у которых есть svace/PROJ/OB/.svace-dir
     --dry-run              Показать решения, ничего не выгружать
-    --force                Выгружать несмотря на BLOCKED
+    --force                Выгружать, даже если исходники изменены после анализа
+    --no-snap-check        Не проверять исходники старых снапшотов через .snap
     --host / --port        Сервер Svacer ($SVACER_HOST / $SVACER_PORT)
     --user / --password    Учётная запись ($SVACER_USER / $SVACER_PASSWORD)
     --svacer-bin PATH      Бинарь svacer ($SVACER_BIN, по умолчанию svacer)
@@ -65,14 +63,14 @@ svace-upload.py — Выгрузка результатов Svace в Svacer с �
     ├── scripts/svace-upload.py
     ├── test/ensure-natural-number-value.js   ← эталон самопроверки
     ├── unpacked/PROJ/src/
-    ├── svace/PROJ/{OB,PY,JS}/.svace-dir/
+    ├── svace/PROJ/OB/.svace-dir/             ← результат svace-analyze.py без флагов
     └── logs/svacer-upload/
         ├── run_YYYYMMDD_HHMMSS.log / .json
         ├── projects/PROJ.log
         └── locks/PROJ.lock
 
 ЗАВИСИМОСТИ:
-    Python 3.6+, svacer, rhash >= 1.4 или gostsum
+    Python 3.6+, svacer, rhash >= 1.4 или gostsum, zstd (для проверки по .snap)
 =============================================================================
 """
 
@@ -85,6 +83,8 @@ import base64
 import hashlib
 import argparse
 import subprocess
+import tempfile
+import zlib
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -107,6 +107,7 @@ DEFAULT_USER       = os.environ.get("SVACER_USER", "admin")
 DEFAULT_PASSWORD   = os.environ.get("SVACER_PASSWORD", "admin")
 
 TRACK = "ob"
+MODE_DIR = "OB"     # подпапка результатов общего анализа в svace/PROJ/
 
 # Эталон для самопроверки алгоритмов хэширования
 TEST_VECTOR_FILE   = os.path.join(BASE_DIR, "test", "ensure-natural-number-value.js")
@@ -119,16 +120,8 @@ LANG_EXTENSIONS = {
     'js': ('.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'),
 }
 
-# Режим -> этап в имени снапшота и языки
-MODES = {
-    'OB': {'stage': None, 'langs': ['py', 'js']},
-    'PY': {'stage': 'PY', 'langs': ['py']},
-    'JS': {'stage': 'JS', 'langs': ['js']},
-}
-
 HASH_ALGS = ('gost12_256', 'md5')
 # =============================================================================
-
 
 def field_name(lang, alg):
     return "src_{}_{}".format(lang, alg)
@@ -289,21 +282,131 @@ def collect_files(src_dir, extensions):
 
 def compute_source_hashes(src_dir, hasher):
     """Хэши деревьев исходников Python и JS + число файлов и максимальный mtime."""
-    result = {'counts': {}, 'max_mtime': {}}
+    result = {'counts': {}, 'max_mtime': {}, 'md5set': {}}
     for lang, exts in LANG_EXTENSIONS.items():
         files = collect_files(src_dir, exts)
         paths = [p for _, p in files]
         gost = hasher.hash_files(paths) if paths else []
         man_g, man_m = [], []
         result['max_mtime'][lang] = 0.0
+        result['md5set'][lang] = set()
         for (rel, path), g in zip(files, gost):
             man_g.append(g.encode('ascii') + b'  ' + rel + b'\n')
-            man_m.append(md5_file(path).encode('ascii') + b'  ' + rel + b'\n')
+            file_md5 = md5_file(path)
+            result['md5set'][lang].add(file_md5)
+            man_m.append(file_md5.encode('ascii') + b'  ' + rel + b'\n')
             result['max_mtime'][lang] = max(result['max_mtime'][lang], os.path.getmtime(path))
         result[field_name(lang, 'gost12_256')] = hasher.hash_bytes(b''.join(man_g))
         result[field_name(lang, 'md5')] = hashlib.md5(b''.join(man_m)).hexdigest()
         result['counts'][lang] = len(files)
     return result
+
+
+# =============================================================================
+# ПРОВЕРКА ИСХОДНИКОВ СТАРЫХ СНАПШОТОВ ЧЕРЕЗ .snap
+# =============================================================================
+# У снапшотов, выгруженных до появления хэшей в custom_fields, исходники
+# проверяются по содержимому: svacer server export -> zstd -> gzip-блоки.
+# Формат .snap внутренний: при любой неудаче проверка возвращает "нельзя
+# проверить", и скрипт выбирает безопасный вариант (новая итерация).
+# Сравнивается множество содержимого файлов (md5), без путей: переименование
+# файла без изменения содержимого этой проверкой не обнаруживается.
+
+GOB_PREFIX = b'\r\xff\x83\x02\x01\x02\xff\x84'  # служебные блоки разметки токенов svacer
+
+
+def zstd_decompress_to(src, dst):
+    if shutil.which('zstd'):
+        with open(dst, 'wb') as out:
+            r = subprocess.run(['zstd', '-dc', src], stdout=out, stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            raise RuntimeError("zstd: " + r.stderr.decode('utf-8', errors='replace').strip())
+        return
+    try:
+        import zstandard
+    except ImportError:
+        raise RuntimeError("нет ни утилиты zstd, ни модуля zstandard")
+    with open(src, 'rb') as fi, open(dst, 'wb') as fo:
+        zstandard.ZstdDecompressor().copy_stream(fi, fo)
+
+
+def gzip_member_md5s(data, chunk=1 << 16):
+    """md5 содержимого всех gzip-блоков внутри data, кроме служебных."""
+    mv = memoryview(data)
+    found = set()
+    pos = 0
+    size = len(data)
+    while True:
+        i = data.find(b'\x1f\x8b\x08', pos)
+        if i < 0:
+            break
+        dec = zlib.decompressobj(31)
+        parts = []
+        p = i
+        try:
+            while not dec.eof and p < size:
+                piece = mv[p:p + chunk]
+                parts.append(dec.decompress(piece))
+                p += len(piece)
+        except zlib.error:
+            pos = i + 1
+            continue
+        if not dec.eof:
+            pos = i + 1
+            continue
+        blob = b''.join(parts)
+        if not blob.startswith(GOB_PREFIX):
+            found.add(hashlib.md5(blob).hexdigest())
+        pos = p - len(dec.unused_data)
+    return found
+
+
+class SnapVerifier(object):
+    def __init__(self, args, product, log):
+        self.args = args
+        self.product = product
+        self.log = log
+        self.cache = {}
+
+    def content(self, snap):
+        name = snap['name']
+        if name in self.cache:
+            return self.cache[name]
+        result = None
+        tmp = tempfile.mkdtemp(prefix='svace-snap-')
+        try:
+            snap_file = os.path.join(tmp, 'snapshot.snap')
+            host = re.sub(r'^https?://', '', self.args.host).rstrip('/')
+            ok, _ = run_cmd([self.args.svacer_bin, 'server', 'export', '--host', host, '--port', str(self.args.port),
+                             '--user', self.args.user, '--password', self.args.password,
+                             '--project', self.product, '--snapshot', name, snap_file],
+                            tmp, self.log, "svacer server export " + name)
+            if ok and os.path.isfile(snap_file):
+                raw = os.path.join(tmp, 'snapshot.raw')
+                zstd_decompress_to(snap_file, raw)
+                with open(raw, 'rb') as f:
+                    result = gzip_member_md5s(f.read())
+                self.log.info("{}: из .snap извлечено {} уникальных файлов".format(name, len(result)))
+        except Exception as e:
+            self.log.warn("{}: проверка по .snap не выполнена: {}".format(name, e))
+            result = None
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.cache[name] = result
+        return result
+
+
+def snap_sources_verdict(verifier, snap, hashes):
+    """
+    True/False — исходники совпадают/отличаются с содержимым снапшота ob (Python + JS),
+    None — проверить нельзя.
+    """
+    if verifier is None:
+        return None
+    content = verifier.content(snap)
+    if not content:
+        return None
+    return content == (hashes['md5set']['py'] | hashes['md5set']['js'])
 
 
 def self_test(hasher, log):
@@ -481,12 +584,17 @@ class SvacerApi(object):
 # =============================================================================
 # ИМЕНА СНАПШОТОВ
 # =============================================================================
+
+# =============================================================================
+# ИМЕНА СНАПШОТОВ
+# =============================================================================
 def series_regex(product):
     return re.compile(r'^' + re.escape(product) + r'(?:_(?P<stage>.+?))?_' + TRACK +
                       r'_v(?P<n>\d+)(?P<rc>_rc)?$')
 
 
 def parse_snapshots(product, raw_snapshots):
+    """Все ob-снапшоты изделия: name, id, stage, n, rc, details."""
     rx = series_regex(product)
     result = []
     for s in raw_snapshots:
@@ -498,13 +606,13 @@ def parse_snapshots(product, raw_snapshots):
     return result
 
 
-def snapshot_name(product, mode, n):
-    stage = MODES[mode]['stage']
-    return "{}{}_{}_v{}".format(product, "_" + stage if stage else "", TRACK, n)
+def is_counted(snap):
+    """Учитываются ob_vN, ob_vN_rc и <Этап>_ob_vN_rc; <Этап>_ob_vN без _rc — нет."""
+    return snap['stage'] is None or snap['rc']
 
 
-def stage_label(stage):
-    return stage if stage else "(без этапа)"
+def snapshot_name(product, n):
+    return "{}_{}_v{}".format(product, TRACK, n)
 
 
 def cf_value(details, name):
@@ -520,82 +628,41 @@ def cf_value(details, name):
 # =============================================================================
 # ПРИНЯТИЕ РЕШЕНИЯ
 # =============================================================================
-def decide(modes, snaps, compare_mode, sources_state, force):
+def decide(snaps, compare):
     """
-    modes          — список режимов прогона, например ['PY', 'JS']
-    snaps          — ob-снапшоты изделия (parse_snapshots)
-    compare_mode   — f(mode, snap) -> (bool одинаковы, [причины])
-    sources_state  — f(langs, [snaps]) -> True / False / None (нельзя проверить)
-    Возвращает dict: iteration, upload [режимы], skip [режимы], blocked, notes
+    snaps    — ob-снапшоты изделия (parse_snapshots)
+    compare  — f(snap) -> (bool дубль, [причины]) для PROJ_ob_vN_max
+    Возвращает dict: action ('upload' | 'skip'), iteration, base, notes
     """
-    plan = {'iteration': None, 'upload': [], 'skip': [], 'blocked': None, 'notes': []}
+    plan = {'action': 'upload', 'iteration': None, 'base': None, 'notes': []}
+    counted = [s for s in snaps if is_counted(s)]
 
-    if not snaps:
+    if not counted:
         plan['iteration'] = 1
-        plan['upload'] = list(modes)
-        plan['notes'].append("ob-снапшотов на сервере нет -> v1")
+        plan['notes'].append("учитываемых ob-снапшотов нет -> v1")
         return plan
 
-    n_max = max(s['n'] for s in snaps)
-    top = [s for s in snaps if s['n'] == n_max]
+    n_max = max(s['n'] for s in counted)
+    top = [s for s in counted if s['n'] == n_max]
     top_rc = [s for s in top if s['rc']]
-    our_stages = set(MODES[m]['stage'] for m in modes)
 
     if top_rc:
-        rc_stages = set(s['stage'] for s in top_rc)
         plan['iteration'] = n_max + 1
-        plan['notes'].append("на v{} есть разметка разработчика ({}) -> новая итерация v{}".format(
+        plan['notes'].append("на v{} есть разметка разработчика ({}) -> v{}".format(
             n_max, ', '.join(s['name'] for s in top_rc), n_max + 1))
-        if not (rc_stages & our_stages):
-            msg = ("_rc есть только для этапов [{}], а выгружаются [{}]: ресивер не перенесёт "
-                   "разметку").format(', '.join(sorted(stage_label(s) for s in rc_stages)),
-                                      ', '.join(sorted(stage_label(s) for s in our_stages)))
-            if not force:
-                plan['blocked'] = msg + " (обход: --force)"
-                return plan
-            plan['notes'].append("--force: " + msg)
-        plan['upload'] = list(modes)
         return plan
 
-    by_stage = {s['stage']: s for s in top}
-    states = {}
-    for m in modes:
-        snap = by_stage.get(MODES[m]['stage'])
-        if snap is None:
-            states[m] = 'missing'
-            continue
-        same, reasons = compare_mode(m, snap)
-        states[m] = 'same' if same else 'different'
-        for r in reasons:
-            plan['notes'].append("{} vs {}: {}".format(m, snap['name'], r))
-
-    if any(v == 'different' for v in states.values()):
-        plan['iteration'] = n_max + 1
-        plan['upload'] = list(modes)
-        plan['notes'].append("результаты отличаются от v{} -> новая итерация v{}".format(n_max, n_max + 1))
-        return plan
-
-    if all(v == 'same' for v in states.values()):
+    base = top[0]  # на N_max без _rc учитывается только PROJ_ob_vN
+    plan['base'] = base['name']
+    same, reasons = compare(base)
+    plan['notes'].extend("vs {}: {}".format(base['name'], r) for r in reasons)
+    if same:
+        plan['action'] = 'skip'
         plan['iteration'] = n_max
-        plan['skip'] = list(modes)
-        plan['notes'].append("все режимы совпадают с v{} -> дубль".format(n_max))
-        return plan
-
-    missing = [m for m in modes if states[m] == 'missing']
-    langs = sorted(set(l for m in missing for l in MODES[m]['langs']))
-    state = sources_state(langs, top)
-    if state is True:
-        plan['iteration'] = n_max
-        plan['upload'] = missing
-        plan['skip'] = [m for m in modes if states[m] == 'same']
-        plan['notes'].append("исходники совпадают с v{} -> добавляем [{}] в v{}".format(
-            n_max, ', '.join(missing), n_max))
+        plan['notes'].append("совпадает с {} -> дубль".format(base['name']))
     else:
         plan['iteration'] = n_max + 1
-        plan['upload'] = list(modes)
-        plan['notes'].append("режимов [{}] нет на v{}, исходники {} -> новая итерация v{}".format(
-            ', '.join(missing), n_max,
-            "отличаются" if state is False else "проверить нельзя (нет хэшей)", n_max + 1))
+        plan['notes'].append("отличается от {} -> v{}".format(base['name'], n_max + 1))
     return plan
 
 
@@ -643,19 +710,19 @@ def upload_host_arg(host, port):
     return host if str(port) == '8080' else "http://{}:{}".format(host, port)
 
 
-def process_product(product, modes, args, api, hasher, log):
-    result = {'product': product, 'status': None, 'iteration': None,
-              'uploaded': [], 'skipped': [], 'notes': [], 'message': ''}
+def process_product(product, args, api, hasher, log):
+    result = {'product': product, 'status': None, 'iteration': None, 'snapshot': None,
+              'notes': [], 'message': ''}
     log.project_log = os.path.join(LOG_DIR, 'projects', product + '.log')
     log.raw("\n" + "=" * 70 + "\nRUN {}\n".format(datetime.now().isoformat(timespec='seconds')) + "=" * 70)
     log.info("=" * 60)
-    log.info("Изделие: {}  режимы: {}".format(product, ', '.join(modes)))
+    log.info("Изделие: {}".format(product))
 
     def finish(status, message=''):
         result['status'] = status
         result['message'] = message
         if message:
-            (log.error if status in ('FAILED', 'BLOCKED') else log.info)("{}: {}".format(status, message))
+            (log.error if status == 'FAILED' else log.info)("{}: {}".format(status, message))
         log.project_log = None
         return result
 
@@ -672,26 +739,20 @@ def process_product(product, modes, args, api, hasher, log):
     for lang in LANG_EXTENSIONS:
         log.info("  {}: gost12={} md5={}".format(lang, hashes[field_name(lang, 'gost12_256')],
                                                  hashes[field_name(lang, 'md5')]))
+    if hashes['counts']['py'] + hashes['counts']['js'] == 0:
+        return finish('SKIPPED', "нет файлов Python и JavaScript")
 
-    # --- Локальные результаты режимов ---
-    local = {}
-    active_modes = []
-    for m in modes:
-        if sum(hashes['counts'][l] for l in MODES[m]['langs']) == 0:
-            log.info("{}: нет файлов языка — режим пропущен".format(m))
-            continue
-        lm = LocalMode(product, m)
-        if lm.error:
-            return finish('FAILED', "{}: {}".format(m, lm.error))
-        newest = max(hashes['max_mtime'][l] for l in MODES[m]['langs'])
-        if newest > os.path.getmtime(lm.svres) and not args.force:
-            return finish('BLOCKED', "{}: исходники изменены после анализа ({}), "
-                                     "перезапустите svace-analyze.py (обход: --force)".format(m, lm.svres))
-        local[m] = lm
-        active_modes.append(m)
-        log.info("{}: {} (svace {})".format(m, lm.svres, lm.svace_version or '?'))
-    if not active_modes:
-        return finish('SKIPPED', "нет режимов для выгрузки")
+    # --- Локальные результаты OB ---
+    lm = LocalMode(product, MODE_DIR)
+    if lm.error:
+        return finish('FAILED', lm.error)
+    newest = max(hashes['max_mtime'].values())
+    if newest > os.path.getmtime(lm.svres):
+        if not args.force:
+            return finish('FAILED', "исходники изменены после анализа ({}), перезапустите "
+                                    "svace-analyze.py (обход: --force)".format(lm.svres))
+        log.warn("--force: исходники изменены после анализа")
+    log.info("Результаты: {} (svace {})".format(lm.svres, lm.svace_version or '?'))
 
     # --- Блокировка и снимок сервера ---
     lock = ProductLock(product)
@@ -704,21 +765,25 @@ def process_product(product, modes, args, api, hasher, log):
             raw = api.snapshots(project_id, branch_id) if project_id and branch_id else []
         except Exception as e:
             return finish('FAILED', "ошибка API: {}".format(e))
-        snaps = parse_snapshots(product, raw)
-        log.info("Снимок сервера: {} ob-снапшотов{}".format(
-            len(snaps), (": " + ', '.join(s['name'] for s in sorted(snaps, key=lambda s: (s['n'], s['name']))))
-            if snaps else ""))
 
-        warn_notes = []
+        snaps = sorted(parse_snapshots(product, raw), key=lambda s: (s['n'], s['stage'] or '', s['rc']))
+        counted = [s['name'] for s in snaps if is_counted(s)]
+        ignored = [s['name'] for s in snaps if not is_counted(s)]
+        log.info("Снимок сервера: учитываются [{}]".format(', '.join(counted)))
+        if ignored:
+            log.info("               игнорируются [{}]".format(', '.join(ignored)))
 
-        def compare_mode(mode, snap):
-            lm = local[mode]
+        warnings = []
+        verifier = None if args.no_snap_check else SnapVerifier(args, product, log)
+
+        def compare(snap):
             srv_info = parse_analysis_info_text(snap['details'].get('analysis-info') or '')
             srv_ver = srv_info.get('Svace version')
             if lm.svace_version and srv_ver and lm.svace_version != srv_ver:
                 return False, ["версия svace {} != {}".format(lm.svace_version, srv_ver)]
+            reasons = []
             no_hash = False
-            for lang in MODES[mode]['langs']:
+            for lang in LANG_EXTENSIONS:
                 for alg in HASH_ALGS:
                     name = field_name(lang, alg)
                     srv = cf_value(snap['details'], name)
@@ -726,10 +791,17 @@ def process_product(product, modes, args, api, hasher, log):
                         no_hash = True
                     elif srv != hashes[name]:
                         return False, ["{} отличается".format(name)]
-            reasons = []
             if no_hash:
-                warn_notes.append("{}: у {} нет хэшей исходников, сравнение только по срабатываниям".format(
-                    mode, snap['name']))
+                verdict = snap_sources_verdict(verifier, snap, hashes)
+                if verdict is False:
+                    return False, ["исходники отличаются (проверка по .snap)"]
+                if verdict is True:
+                    reasons.append("исходники совпадают (проверка по .snap)")
+                else:
+                    warnings.append("у {} нет хэшей исходников и проверка по .snap невозможна: "
+                                    "сравнение только по срабатываниям".format(snap['name']))
+            else:
+                reasons.append("хэши исходников совпадают")
             markers = api.fullmarkers(project_id, branch_id, snap['id'])
             srv_keys = markers_to_keys(markers, srv_info.get('Current directory') or lm.src_in_svres)
             loc_keys = lm.keys()
@@ -742,87 +814,64 @@ def process_product(product, modes, args, api, hasher, log):
             reasons.append("срабатывания совпадают ({})".format(sum(loc_keys.values())))
             return True, reasons
 
-        def sources_state(langs, top):
-            for lang in langs:
-                verdict = None
-                for snap in top:
-                    vals = [cf_value(snap['details'], field_name(lang, a)) for a in HASH_ALGS]
-                    if all(vals):
-                        verdict = all(v == hashes[field_name(lang, a)] for v, a in zip(vals, HASH_ALGS))
-                        break
-                if verdict is None:
-                    return None
-                if not verdict:
-                    return False
-            return True
-
         try:
-            plan = decide(active_modes, snaps, compare_mode, sources_state, args.force)
+            plan = decide(snaps, compare)
         except Exception as e:
             return finish('FAILED', "ошибка сравнения: {}".format(e))
 
-        for w in warn_notes:
+        n = plan['iteration']
+        stage_rc = [s['name'] for s in snaps if s['rc'] and s['stage'] is not None and s['n'] == n - 1]
+        if plan['action'] == 'upload' and stage_rc:
+            warnings.append("разметка из [{}] не будет перенесена ресивером в {} "
+                            "(ресивер ищет {})".format(', '.join(stage_rc), snapshot_name(product, n),
+                                                       snapshot_name(product, n - 1) + "_rc"))
+        for w in warnings:
             log.warn(w)
-        for n in plan['notes']:
-            log.info("  " + n)
-        result['notes'] = warn_notes + plan['notes']
-        result['iteration'] = plan['iteration']
+        for note in plan['notes']:
+            log.info("  " + note)
+        result['notes'] = warnings + plan['notes']
+        result['iteration'] = n
+        name = snapshot_name(product, n)
+        result['snapshot'] = name
 
-        if plan['blocked']:
-            return finish('BLOCKED', plan['blocked'])
+        if plan['action'] == 'skip':
+            return finish('SKIPPED', "дубль {}".format(name))
 
-        for m in plan['skip']:
-            result['skipped'].append(snapshot_name(product, m, plan['iteration']))
-            log.info("SKIP {} (дубль)".format(snapshot_name(product, m, plan['iteration'])))
-
-        if not plan['upload']:
-            return finish('SKIPPED', "дубль v{}".format(plan['iteration']))
-
-        existing = set(s['name'] for s in snaps)
-        for m in plan['upload']:
-            name = snapshot_name(product, m, plan['iteration'])
-            if name in existing:
-                return finish('FAILED', "снапшот {} уже существует — решение противоречиво".format(name))
+        if any(s['name'] == name for s in snaps):
+            return finish('FAILED', "снапшот {} уже существует — решение противоречиво".format(name))
 
         if args.dry_run:
-            for m in plan['upload']:
-                log.info("DRY-RUN: выгрузил бы {}".format(snapshot_name(product, m, plan['iteration'])))
-            result['uploaded'] = [snapshot_name(product, m, plan['iteration']) for m in plan['upload']]
+            log.info("DRY-RUN: выгрузил бы {}".format(name))
             return finish('DRY-RUN')
 
         # --- Выгрузка ---
-        for m in plan['upload']:
-            name = snapshot_name(product, m, plan['iteration'])
-            lm = local[m]
-            store = os.path.join(lm.mode_dir, '.svacer-dir')
-            if os.path.isdir(store):
-                shutil.rmtree(store)  # чтобы upload отправил ровно одну запись
-            cmd = [args.svacer_bin, 'import', '--project', product, '--snapshot', name]
-            for lang in LANG_EXTENSIONS:
-                for alg in HASH_ALGS:
-                    cmd += ['--field', "{}:{}".format(field_name(lang, alg), hashes[field_name(lang, alg)])]
-            cmd += ['--field', "dedup_mode:{}".format(m), lm.mode_dir]
-            ok, _ = run_cmd(cmd, lm.mode_dir, log, "svacer import " + name)
-            if not ok:
-                return finish('FAILED', "import {}".format(name))
-            ok, out = run_cmd([args.svacer_bin, 'upload',
-                               '--host', upload_host_arg(args.host, args.port),
-                               '--user', args.user, '--password', args.password],
-                              lm.mode_dir, log, "svacer upload " + name)
-            if not ok:
-                return finish('FAILED', "upload {}".format(name))
-            found = re.search(r'Found (\d+) records', out)
-            if found and found.group(1) != '1':
-                log.warn("upload отправил {} записей вместо 1".format(found.group(1)))
-            result['uploaded'].append(name)
+        store = os.path.join(lm.mode_dir, '.svacer-dir')
+        if os.path.isdir(store):
+            shutil.rmtree(store)  # чтобы upload отправил ровно одну запись
+        cmd = [args.svacer_bin, 'import', '--project', product, '--snapshot', name]
+        for lang in LANG_EXTENSIONS:
+            for alg in HASH_ALGS:
+                cmd += ['--field', "{}:{}".format(field_name(lang, alg), hashes[field_name(lang, alg)])]
+        cmd += ['--field', "dedup_mode:{}".format(MODE_DIR), lm.mode_dir]
+        ok, _ = run_cmd(cmd, lm.mode_dir, log, "svacer import " + name)
+        if not ok:
+            return finish('FAILED', "import {}".format(name))
+        ok, out = run_cmd([args.svacer_bin, 'upload',
+                           '--host', upload_host_arg(args.host, args.port),
+                           '--user', args.user, '--password', args.password],
+                          lm.mode_dir, log, "svacer upload " + name)
+        if not ok:
+            return finish('FAILED', "upload {}".format(name))
+        found = re.search(r'Found (\d+) records', out)
+        if found and found.group(1) != '1':
+            log.warn("upload отправил {} записей вместо 1".format(found.group(1)))
 
         # --- Контроль на сервере ---
         try:
             project_id, branch_id = api.find_project(product)
             names = set(s.get('name') for s in api.snapshots(project_id, branch_id))
-            lost = [n for n in result['uploaded'] if n not in names]
-            if lost:
-                return finish('FAILED', "после выгрузки не найдены на сервере: {}".format(', '.join(lost)))
+            if name not in names:
+                return finish('FAILED', "после выгрузки {} не найден на сервере".format(name))
         except Exception as e:
             log.warn("контроль после выгрузки не выполнен: {}".format(e))
 
@@ -834,33 +883,20 @@ def process_product(product, modes, args, api, hasher, log):
 # =============================================================================
 # ОСНОВНОЙ ЦИКЛ
 # =============================================================================
-def select_modes(args):
-    if args.only_python:
-        return ['PY']
-    if args.only_javascript:
-        return ['JS']
-    if args.separate:
-        return ['PY', 'JS']
-    return ['OB']
-
-
-def discover_products(modes):
+def discover_products():
     if not os.path.isdir(SVACE_WORK_DIR):
         return []
     return sorted(p for p in os.listdir(SVACE_WORK_DIR)
-                  if any(os.path.isdir(os.path.join(SVACE_WORK_DIR, p, m, '.svace-dir')) for m in modes))
+                  if os.path.isdir(os.path.join(SVACE_WORK_DIR, p, MODE_DIR, '.svace-dir')))
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Выгрузка результатов Svace в Svacer с дедупликацией',
+    parser = argparse.ArgumentParser(description='Выгрузка результатов Svace (OB) в Svacer с дедупликацией',
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--project', metavar='NAME', action='append', default=None)
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--only-python', action='store_true')
-    group.add_argument('--only-javascript', '--only-js', dest='only_javascript', action='store_true')
-    group.add_argument('--separate', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--force', action='store_true')
+    parser.add_argument('--no-snap-check', action='store_true')
     parser.add_argument('--host', default=DEFAULT_HOST)
     parser.add_argument('--port', default=DEFAULT_PORT)
     parser.add_argument('--user', default=DEFAULT_USER)
@@ -869,7 +905,6 @@ def main():
     parser.add_argument('--timeout', type=int, default=300)
     args = parser.parse_args()
 
-    modes = select_modes(args)
     for d in ('', 'projects', 'locks'):
         os.makedirs(os.path.join(LOG_DIR, d), exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -878,7 +913,7 @@ def main():
 
     log.info("BASE_DIR : {}".format(BASE_DIR))
     log.info("Сервер   : {}:{} (user {})".format(args.host, args.port, args.user))
-    log.info("Режимы   : {}{}{}".format(', '.join(modes), "  [DRY-RUN]" if args.dry_run else "",
+    log.info("Режим    : OB{}{}".format("  [DRY-RUN]" if args.dry_run else "",
                                         "  [FORCE]" if args.force else ""))
 
     try:
@@ -890,12 +925,11 @@ def main():
         log.error("Хэширование недоступно: {}".format(e))
         sys.exit(2)
 
-    if not args.dry_run:
-        try:
-            subprocess.run([args.svacer_bin, '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except OSError:
-            log.error("svacer не найден: {}".format(args.svacer_bin))
-            sys.exit(2)
+    try:
+        subprocess.run([args.svacer_bin, '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        log.error("svacer не найден: {}".format(args.svacer_bin))
+        sys.exit(2)
 
     api = SvacerApi(args.host, args.port, args.user, args.password, args.timeout)
     try:
@@ -905,37 +939,36 @@ def main():
         log.error("Авторизация на сервере не удалась: {}".format(e))
         sys.exit(2)
 
-    products = args.project or discover_products(modes)
+    products = args.project or discover_products()
     if not products:
-        log.error("Нет изделий с результатами режимов {} в {}".format(', '.join(modes), SVACE_WORK_DIR))
+        log.error("Нет изделий с результатами svace/PROJ/{}/ в {}".format(MODE_DIR, SVACE_WORK_DIR))
         sys.exit(1)
     log.info("Изделий: {} ({})".format(len(products), ', '.join(products)))
 
     results = []
     for product in products:
         try:
-            results.append(process_product(product, modes, args, api, hasher, log))
+            results.append(process_product(product, args, api, hasher, log))
         except Exception as e:
             log.project_log = None
             log.error("{}: непредвиденная ошибка: {}".format(product, e))
             results.append({'product': product, 'status': 'FAILED', 'message': str(e),
-                            'uploaded': [], 'skipped': [], 'notes': [], 'iteration': None})
+                            'iteration': None, 'snapshot': None, 'notes': []})
 
     log.info("")
     log.info("=" * 60)
     log.info("ИТОГ")
     for r in results:
-        detail = ', '.join(r['uploaded']) or ', '.join(r['skipped']) or r.get('message', '')
-        log.info("  {:<10} {:<24} {}".format(r['status'], r['product'], detail))
+        log.info("  {:<10} {:<24} {}".format(r['status'], r['product'],
+                                             r.get('snapshot') or r.get('message', '')))
 
     report = os.path.join(LOG_DIR, "run_{}.json".format(stamp))
     with open(report, 'w', encoding='utf-8') as f:
-        json.dump({'started': stamp, 'modes': modes, 'dry_run': args.dry_run, 'results': results},
+        json.dump({'started': stamp, 'dry_run': args.dry_run, 'results': results},
                   f, ensure_ascii=False, indent=2)
     log.info("Отчёт: {}".format(report))
 
-    bad = [r for r in results if r['status'] in ('FAILED', 'BLOCKED')]
-    sys.exit(1 if bad else 0)
+    sys.exit(1 if any(r['status'] == 'FAILED' for r in results) else 0)
 
 
 if __name__ == '__main__':
