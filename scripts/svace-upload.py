@@ -37,8 +37,10 @@ svace-upload.py — Выгрузка результатов Svace (OB) в Svacer
     (svacer server export): множество md5 файлов снапшота против файлов src.
     Если проверить нельзя — сравнение только по срабатываниям с [WARN].
 
-    Разметка из PROJ_<Этап>_ob_vN_rc ресивером в PROJ_ob_v(N+1) не переносится
-    (ресивер ищет PROJ_ob_vN_rc) — в этом случае выводится [WARN].
+    Разметку разработчика в новый PROJ_ob_v(N+1) переносит ресивер, строго
+    последовательно: сначала PROJ_ob_vN_rc (приоритет), затем
+    PROJ_<Этап>_ob_vN_rc всех этапов по имени. Скрипт выводит этот порядок
+    в лог, чтобы его можно было сверить с логом ресивера.
 
     При старте выполняется самопроверка алгоритмов на эталонном файле
     test/ensure-natural-number-value.js. ГОСТ считается через rhash
@@ -615,6 +617,17 @@ def snapshot_name(product, n):
     return "{}_{}_v{}".format(product, TRACK, n)
 
 
+def receiver_sources(snaps, n):
+    """
+    Снапшоты, из которых ресивер перенесёт разметку в PROJ_ob_vN, в порядке
+    применения: PROJ_ob_v(N-1)_rc, затем PROJ_<Этап>_ob_v(N-1)_rc по имени.
+    """
+    rc = [s for s in snaps if s['rc'] and s['n'] == n - 1]
+    own = [s['name'] for s in rc if s['stage'] is None]
+    stages = sorted(s['name'] for s in rc if s['stage'] is not None)
+    return own + stages
+
+
 def cf_value(details, name):
     value = (details.get('custom_fields') or {}).get(name)
     if isinstance(value, list):
@@ -820,11 +833,10 @@ def process_product(product, args, api, hasher, log):
             return finish('FAILED', "ошибка сравнения: {}".format(e))
 
         n = plan['iteration']
-        stage_rc = [s['name'] for s in snaps if s['rc'] and s['stage'] is not None and s['n'] == n - 1]
-        if plan['action'] == 'upload' and stage_rc:
-            warnings.append("разметка из [{}] не будет перенесена ресивером в {} "
-                            "(ресивер ищет {})".format(', '.join(stage_rc), snapshot_name(product, n),
-                                                       snapshot_name(product, n - 1) + "_rc"))
+        sources = receiver_sources(snaps, n)
+        if plan['action'] == 'upload' and sources:
+            plan['notes'].append("ресивер перенесёт разметку в {} по порядку: {}".format(
+                snapshot_name(product, n), ' -> '.join(sources)))
         for w in warnings:
             log.warn(w)
         for note in plan['notes']:
