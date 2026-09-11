@@ -244,6 +244,15 @@ import time
 from pathlib import Path
 from datetime import datetime
 
+# Защита от UnicodeEncodeError при печати путей/имён с битой кодировкой
+# (суррогатные символы из неверно закодированной кириллицы и т.п.).
+# reconfigure доступен с Python 3.7 — заменяем ошибочные символы вместо краха.
+try:
+    sys.stdout.reconfigure(errors='replace')
+    sys.stderr.reconfigure(errors='replace')
+except (AttributeError, Exception):
+    pass
+
 # Глобальный таймер — время старта скрипта
 _SCRIPT_START = time.monotonic()
 
@@ -255,6 +264,19 @@ def _ts():
     m = (elapsed % 3600) // 60
     s = elapsed % 60
     return "[{:02d}:{:02d}:{:02d}]".format(h, m, s)
+
+
+def _safe(s):
+    """
+    Делает строку безопасной для print — заменяет суррогатные и
+    невалидные символы. Нужно для имён файлов/путей с битой кодировкой
+    (например кириллица в неверной кодировке даёт суррогаты, которые
+    ломают print с UnicodeEncodeError).
+    """
+    try:
+        return str(s).encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+    except Exception:
+        return repr(s)
 
 # =============================================================================
 # НАСТРАИВАЕМЫЕ ПУТИ
@@ -2750,7 +2772,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     print(_ts() + "   Buildography files found: {}".format(len(buildography_files)))
     for f in buildography_files:
-        print(_ts() + "     {}".format(os.path.basename(f)))
+        print(_ts() + "     {}".format(_safe(os.path.basename(f))))
 
     sources_dir = os.path.join(RESULTS_DIR, project_name, "sources")
     signatures_pattern = os.path.join(sources_dir, "*_src.json")
@@ -2761,7 +2783,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     print(_ts() + "   Source signature files found: {}".format(len(signatures_files)))
     for f in signatures_files:
-        print(_ts() + "     {}".format(os.path.basename(f)))
+        print(_ts() + "     {}".format(_safe(os.path.basename(f))))
 
     output_dir = os.path.join(RESULTS_DIR, project_name, "izb")
     os.makedirs(output_dir, exist_ok=True)
