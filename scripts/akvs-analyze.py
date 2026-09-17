@@ -293,6 +293,42 @@ def fresh_copytree(src, dst):
     shutil.copytree(src, dst)
 
 
+def zip_sources(src_dir, zip_path, log):
+    """Пакует СОДЕРЖИМОЕ src_dir в zip_path (без верхней папки src).
+
+    Все симлинки пропускаются — и битые, и валидные. Битые симлинки
+    (напр. шрифты/сертификаты из prebuild-дистрибутива) ломают штатный
+    архиватор клиента (FileNotFoundError при упаковке). Здесь мы кладём
+    только реальные файлы, поэтому упаковка не падает. Возвращает число
+    упакованных файлов и число пропущенных симлинков.
+    """
+    packed = 0
+    skipped_links = 0
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, dirnames, filenames in os.walk(src_dir):
+            # не заходим в каталоги-симлинки (и не тащим их)
+            dirnames[:] = [d for d in dirnames
+                           if not os.path.islink(os.path.join(dirpath, d))]
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full):
+                    skipped_links += 1
+                    continue
+                if not os.path.isfile(full):   # на всякий случай — только обычные файлы
+                    continue
+                arcname = os.path.relpath(full, src_dir)   # без верхней папки src
+                try:
+                    zf.write(full, arcname)
+                    packed += 1
+                except (OSError, IOError) as e:
+                    skipped_links += 1
+                    log.error("пропущен файл при упаковке: {} ({})".format(arcname, e))
+    log.info("Упаковано в zip: файлов={}, пропущено симлинков={}".format(packed, skipped_links))
+    return packed, skipped_links
+
+
 # =============================================================================
 # КОМАНДЫ АК-ВС
 # =============================================================================
@@ -416,9 +452,17 @@ def process_project(project, cfg, keep_raw):
 
         # ---------- 1. СТАТИКА ----------
         stage = "static"
+        # Пакуем исходники сами (штатным zipfile, все симлинки пропускаем).
+        # Так обходим падение клиентского архиватора на битых симлинках
+        # (шрифты/сертификаты из prebuild-дистрибутивов).
+        src_zip = os.path.join(work, "src.zip")
+        packed, _ = zip_sources(src_dir, src_zip, log)
+        if packed == 0:
+            raise StageError(stage, "в исходниках нет файлов для упаковки (пустой src)")
+
         cmd = [cfg['java'], '-jar', cfg['jar'], 'analyze', 'static'] \
             + auth_args(cfg) + ['-n', project, '-l', str(cfg['level']),
-                                '-i', src_dir, '-o', static_out]
+                                '-i', src_zip, '-o', static_out]
         for d in STATIC_DOWNLOAD:
             cmd += ['-sd', d]
         if not run_cmd(cmd, BASE_DIR, log, "analyze static"):
