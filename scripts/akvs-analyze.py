@@ -338,26 +338,39 @@ def auth_args(cfg):
 
 
 def akvs_delete_project(cfg, project, log):
-    """Удаление одного проекта по имени (тихо — не роняет прогон)."""
+    """Удаление одного проекта по имени. Возвращает True при успехе."""
     cmd = [cfg['java'], '-jar', cfg['jar'], 'project', 'delete'] \
         + auth_args(cfg) + ['-n', project]
-    run_cmd(cmd, BASE_DIR, log, "project delete")
+    return run_cmd(cmd, BASE_DIR, log, "project delete")
 
 
 def akvs_list_projects(cfg, log):
-    """Возвращает список имён проектов на сервере (или [] при ошибке)."""
+    """Список имён проектов на сервере.
+
+    Возвращает (names, ok):
+      names — список имён (может быть пустым);
+      ok    — True если сервер ответил корректно, False при ошибке связи
+              (сервер недоступен/несовместим). Нужно, чтобы отличать
+              'проектов нет' от 'сервер не ответил'.
+    """
     cmd = [cfg['java'], '-jar', cfg['jar'], 'project', 'list'] + auth_args(cfg)
     try:
         result = subprocess.run(cmd, cwd=BASE_DIR,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except Exception as e:
         log.error("project list: ошибка запуска: {}".format(e))
-        return []
+        return [], False
     out = result.stdout.decode('utf-8', errors='replace')
+    err = result.stderr.decode('utf-8', errors='replace')
+    if result.returncode != 0:
+        log.error("project list: код {} ({})".format(
+            result.returncode, (err.strip() or out.strip())[:200]))
+        return [], False
     # Формат вывода:
     #   [INFO] Projects:
     #   - name1
     #   - name2
+    # либо '[INFO] Projects: empty' когда пусто.
     names = []
     for line in out.splitlines():
         s = line.strip()
@@ -365,17 +378,26 @@ def akvs_list_projects(cfg, log):
             name = s[2:].strip()
             if name:
                 names.append(name)
-    return names
+    return names, True
 
 
 def akvs_purge_slot(cfg, log):
-    """Освобождает слот: удаляет ВСЕ проекты на сервере (сервер однопроектный)."""
-    names = akvs_list_projects(cfg, log)
+    """Освобождает слот: удаляет ВСЕ проекты на сервере (сервер однопроектный).
+
+    Возвращает список проектов, которые удалить НЕ удалось (для предупреждений).
+    """
+    names, ok = akvs_list_projects(cfg, log)
+    if not ok:
+        log.error("СЕРВЕР НЕДОСТУПЕН при очистке слота — проекты могли остаться")
+        return []
     if not names:
-        return
+        return []
     log.info("На сервере найдены проекты: {} — удаляю все".format(', '.join(names)))
+    not_deleted = []
     for name in names:
-        akvs_delete_project(cfg, name, log)
+        if not akvs_delete_project(cfg, name, log):
+            not_deleted.append(name)
+    return not_deleted
 
 
 def akvs_download_server_log(cfg, project, stage, log):
@@ -411,7 +433,7 @@ def akvs_download_server_log(cfg, project, stage, log):
 # =============================================================================
 # ОБРАБОТКА ОДНОГО ПРОЕКТА
 # =============================================================================
-def process_project(project, cfg, keep_raw):
+def process_project(project, cfg, keep_raw, leftovers):
     log = ProjectLogger(project)
     log.start_run()
 
@@ -445,6 +467,7 @@ def process_project(project, cfg, keep_raw):
 
     status = "success"
     stage = None
+    fail_stage = None
     try:
         # Освобождаем слот: сервер держит один проект за раз, поэтому
         # удаляем ВСЁ, что осталось от прошлых прогонов/тестов.
@@ -537,21 +560,39 @@ def process_project(project, cfg, keep_raw):
 
     except StageError as e:
         status = "failed"
+        fail_stage = e.stage
         log.error("Стадия '{}': {}".format(e.stage, e.message))
-        try:
-            akvs_download_server_log(cfg, project, e.stage, log)
-        except Exception as le:
-            log.error("Не удалось скачать логи с сервера: {}".format(le))
     except Exception as e:
         status = "failed"
+        fail_stage = stage or "static"
         log.error("Непредвиденная ошибка на стадии '{}': {}".format(stage, e))
-        try:
-            akvs_download_server_log(cfg, project, stage or "static", log)
-        except Exception as le:
-            log.error("Не удалось скачать логи с сервера: {}".format(le))
     finally:
-        # Проект на сервере удаляем ВСЕГДА (сервер держит только один проект)
-        akvs_delete_project(cfg, project, log)
+        # При ошибке — СНАЧАЛА тянем серверный лог, и только ПОТОМ удаляем
+        # проект (после delete логи уже не скачать). Оба шага в finally,
+        # чтобы порядок соблюдался при любом пути выхода.
+        if status == "failed":
+            try:
+                akvs_download_server_log(cfg, project, fail_stage or "static", log)
+            except Exception as le:
+                log.error("Не удалось скачать логи с сервера: {}".format(le))
+
+        # Проект на сервере удаляем ВСЕГДА (сервер держит только один проект).
+        # ВАЖНО: лицензия сервера = 1 проект, поэтому незакрытый «хвост»
+        # роняет сервер при следующем старте. Отслеживаем неудачи явно.
+        deleted = akvs_delete_project(cfg, project, log)
+        if not deleted:
+            # Проверяем, действительно ли проект остался на сервере
+            names, ok = akvs_list_projects(cfg, log)
+            if not ok:
+                log.error("НЕ УДАЛОСЬ УДАЛИТЬ проект и сервер недоступен — "
+                          "проект '{}' МОГ остаться на сервере".format(project))
+                if project not in leftovers:
+                    leftovers.append(project)
+            elif project in names:
+                log.error("ПРОЕКТ '{}' ОСТАЛСЯ НА СЕРВЕРЕ — удалите вручную, "
+                          "иначе сервер может упасть по лимиту лицензии".format(project))
+                leftovers.append(project)
+
         # Чистка сырых выгрузок / рабочих файлов, если не --keep-raw
         if not keep_raw:
             if os.path.isdir(work):
@@ -634,10 +675,26 @@ def main():
     print("Проектов к анализу: {}".format(len(projects)))
     print("Список: {}".format(', '.join(projects)))
 
+    # Проверка сервера ДО старта: если недоступен — не начинаем, чтобы не
+    # плодить полусозданные проекты (сервер держит только 1 проект).
+    class _PreLog(object):
+        def info(self, m): print("    {}".format(m))
+        def error(self, m): print("    [ERROR] {}".format(m))
+    names0, ok0 = akvs_list_projects(cfg, _PreLog())
+    if not ok0:
+        print("\n[ОШИБКА] Сервер {}:{} недоступен (project list не ответил).".format(
+            cfg['server'], cfg['port']))
+        print("   Проверьте, что сервер запущен и совместим, затем повторите.")
+        sys.exit(1)
+    if names0:
+        print("[ВНИМАНИЕ] На сервере уже есть проекты: {}".format(', '.join(names0)))
+        print("           Они будут удалены при очистке слота перед каждым проектом.")
+
     start_time = datetime.now()
     results = {}
+    leftovers = []   # проекты, которые НЕ удалось удалить с сервера
     for project in projects:
-        results[project] = process_project(project, cfg, args.keep_raw)
+        results[project] = process_project(project, cfg, args.keep_raw, leftovers)
 
     elapsed = datetime.now() - start_time
     success = [p for p, s in results.items() if s == "success"]
@@ -664,7 +721,23 @@ def main():
         for p in skipped:
             print("  - {}".format(p))
 
-    sys.exit(0 if not failed else 1)
+    # Уровень 1+2: громкое предупреждение о «хвостах» на сервере.
+    # Лицензия сервера = 1 проект, поэтому незакрытые проекты при следующем
+    # старте роняют сервер в цикл падений (Too many projects for this license).
+    if leftovers:
+        uniq = sorted(set(leftovers))
+        print("\n" + "!" * 60)
+        print("ВНИМАНИЕ: следующие проекты, возможно, ОСТАЛИСЬ на сервере:")
+        for p in uniq:
+            print("  - {}".format(p))
+        print("Удалите их вручную, иначе сервер может упасть по лимиту лицензии:")
+        print("  java -jar {} project delete -s {} -p {} -n <ИМЯ>".format(
+            cfg['jar'], cfg['server'], cfg['port']))
+        print("Проверить слот: project list. Если сервер уже в цикле падений —")
+        print("почистите БД: mongo akvs3 --eval 'db.projects.deleteMany({})'")
+        print("!" * 60)
+
+    sys.exit(0 if (not failed and not leftovers) else 1)
 
 
 if __name__ == '__main__':
