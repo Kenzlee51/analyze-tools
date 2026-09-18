@@ -22,13 +22,25 @@ TRANSLIT_TABLE = {
 
 ENCODINGS = ('cp1251', 'koi8-r', 'cp866', 'iso8859-5')
 
-def decode_filename(broken_name):
-    """Пытается восстановить читаемую кириллицу, если имя сломано."""
+
+def is_broken(name):
+    """True, если имя нельзя закодировать в чистый UTF-8 (битые байты/суррогаты)."""
     try:
-        broken_name.encode('utf-8', 'strict')
-        return broken_name   # имя уже корректное
+        name.encode('utf-8', 'strict')
+        return False
     except UnicodeEncodeError:
-        pass
+        return True
+
+
+def decode_filename(broken_name):
+    """Пытается восстановить читаемую кириллицу, если имя сломано.
+
+    Имена, распакованные из архивов cp1251/koi8-r/cp866 в UTF-8-системе,
+    Python отдаёт с суррогатами (surrogateescape). Раскодируем обратно в
+    правильный UTF-8, перебирая кодировки и проверяя round-trip.
+    """
+    if not is_broken(broken_name):
+        return broken_name  # имя уже корректное
     name_bytes = broken_name.encode('utf-8', 'surrogateescape')
     for enc in ENCODINGS:
         try:
@@ -39,8 +51,10 @@ def decode_filename(broken_name):
             continue
     return broken_name
 
+
 def translit(text):
     return ''.join(TRANSLIT_TABLE.get(ch, ch) for ch in text)
+
 
 def normalize_name(original_name):
     name = translit(original_name)
@@ -51,53 +65,97 @@ def normalize_name(original_name):
     name = name.strip('_')
     return name
 
+
 def get_unique_name(directory, desired_name):
     if not os.path.exists(os.path.join(directory, desired_name)):
         return desired_name
+    base, ext = os.path.splitext(desired_name)
     counter = 1
     while True:
-        candidate = "{}_{}".format(desired_name, counter)
+        candidate = "{}_{}{}".format(base, counter, ext)
         if not os.path.exists(os.path.join(directory, candidate)):
             return candidate
         counter += 1
 
+
+def repair_tree(content_dir):
+    """Рекурсивно чинит битые имена файлов и папок в content_dir.
+
+    Вариант A: чиним ТОЛЬКО кодировку (битые имена -> валидный UTF-8,
+    кириллица сохраняется как есть). Корректные имена не трогаем —
+    без транслита и приведения к верхнему регистру.
+
+    Обход снизу вверх (сначала самые глубокие пути): переименование
+    ребёнка не ломает ещё не обработанный путь родителя.
+    """
+    if not os.path.isdir(content_dir):
+        print("Ошибка: директория {!r} не существует.".format(content_dir))
+        return 0
+
+    # Собираем все пути (файлы и папки), сортируем по глубине по убыванию.
+    entries = []
+    for root, dirs, files in os.walk(content_dir):
+        for name in files:
+            entries.append(os.path.join(root, name))
+        for name in dirs:
+            entries.append(os.path.join(root, name))
+    entries.sort(key=lambda p: p.count(os.sep), reverse=True)
+
+    renamed = 0
+    skipped = 0
+    for path in entries:
+        parent = os.path.dirname(path)
+        name = os.path.basename(path)
+        if not is_broken(name):
+            continue  # имя нормальное — не трогаем
+
+        new_name = decode_filename(name)
+        if is_broken(new_name) or new_name == name:
+            # раскодировать не удалось ни одной кодировкой
+            print("  [WARN] не удалось раскодировать имя: {!r} — пропускаю".format(name))
+            skipped += 1
+            continue
+
+        final_name = get_unique_name(parent, new_name)
+        old_path = os.path.join(parent, name)
+        new_path = os.path.join(parent, final_name)
+        try:
+            shutil.move(old_path, new_path)
+            print("  Починено: {!r} -> {}".format(name, final_name))
+            renamed += 1
+        except Exception as e:
+            print("  [WARN] ошибка переименования {!r}: {}".format(name, e))
+            skipped += 1
+
+    print("Готово. Починено имён: {}, пропущено: {}".format(renamed, skipped))
+    return renamed
+
+
 def main():
-    # Корень проекта – на два уровня выше, чем lib/
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    target_dir = os.path.join(base_dir, 'src')
+    # --content-dir DIR — директория для обработки. Если не указана,
+    # берём src/ рядом с корнем проекта (обратная совместимость).
+    content_dir = None
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == '--content-dir':
+            if i + 1 < len(args):
+                content_dir = args[i + 1]
+                i += 2
+                continue
+            print("Ошибка: --content-dir требует путь.")
+            sys.exit(1)
+        else:
+            # позиционный аргумент тоже принимаем как каталог
+            content_dir = args[i]
+            i += 1
+    if content_dir is None:
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        content_dir = os.path.join(base_dir, 'src')
 
-    if not os.path.isdir(target_dir):
-        print("Ошибка: директория {} не существует или не является папкой.".format(target_dir))
-        sys.exit(1)
+    print("Чиню имена (только битые) в: {}".format(content_dir))
+    repair_tree(content_dir)
 
-    print("Работаем с директорией проектов: {}".format(target_dir))
-    renamed_count = 0
-    with os.scandir(target_dir) as entries:
-        for entry in entries:
-            if entry.is_dir():   # обрабатываем только папки
-                raw_name = entry.name
-                original_name = decode_filename(raw_name)
-                print("Обнаружена папка: {!r} -> раскодировано как {!r}".format(raw_name, original_name))
-
-                new_name = normalize_name(original_name)
-                if not new_name:
-                    print("  Предупреждение: для {!r} получено пустое имя, пропускаем.".format(original_name))
-                    continue
-                if new_name == original_name:
-                    continue
-
-                final_name = get_unique_name(target_dir, new_name)
-                old_path = entry.path
-                new_path = os.path.join(target_dir, final_name)
-
-                try:
-                    print("  Переименовываем: {!r} -> {}".format(raw_name, final_name))
-                    shutil.move(old_path, new_path)
-                    renamed_count += 1
-                except Exception as e:
-                    print("  Ошибка при переименовании {!r}: {}".format(raw_name, e))
-
-    print("Готово. Переименовано папок: {}".format(renamed_count))
 
 if __name__ == "__main__":
     main()
