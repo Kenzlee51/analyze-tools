@@ -141,7 +141,7 @@ mongo ${MONGO_DB} --quiet --eval 'printjson(db.projects.deleteMany({}))'
 
 echo "[remote] Удаление папок проектов из ${PROJECTS_DIR} ..."
 if [ -d "${PROJECTS_DIR}" ]; then
-    echo "${SUDO_PASS}" | sudo -S -p "" bash -c 'rm -rf "${0}"/* ' "${PROJECTS_DIR}"
+    echo "${SUDO_PASS}" | sudo -S -p "" rm -rf "${PROJECTS_DIR}"/* || { echo "[remote] ОШИБКА rm (sudo?)"; exit 3; }
     echo "[remote] Готово. Осталось в папке:"
     ls -1 "${PROJECTS_DIR}" 2>/dev/null | sed 's/^/    - /' || echo "    (пусто)"
 else
@@ -167,7 +167,7 @@ echo
 echo "== Проверка после очистки (даём сервису ~20с на старт) =="
 sleep 20
 echo "  Проекты в БД:"
-run_ssh "mongo ${MONGO_DB} --quiet --eval 'var n=db.projects.countDocuments({}); print(\"    всего: \"+n)'" \
+run_ssh "mongo ${MONGO_DB} --quiet --eval 'print(\"    всего: \"+db.projects.find().count())'" \
     || echo "    (не удалось проверить)"
 echo "  Папки на диске:"
 run_ssh "ls -1 '${PROJECTS_DIR}' 2>/dev/null | sed 's/^/    - /' || echo '    (пусто)'"
