@@ -10,15 +10,17 @@ regex = "\[.*\]"
 regex1 = "[0-9]+\:[0-9]+"
 regex2 = "\"[0-9]+\:[0-9]+\":\[\"[0-9\:\"\,]*\"]"
 
-countFileInPath = len([name for name in os.listdir('./dyn/data/fo_without_def')])
-lNameFile = [name for name in os.listdir('./dyn/data/fo_without_def')]
+# Файлы данных чанков — это те, что НЕ начинаются с 'calls_' (0.js, 1.js, ...).
+# Их парные файлы вызовов — 'calls_' + имя. НЕ полагаемся на порядок os.listdir:
+# раньше брали первую половину списка, и если calls_-файл попадал в первую
+# половину, получалось имя 'calls_calls_0.js' -> FileNotFoundError.
+allNamesFO = os.listdir('./dyn/data/fo_without_def')
+dataNamesFO = [name for name in allNamesFO if not name.startswith('calls_')]
 
 lStr_fo_without_def = []
 lStr_fo_without_def_calls = []
 lStr_fo_without_def_calls_copy = []
-countFile = int(countFileInPath/2)
-for item in range(countFile):
-	nameFile = lNameFile[item]
+for nameFile in dataNamesFO:
 	pathFile = './dyn/data/fo_without_def/'+nameFile
 	pathFileCalls = './dyn/data/fo_without_def/calls_'+nameFile
 	with open(pathFile) as file_fo_without_def:
