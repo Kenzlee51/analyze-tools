@@ -114,6 +114,29 @@ LIB_SUBDIR = os.path.join("lib", "akvs")
 STATIC_DOWNLOAD  = ["data"]           # для dyn.py достаточно data/*.js
 DYNAMIC_DOWNLOAD = ["html", "data"]   # html — база отчёта, data — за metrics.json
 
+# Расширения исходников, которые анализирует АК-ВС 3 (C/C++, Java, C#, Go,
+# JavaScript, PHP, Python, Perl). В src.zip пакуются ТОЛЬКО файлы с этими
+# расширениями (без учёта регистра). Файлы других языков и файлы без
+# расширения не упаковываются. Отключается флагом --no-lang-filter.
+AKVS_SOURCE_EXTS = {
+    # C/C++
+    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".c++", ".h++",
+    # Java
+    ".java",
+    # C#
+    ".cs", ".csx",
+    # Go
+    ".go",
+    # JavaScript
+    ".js", ".mjs", ".cjs", ".jsx",
+    # PHP
+    ".php", ".php3", ".php4", ".php5", ".php7", ".phtml",
+    # Python
+    ".py", ".pyx", ".pxd", ".pyi",
+    # Perl
+    ".pl", ".pm", ".t", ".pod",
+}
+
 # =============================================================================
 
 BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -293,17 +316,22 @@ def fresh_copytree(src, dst):
     shutil.copytree(src, dst)
 
 
-def zip_sources(src_dir, zip_path, log):
+def zip_sources(src_dir, zip_path, log, lang_filter=True):
     """Пакует СОДЕРЖИМОЕ src_dir в zip_path (без верхней папки src).
 
-    Все симлинки пропускаются — и битые, и валидные. Битые симлинки
-    (напр. шрифты/сертификаты из prebuild-дистрибутива) ломают штатный
-    архиватор клиента (FileNotFoundError при упаковке). Здесь мы кладём
-    только реальные файлы, поэтому упаковка не падает. Возвращает число
-    упакованных файлов и число пропущенных симлинков.
+    - Все симлинки пропускаются (и битые, и валидные): битые симлинки
+      (шрифты/сертификаты из prebuild-дистрибутивов) ломают штатный
+      архиватор клиента. Кладём только реальные файлы.
+    - При lang_filter=True (по умолчанию) пакуются ТОЛЬКО файлы с
+      расширениями языков АК-ВС (AKVS_SOURCE_EXTS), без учёта регистра.
+      Файлы других языков и файлы без расширения не упаковываются —
+      это резко уменьшает объём и снимает нагрузку с сервера.
+      Отключается флагом --no-lang-filter (lang_filter=False).
+    Возвращает (packed, skipped_links, skipped_ext).
     """
     packed = 0
     skipped_links = 0
+    skipped_ext = 0
     if os.path.exists(zip_path):
         os.remove(zip_path)
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -316,8 +344,14 @@ def zip_sources(src_dir, zip_path, log):
                 if os.path.islink(full):
                     skipped_links += 1
                     continue
-                if not os.path.isfile(full):   # на всякий случай — только обычные файлы
+                if not os.path.isfile(full):   # только обычные файлы
                     continue
+                if lang_filter:
+                    ext = os.path.splitext(name)[1].lower()
+                    # без расширения -> ext == "" -> не проходит фильтр
+                    if ext not in AKVS_SOURCE_EXTS:
+                        skipped_ext += 1
+                        continue
                 arcname = os.path.relpath(full, src_dir)   # без верхней папки src
                 try:
                     zf.write(full, arcname)
@@ -325,8 +359,9 @@ def zip_sources(src_dir, zip_path, log):
                 except (OSError, IOError) as e:
                     skipped_links += 1
                     log.error("пропущен файл при упаковке: {} ({})".format(arcname, e))
-    log.info("Упаковано в zip: файлов={}, пропущено симлинков={}".format(packed, skipped_links))
-    return packed, skipped_links
+    log.info("Упаковано в zip: файлов={}, пропущено симлинков={}, "
+             "пропущено по расширению={}".format(packed, skipped_links, skipped_ext))
+    return packed, skipped_links, skipped_ext
 
 
 # =============================================================================
@@ -401,12 +436,17 @@ def akvs_purge_slot(cfg, log):
 
 
 def akvs_download_server_log(cfg, project, stage, log):
-    """Скачивание логов с сервера при ошибке -> logs/akvs/PROJ/serverlog/."""
+    """Скачивание логов с сервера -> logs/akvs/PROJ/serverlog/.
+
+    Набор типов зависит от стадии; для успешного прогона (stage='done')
+    качаем полный набор project+static+dynamic для контроля.
+    """
     types_by_stage = {
         'static': ['p', 's'],
         'dyn.py': ['p', 's'],
         'dynamic': ['p', 'd'],
         'end.py': ['p', 's', 'd'],
+        'done': ['p', 's', 'd'],   # успешный прогон — полный набор для контроля
     }
     wt = types_by_stage.get(stage, ['p'])
 
@@ -475,13 +515,17 @@ def process_project(project, cfg, keep_raw, leftovers):
 
         # ---------- 1. СТАТИКА ----------
         stage = "static"
-        # Пакуем исходники сами (штатным zipfile, все симлинки пропускаем).
-        # Так обходим падение клиентского архиватора на битых симлинках
-        # (шрифты/сертификаты из prebuild-дистрибутивов).
+        # Пакуем исходники сами (штатным zipfile):
+        #  - все симлинки пропускаем (обход падения клиентского архиватора
+        #    на битых симлинках из prebuild-дистрибутивов);
+        #  - по умолчанию пакуем только файлы языков АК-ВС (lang_filter).
         src_zip = os.path.join(work, "src.zip")
-        packed, _ = zip_sources(src_dir, src_zip, log)
+        packed, _, _ = zip_sources(src_dir, src_zip, log,
+                                   lang_filter=cfg.get('lang_filter', True))
         if packed == 0:
-            raise StageError(stage, "в исходниках нет файлов для упаковки (пустой src)")
+            raise StageError(stage, "нет файлов для упаковки (после фильтра по "
+                                    "расширениям языков АК-ВС пусто; проверьте "
+                                    "исходники или --no-lang-filter)")
 
         cmd = [cfg['java'], '-jar', cfg['jar'], 'analyze', 'static'] \
             + auth_args(cfg) + ['-n', project, '-l', str(cfg['level']),
@@ -567,14 +611,16 @@ def process_project(project, cfg, keep_raw, leftovers):
         fail_stage = stage or "static"
         log.error("Непредвиденная ошибка на стадии '{}': {}".format(stage, e))
     finally:
-        # При ошибке — СНАЧАЛА тянем серверный лог, и только ПОТОМ удаляем
-        # проект (после delete логи уже не скачать). Оба шага в finally,
-        # чтобы порядок соблюдался при любом пути выхода.
-        if status == "failed":
-            try:
-                akvs_download_server_log(cfg, project, fail_stage or "static", log)
-            except Exception as le:
-                log.error("Не удалось скачать логи с сервера: {}".format(le))
+        # Серверный лог тянем ВСЕГДА (и при успехе — для контроля), и строго
+        # ДО удаления проекта (после delete логи уже не скачать). При ошибке —
+        # набор под упавшую стадию, при успехе — полный (project+static+dynamic).
+        try:
+            akvs_download_server_log(
+                cfg, project,
+                (fail_stage or "static") if status == "failed" else "done",
+                log)
+        except Exception as le:
+            log.error("Не удалось скачать логи с сервера: {}".format(le))
 
         # Проект на сервере удаляем ВСЕГДА (сервер держит только один проект).
         # ВАЖНО: лицензия сервера = 1 проект, поэтому незакрытый «хвост»
@@ -616,6 +662,63 @@ def discover_all_projects():
     ])
 
 
+LOCK_PATH = os.path.join(WORK_ROOT, ".lock")
+
+
+def _pid_alive(pid):
+    """True, если процесс с таким PID существует."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_lock(force=False):
+    """Ставит лок от параллельного запуска. Возвращает True при успехе.
+
+    Сервер держит один проект за раз, поэтому два параллельных прогона
+    конфликтуют (снос чужого проекта, гонки). Лок это предотвращает.
+    Если найден протухший лок (процесс с записанным PID мёртв) — забираем его.
+    С force=True лок ставится принудительно поверх любого.
+    """
+    os.makedirs(WORK_ROOT, exist_ok=True)
+    if os.path.exists(LOCK_PATH) and not force:
+        old_pid = None
+        old_info = ""
+        try:
+            with open(LOCK_PATH) as f:
+                old_info = f.read().strip()
+            old_pid = int(old_info.split()[0])
+        except Exception:
+            old_pid = None
+        if old_pid and _pid_alive(old_pid):
+            print("\n[ОШИБКА] Уже идёт другой прогон (lock: {}).".format(old_info))
+            print("   Файл лока: {}".format(LOCK_PATH))
+            print("   Дождитесь завершения или запустите с --force, если уверены,")
+            print("   что другого прогона нет.")
+            return False
+        # лок протух (процесс мёртв) — заберём
+        print("[ИНФО] Найден протухший лок (PID {} не активен) — перезабираю".format(old_pid))
+    try:
+        with open(LOCK_PATH, 'w') as f:
+            f.write("{} {}".format(os.getpid(),
+                                   datetime.now().isoformat(timespec='seconds')))
+    except Exception as e:
+        print("[ОШИБКА] Не удалось создать лок {}: {}".format(LOCK_PATH, e))
+        return False
+    return True
+
+
+def release_lock():
+    """Снимает лок, если он наш (или просто удаляет файл)."""
+    try:
+        if os.path.exists(LOCK_PATH):
+            os.remove(LOCK_PATH)
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Последовательный анализ проектов через АК-ВС "
@@ -635,6 +738,10 @@ def main():
     parser.add_argument('--java-bin', default=DEFAULT_JAVA_BIN,  help='Путь/имя java (default: $JAVA_BIN или "java")')
     parser.add_argument('--jar',      default=DEFAULT_JAR,       help='Путь к akvs-rest-client.jar')
     parser.add_argument('--keep-raw', action='store_true',       help='Не удалять сырые выгрузки/рабочие файлы')
+    parser.add_argument('--no-lang-filter', action='store_true',
+                        help='Паковать ВСЕ файлы (иначе только расширения языков АК-ВС)')
+    parser.add_argument('--force', action='store_true',
+                        help='Игнорировать лок и запуститься даже если есть другой прогон')
     args = parser.parse_args()
 
     cfg = {
@@ -642,6 +749,7 @@ def main():
         'login': args.login, 'password': args.password,
         'timeout': args.timeout, 'level': args.level,
         'java': args.java_bin, 'jar': args.jar,
+        'lang_filter': not args.no_lang_filter,
     }
 
     print("AK-VS analyze")
@@ -675,6 +783,18 @@ def main():
     print("Проектов к анализу: {}".format(len(projects)))
     print("Список: {}".format(', '.join(projects)))
 
+    # Лок от параллельного запуска (сервер держит 1 проект — два прогона
+    # конфликтуют). Снимается в finally ниже.
+    if not acquire_lock(force=args.force):
+        sys.exit(1)
+
+    try:
+        _run_all(projects, cfg, args)
+    finally:
+        release_lock()
+
+
+def _run_all(projects, cfg, args):
     # Проверка сервера ДО старта: если недоступен — не начинаем, чтобы не
     # плодить полусозданные проекты (сервер держит только 1 проект).
     class _PreLog(object):
