@@ -1335,6 +1335,10 @@ normalize_projects_dir() {
     local t0 rc=0
     t0=$(now_ns)
 
+    # --- Шаг 1: починка кодировки во всём дереве src/ ---
+    # normalize.py работает в режиме "Вариант A": чинит ТОЛЬКО битые байты
+    # в именах (cp1251/koi8-r/cp866 -> валидный UTF-8), кириллицу сохраняет
+    # как есть, регистр и расширения не трогает.
     echo "[INFO] Предварительная нормализация имён: $PROJECTS_DIR"
     PYTHONIOENCODING=utf-8:surrogateescape python3 "$NORMALIZE_PY" \
         --content-dir "$PROJECTS_DIR" 2>&1 | tee "$pre_log" || rc=$?
@@ -1342,6 +1346,90 @@ normalize_projects_dir() {
     if (( rc != 0 )); then
         echo "[WARN] normalize.py завершился с кодом $rc — продолжаем без полной нормализации."
     fi
+
+    # --- Шаг 2: транслитерация ТОЛЬКО имён проектных папок ---
+    # Применяется исключительно к папкам верхнего уровня в src/ (именам
+    # проектов) и только при необходимости — если в имени остались не-ASCII
+    # символы после починки кодировки. Внутрь проектов этот шаг не заходит
+    # намеренно: полный normalize_name() приводит имена к верхнему регистру
+    # вместе с расширениями (main.py -> MAIN.PY, .c -> .C), что сломало бы
+    # регистрозависимый --filter и сборку исходников. Здесь используется
+    # только translit() — регистр остальных символов сохраняется.
+    rc=0
+    PYTHONIOENCODING=utf-8:surrogateescape python3 - \
+        "$PROJECTS_DIR" "$NORMALIZE_PY" <<'PYEOF' 2>&1 | tee -a "$pre_log" || rc=$?
+import importlib.util
+import os
+import sys
+
+projects_dir, normalize_py = sys.argv[1], sys.argv[2]
+
+spec = importlib.util.spec_from_file_location("normalize_mod", normalize_py)
+nz = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nz)
+
+
+def is_ascii(text):
+    # str.isascii() появился только в Python 3.7, а normalize.py
+    # заявлен как совместимый с 3.5 — держим ту же планку.
+    try:
+        text.encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+print("Транслитерация имён проектов в: {}".format(projects_dir))
+
+renamed = 0
+skipped = 0
+
+for name in sorted(os.listdir(projects_dir)):
+    path = os.path.join(projects_dir, name)
+    if not os.path.isdir(path):
+        continue  # файлы верхнего уровня (.gitkeep и т.п.) не трогаем
+
+    if nz.is_broken(name):
+        # кодировка не починилась на шаге 1 — транслитерировать нечего
+        print("  [WARN] имя осталось битым, пропускаю: {!r}".format(name))
+        skipped += 1
+        continue
+
+    if is_ascii(name):
+        continue  # уже латиница — транслит не нужен
+
+    new_name = nz.translit(name)
+
+    # Проверку на ASCII делаем ДО сравнения с исходным именем: если символов
+    # нет в таблице транслита (например, иероглифы), translit() вернёт имя
+    # без изменений, и сравнение "new_name == name" молча проглотило бы
+    # такой случай без предупреждения. Частично транслитерированные имена
+    # (часть символов осталась не-ASCII) тоже не принимаем.
+    if not is_ascii(new_name):
+        print("  [WARN] не удалось транслитерировать (символов нет в таблице): {}"
+              " — оставляю как есть".format(name))
+        skipped += 1
+        continue
+
+    if new_name == name:
+        continue
+
+    final_name = nz.get_unique_name(projects_dir, new_name)
+    try:
+        os.rename(path, os.path.join(projects_dir, final_name))
+        print("  Транслит: {} -> {}".format(name, final_name))
+        renamed += 1
+    except OSError as exc:
+        print("  [WARN] ошибка переименования {!r}: {}".format(name, exc))
+        skipped += 1
+
+print("Готово. Транслитерировано: {}, пропущено: {}".format(renamed, skipped))
+PYEOF
+
+    if (( rc != 0 )); then
+        echo "[WARN] шаг транслитерации завершился с кодом $rc — продолжаем."
+    fi
+
     echo "[TIME] normalize src/: $(format_duration $(( $(now_ns) - t0 )))"
     echo ""
 }
