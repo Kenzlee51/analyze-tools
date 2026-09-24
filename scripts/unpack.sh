@@ -1110,7 +1110,17 @@ process_project() {
     if [[ -f "$NORMALIZE_PY" ]]; then
         t0=$(now_ns)
         log_to_file "$log_path" "[INFO] Normalizing filenames..."
-        python3 "$NORMALIZE_PY" --content-dir "$unpack_dir" 2>&1 | log_to_file "$log_path"
+        # PYTHONIOENCODING=utf-8:surrogateescape — без этого normalize.py
+        # падает с UnicodeEncodeError на файлах/папках, чьё имя в архиве
+        # было сохранено не в UTF-8 (например, кириллица в CP866/CP1251).
+        # На Linux-ФС такое имя хранится как «сырые» байты; Python читает
+        # его через os.walk/os.listdir с errors=surrogateescape и работает
+        # с ним без проблем, но при печати (print/log) в обычном
+        # strict-режиме stdout падает именно на попытке вывести ЭТО имя —
+        # то есть на попытке залогировать путь к тому самому файлу,
+        # который normalize.py должен был почистить. surrogateescape для
+        # stdout позволяет напечатать такие «битые» суррогаты вместо краха.
+        PYTHONIOENCODING=utf-8:surrogateescape python3 "$NORMALIZE_PY" --content-dir "$unpack_dir" 2>&1 | log_to_file "$log_path"
         log_to_file "$log_path" "[TIME] normalize: $(format_duration $(( $(now_ns) - t0 )))"
     else
         log_to_file "$log_path" "[WARN] normalize.py не найден: $NORMALIZE_PY"
