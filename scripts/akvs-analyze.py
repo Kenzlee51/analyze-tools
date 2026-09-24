@@ -90,6 +90,7 @@ akvs-analyze.py — Анализ проектов через АК-ВС (REST-cli
 """
 
 import os
+import re
 import sys
 import shutil
 import zipfile
@@ -135,6 +136,10 @@ AKVS_SOURCE_EXTS = {
     ".py", ".pyx", ".pxd", ".pyi",
     # Perl
     ".pl", ".pm", ".t", ".pod",
+    # Прочие расширения из авторитетного списка загрузчика АК-ВС
+    # (launch-лог: -e cs,c,cpp,...,inc,...,plugin). Без них C-проекты
+    # с .inc-инклюдами и .plugin отсеивались целиком.
+    ".inc", ".plugin",
 }
 
 # =============================================================================
@@ -653,6 +658,95 @@ def process_project(project, cfg, keep_raw, leftovers):
 # =============================================================================
 # ОСНОВНОЙ ЦИКЛ
 # =============================================================================
+# --- Починка битых cp1251-имён ПАПОК проектов --------------------------------
+_TRANSLIT = {
+    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z',
+    'и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r',
+    'с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh',
+    'щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+    'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'E','Ж':'ZH','З':'Z',
+    'И':'I','Й':'Y','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R',
+    'С':'S','Т':'T','У':'U','Ф':'F','Х':'KH','Ц':'TS','Ч':'CH','Ш':'SH',
+    'Щ':'SCH','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'YU','Я':'YA',
+}
+_ENCODINGS = ('cp1251', 'koi8-r', 'cp866', 'iso8859-5')
+
+
+def _is_broken_name(name):
+    try:
+        name.encode('utf-8', 'strict')
+        return False
+    except UnicodeEncodeError:
+        return True
+
+
+def _decode_broken(name):
+    if not _is_broken_name(name):
+        return name
+    nb = name.encode('utf-8', 'surrogateescape')
+    for enc in _ENCODINGS:
+        try:
+            dec = nb.decode(enc)
+            if dec.encode(enc) == nb:
+                return dec
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            continue
+    return name
+
+
+def _clean_latin(name):
+    """Битое/кириллическое имя -> безопасный латинский идентификатор.
+
+    Имя папки проекта служит и именем на сервере (-n), и частью путей,
+    поэтому приводим к латинице (транслит) — как договаривались для верхних
+    папок. Небитые латинские имена не трогаем.
+    """
+    decoded = _decode_broken(name)
+    out = ''.join(_TRANSLIT.get(ch, ch) for ch in decoded)
+    out = out.replace(' ', '_')
+    out = re.sub(r'[^A-Za-z0-9._-]', '', out)
+    out = re.sub(r'_+', '_', out).strip('_')
+    return out
+
+
+def _needs_latin(name):
+    """True, если имя нужно привести к латинице: битое (суррогаты) ИЛИ
+    содержит не-ASCII символы (кириллица). Сервер АК-ВС не принимает
+    кириллические имена проектов (-n), а в путях они тоже создают проблемы.
+    """
+    if _is_broken_name(name):
+        return True
+    return any(ord(ch) > 127 for ch in name)
+
+
+def repair_project_dir_names():
+    """Приводит имена папок проектов в unpacked/ к латинице.
+
+    Затрагивает битые (cp1251-суррогаты) И валидные кириллические имена —
+    оба транслитерируются в латиницу (ИСАТ.01342 -> ISAT.01342). Чисто
+    ASCII-имена не трогает. Возвращает список пар (было_repr, стало).
+    """
+    if not os.path.isdir(UNPACKED_DIR):
+        return []
+    renamed = []
+    for raw in list(os.listdir(UNPACKED_DIR)):
+        if not _needs_latin(raw):
+            continue
+        clean = _clean_latin(raw) or 'project'
+        final = clean
+        n = 2
+        while os.path.exists(os.path.join(UNPACKED_DIR, final)):
+            final = '{}_{}'.format(clean, n)
+            n += 1
+        try:
+            os.rename(os.path.join(UNPACKED_DIR, raw),
+                      os.path.join(UNPACKED_DIR, final))
+            renamed.append((repr(raw), final))
+        except Exception as e:
+            print("[ВНИМАНИЕ] не удалось переименовать битую папку {!r}: {}".format(raw, e))
+    return renamed
+
+
 def discover_all_projects():
     if not os.path.isdir(UNPACKED_DIR):
         return []
@@ -763,6 +857,11 @@ def main():
         for p in problems:
             print("  - {}".format(p))
         sys.exit(1)
+
+    # Чиним битые cp1251-имена ПАПОК проектов в unpacked/ (иначе падаем
+    # на выводе списка и на путях). Латиница безопасна и для -n на сервере.
+    for _old, _new in repair_project_dir_names():
+        print("[ИНФО] Битое имя папки проекта {} -> {}".format(_old, _new))
 
     # --- Список проектов ---
     if args.project:
