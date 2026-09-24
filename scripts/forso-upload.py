@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-akvs-upload.py — Выгрузка отчётов АК-ВС на сетевой диск (CIFS/SMB)
+forso-upload.py — Выгрузка результатов на сетевой диск (CIFS/SMB)
 =============================================================================
 
 ОПИСАНИЕ:
@@ -31,11 +31,11 @@ akvs-upload.py — Выгрузка отчётов АК-ВС на сетевой
     скрипт с ним работает, но НЕ размонтирует его в конце.
 
 ИСПОЛЬЗОВАНИЕ:
-    python3 scripts/akvs-upload.py --adlb 123
-    python3 scripts/akvs-upload.py --dir "АДЛБ.123 Изделие Х"
-    python3 scripts/akvs-upload.py --adlb 123 --dry-run
-    python3 scripts/akvs-upload.py --adlb 123 --force
-    sudo -v && python3 scripts/akvs-upload.py --adlb 123   # чтобы sudo не спрашивал пароль в процессе
+    python3 scripts/forso-upload.py --adlb 123
+    python3 scripts/forso-upload.py --dir "АДЛБ.123 Изделие Х"
+    python3 scripts/forso-upload.py --adlb 123 --dry-run
+    python3 scripts/forso-upload.py --adlb 123 --force
+    sudo -v && python3 scripts/forso-upload.py --adlb 123   # чтобы sudo не спрашивал пароль в процессе
 
 ОПЦИИ:
     --adlb XXX          Номер проекта: РОВНО 3 цифры (по умолчанию так).
@@ -303,7 +303,7 @@ def read_hash_file(path):
 def write_hash_file(path, table):
     """Пишет hash.txt (сначала во временный файл рядом, затем подменяет)."""
     tmp = path + ".tmp"
-    lines = ["# akvs-upload.py — хэши выгруженных отчётов АК-ВС",
+    lines = ["# forso-upload.py — хэши выгруженных отчётов АК-ВС",
              "# обновлено: {}".format(datetime.now().isoformat(timespec='seconds')),
              "# формат: <sha256> <имя папки/файла>"]
     for name in sorted(table):
