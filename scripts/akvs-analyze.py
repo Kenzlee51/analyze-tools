@@ -510,6 +510,24 @@ def process_project(project, cfg, keep_raw, leftovers):
     os.makedirs(out_dir)
     shutil.copy2(DICTIONARY, os.path.join(work, "dictionary.txt"))
 
+    # Пакуем исходники ДО обращений к серверу (упаковка сервер не трогает).
+    #  - все симлинки пропускаем (обход падения клиентского архиватора на
+    #    битых симлинках из prebuild-дистрибутивов);
+    #  - по умолчанию пакуем только файлы языков АК-ВС (lang_filter).
+    # Если после фильтра НЕ осталось файлов — проект без исходного кода
+    # (конфиги/шрифты/deb-пакеты и т.п.): помечаем SKIPPED и НЕ создаём его
+    # на сервере (иначе повиснет пустой проект и полезут ложные ошибки).
+    src_zip = os.path.join(work, "src.zip")
+    packed, _, _ = zip_sources(src_dir, src_zip, log,
+                               lang_filter=cfg.get('lang_filter', True))
+    if packed == 0:
+        log.error("Нет файлов на языках АК-ВС после фильтра — в проекте нет "
+                  "исходного кода. Пропускаю (сервер не трогаю).")
+        if not keep_raw and os.path.isdir(work):
+            shutil.rmtree(work)
+        log.end_run("SKIPPED (нет исходного кода)")
+        return "skipped"
+
     status = "success"
     stage = None
     fail_stage = None
@@ -518,20 +536,8 @@ def process_project(project, cfg, keep_raw, leftovers):
         # удаляем ВСЁ, что осталось от прошлых прогонов/тестов.
         akvs_purge_slot(cfg, log)
 
-        # ---------- 1. СТАТИКА ----------
+        # ---------- 1. СТАТИКА (src.zip уже собран выше) ----------
         stage = "static"
-        # Пакуем исходники сами (штатным zipfile):
-        #  - все симлинки пропускаем (обход падения клиентского архиватора
-        #    на битых симлинках из prebuild-дистрибутивов);
-        #  - по умолчанию пакуем только файлы языков АК-ВС (lang_filter).
-        src_zip = os.path.join(work, "src.zip")
-        packed, _, _ = zip_sources(src_dir, src_zip, log,
-                                   lang_filter=cfg.get('lang_filter', True))
-        if packed == 0:
-            raise StageError(stage, "нет файлов для упаковки (после фильтра по "
-                                    "расширениям языков АК-ВС пусто; проверьте "
-                                    "исходники или --no-lang-filter)")
-
         cmd = [cfg['java'], '-jar', cfg['jar'], 'analyze', 'static'] \
             + auth_args(cfg) + ['-n', project, '-l', str(cfg['level']),
                                 '-i', src_zip, '-o', static_out]
