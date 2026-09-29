@@ -722,6 +722,113 @@ def link_compiler_to_assembler(raw_cmds):
     return linked
 
 
+# Компиляторы с ИНТЕГРИРОВАННЫМ ассемблером (clang/clang++): компилируют и
+# ассемблируют в одном процессе, отдельного 'as' нет. Для gcc/g++ здесь на
+# случай, если трассировщик не поймал выход и на уровне драйвера.
+_INTEGRATED_COMPILERS = {'clang', 'clang++', 'gcc', 'g++', 'cc', 'c++'}
+
+
+def _o_target_from_argv(argv):
+    """Возвращает аргумент после -o (или -oX.o), если это .o, иначе None."""
+    for i, t in enumerate(argv):
+        t = str(t)
+        if t == '-o' and i + 1 < len(argv):
+            return str(argv[i + 1])
+        if t.startswith('-o') and len(t) > 2:
+            return t[2:]
+    return None
+
+
+def link_compiler_output_via_consumers(raw_cmds):
+    """
+    Восстанавливает цепочку компиляции для clang (интегрированный ассемблер).
+
+    Проблема: у clang/clang++ ассемблер встроен, отдельного 'as' нет, а этот
+    трассировщик НЕ фиксирует итоговый .o в поле output команды
+    'clang++ -c foo.cpp -o foo.o' (output пустой или .tmp). При этом сам .o
+    существует и записан как ЗАВИСИМОСТЬ (вход) следующей команды — линковщика
+    'ld' (или драйвера clang при линковке). В результате узел .o не имеет
+    команды-производителя, обратный обход от бинаря обрывается на .o и .cpp
+    ложно попадает в not_compiled/избыточные.
+
+    Решение: строим индекс всех .o, встречающихся во ВХОДАХ любых команд
+    (basename -> [(нормпуть, hash)]). Для каждой команды-компилятора с '-c'
+    и '-o X.o', у которой output пуст, берём hash того же .o из этого индекса
+    и синтезируем ей выход. Сопоставление по basename; при коллизии basename
+    уточняем по суффиксу относительного пути '-o' (путь CMakeFiles/<t>.dir/…
+    уникален). Это аналог link_compiler_to_assembler, но источник hash —
+    потребитель .o, а не брат 'as'.
+
+    Модифицирует raw_cmds на месте. Возвращает количество сшитых команд.
+    """
+    # Индекс .o из ВХОДОВ (dependencies) всех команд.
+    o_index = {}  # basename -> list[(normpath, hash)]
+    for cmd in raw_cmds:
+        deps = cmd.get('dependencies', {})
+        if isinstance(deps, dict):
+            items = deps.items()
+        elif isinstance(deps, list):
+            items = [(d.get('path', ''), d.get('hash', '')) for d in deps
+                     if isinstance(d, dict)]
+        else:
+            items = []
+        for path, h in items:
+            if not path or not path.endswith('.o'):
+                continue
+            h = h.strip() if h else ''
+            if not h:
+                continue
+            o_index.setdefault(os.path.basename(path), []).append(
+                (os.path.normpath(path), h))
+
+    if not o_index:
+        return 0
+
+    linked = 0
+    for cmd in raw_cmds:
+        cl = cmd.get('command', [])
+        if not cl:
+            continue
+        tool = os.path.basename(str(cl[0]))
+        if tool not in _INTEGRATED_COMPILERS:
+            continue
+        if '-c' not in [str(x) for x in cl]:
+            continue
+
+        # Уже есть непустой output? Цепочка не разорвана — не трогаем.
+        existing_out = cmd.get('output', {})
+        has_output = (isinstance(existing_out, dict) and existing_out) or \
+                     (isinstance(existing_out, list) and existing_out)
+        if has_output:
+            continue
+
+        ot = _o_target_from_argv(cl)
+        if not ot or not ot.endswith('.o'):
+            continue
+
+        cands = o_index.get(os.path.basename(ot))
+        if not cands:
+            continue
+
+        hit = None
+        if len(cands) == 1:
+            hit = cands[0]
+        else:
+            rel = os.path.normpath(ot)
+            sfx = [c for c in cands
+                   if c[0] == rel or c[0].endswith(os.sep + rel)]
+            if len(sfx) == 1:
+                hit = sfx[0]
+            # >1 суффикса — неоднозначно, пропускаем (безопаснее не гадать)
+
+        if hit:
+            cmd['output'] = [{'path': ot, 'hash': hit[1],
+                              'synthesized': 'clang_o_from_consumer'}]
+            linked += 1
+
+    return linked
+
+
 # =============================================================================
 # ФУНКЦИИ ДЛЯ ПРОХОДА 2 (КОМПИЛИРУЕМЫЕ) – ТРАНЗИТИВНАЯ ВЕРСИЯ С ПОДДЕРЖКОЙ ХЕШЕЙ
 # =============================================================================
@@ -2798,6 +2905,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         _linked = link_compiler_to_assembler(raw_cmds)
         if _linked:
             print(_ts() + "   Linked compiler->assembler chains: {} .cpp->.o pairs".format(_linked))
+
+        # Восстанавливаем цепочку для clang (интегрированный ассемблер):
+        # трассировщик не пишет .o в output команды 'clang++ -c ... -o X.o',
+        # но .o есть во входах ld. Берём hash .o из потребителя и синтезируем
+        # выход компилятору, чтобы .cpp не попал в избыточные ложно.
+        _linked_clang = link_compiler_output_via_consumers(raw_cmds)
+        if _linked_clang:
+            print(_ts() + "   Linked clang(integrated-as)->.o via consumers: {} .cpp->.o pairs".format(_linked_clang))
 
         bin_hashes, bin_paths = load_bin_signatures(project_name)
     except Exception as e:
