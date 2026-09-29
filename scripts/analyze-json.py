@@ -1190,7 +1190,8 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
                         all_good_cmds=None):
     """
     Классифицирует интерпретируемые файлы из signatures на четыре категории:
-      - executed:   только Python-файлы, которые были входными для команд интерпретаторов
+      - executed:   интерпретируемые файлы (любого языка), которые были входными
+                    для команд интерпретаторов — .py под python, .js под qjs и т.п.
                     (добавляется поле "commands" со списком полных команд)
       - compiled:   выходные файлы интерпретаторов + входные любых языков, чьи выходы попали в bin
                     (транзитивно — если выход команды транзитивно попадает в bin)
@@ -1323,18 +1324,20 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             added_compiled_paths.add(p_norm)
             continue
 
-        # --- 4. Проверка на executed (только Python, был входным для интерпретатора) ---
-        if is_python_extension(path):
-            was_executed = (h and h in input_hashes) or (p_norm and p_norm in input_paths_norm)
-            if was_executed:
-                cmd_indices_exec = input_by_hash.get(h, set()) if h else input_by_path.get(p_norm, set())
-                commands = []
-                for idx in cmd_indices_exec:
-                    cmd_str = cmd_idx_to_command.get(idx)
-                    if cmd_str and cmd_str not in commands:
-                        commands.append(cmd_str)
-                executed.append({'path': path, 'hash': h, 'commands': commands})
-                continue
+        # --- 4. Проверка на executed (любой интерпретируемый файл, который был
+        #        входом команды интерпретатора: .py под python, .js под qjs и т.д.).
+        #        Ранее было ограничено только Python — из-за этого .js, исполняемые
+        #        через qjs, ложно уходили в избыточные. ---
+        was_executed = (h and h in input_hashes) or (p_norm and p_norm in input_paths_norm)
+        if was_executed:
+            cmd_indices_exec = input_by_hash.get(h, set()) if h else input_by_path.get(p_norm, set())
+            commands = []
+            for idx in cmd_indices_exec:
+                cmd_str = cmd_idx_to_command.get(idx)
+                if cmd_str and cmd_str not in commands:
+                    commands.append(cmd_str)
+            executed.append({'path': path, 'hash': h, 'commands': commands})
+            continue
 
         # --- 5. Остальное — избыточное ---
         izb.append({'path': path, 'hash': h})

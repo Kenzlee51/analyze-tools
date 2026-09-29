@@ -199,6 +199,16 @@ utilities:
     - ruby
     - node
     - nodejs
+    # JS-движок QuickJS и Qt-инструменты перевода.
+    # В interpreters (а не compilers), т.к. Pass3 сканирует команды именно
+    # по этому списку; тогда .js (через qjs) и .ts (через lrelease) корректно
+    # классифицируются как executed / compiled_used, а не как избыточные.
+    - qjs            # QuickJS — исполняет .js
+    - qjsc           # QuickJS — компилятор скриптов
+    - lrelease       # Qt: .ts -> .qm
+    - lrelease-qt5   # тот же lrelease в варианте имени qt5
+    - lupdate        # Qt: обновление .ts из исходников
+    - lupdate-qt5
 
   other:
     - ar
