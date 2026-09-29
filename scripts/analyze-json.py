@@ -2910,9 +2910,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         # трассировщик не пишет .o в output команды 'clang++ -c ... -o X.o',
         # но .o есть во входах ld. Берём hash .o из потребителя и синтезируем
         # выход компилятору, чтобы .cpp не попал в избыточные ложно.
-        _linked_clang = link_compiler_output_via_consumers(raw_cmds)
-        if _linked_clang:
-            print(_ts() + "   Linked clang(integrated-as)->.o via consumers: {} .cpp->.o pairs".format(_linked_clang))
+        # Переключатель для отладки: NO_CLANG_LINK=1 отключает сшивку,
+        # чтобы сравнить результат с/без неё на одном и том же buildography.
+        if os.environ.get('NO_CLANG_LINK') == '1':
+            print(_ts() + "   [NO_CLANG_LINK=1] clang(integrated-as)->.o linking DISABLED")
+        else:
+            _linked_clang = link_compiler_output_via_consumers(raw_cmds)
+            if _linked_clang:
+                print(_ts() + "   Linked clang(integrated-as)->.o via consumers: {} .cpp->.o pairs".format(_linked_clang))
 
         bin_hashes, bin_paths = load_bin_signatures(project_name)
     except Exception as e:
