@@ -741,26 +741,146 @@ def discover_trusted_dirs(project_name, interactive=True):
     return good
 
 
+def _json_line_value(line):
+    """
+    Достаёт значение строкового поля из строки вида:   "path": "значение",
+    Возвращает None, если строка не такой формы.
+    """
+    i = line.find(':')
+    if i < 0:
+        return None
+    s = line.find('"', i + 1)
+    if s < 0:
+        return None
+    e = line.rfind('"')
+    if e <= s:
+        return None
+    val = line[s + 1:e]
+    if '\\' in val:
+        val = val.replace('\\\\', '\x00').replace('\\"', '"').replace('\x00', '\\')
+    return val
+
+
+def _stream_signatures(jpath):
+    """
+    Потоковый разбор json, который пишет generate_json.sh.
+
+    Отдаёт пары (hash, path), НЕ материализуя файл целиком.
+
+    Зачем. Инвентаризация согласованного носителя может быть огромной:
+    на СВВП 0.9.6 это 2.23 млн файлов и 62 ГБ, что даёт json на 1.3-2 ГБ.
+    Обычный json.load развернул бы его в список из 2.23 млн словарей по
+    пять ключей — пять-восемь гигабайт объектов Python на пике, то есть
+    гарантированный OOM, причём ДО того как построен хоть какой-то индекс.
+
+    Формат фиксирован, его печатает printf в process_subdir:
+        {
+            "path": "...",
+            "hash": "...",
+            "archive": 0,
+            "parents_hash": "...",
+            "parents_chain": [...]
+        }
+    Каждое поле на своей строке; переводы строк внутри значений
+    экранируются в json_escape, поэтому построчный разбор корректен.
+
+    Проверка на "parents_hash" нужна, чтобы не спутать его с "hash".
+    """
+    cur_path = None
+    with open(jpath, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            st = line.lstrip()
+            if st.startswith('"path"'):
+                cur_path = _json_line_value(st)
+            elif st.startswith('"hash"'):
+                h = _json_line_value(st)
+                if h and cur_path is not None:
+                    yield h, cur_path
+                    cur_path = None
+
+
+class TrustedIndex:
+    """
+    Компактный индекс хешей согласованных носителей.
+
+    Устройство выбрано под объём в миллионы записей:
+
+      - ключ хранится ЦЕЛЫМ числом, а не 64-символьной строкой
+        (строка весит около 113 байт, целое примерно 32);
+
+      - значением хранится не полный путь, а КОНТЕЙНЕР — ближайший
+        архив. В отчёте фигурирует именно он, а контейнеров на носителе
+        тысячи, а не миллионы, поэтому при интернировании все пути
+        схлопываются в несколько тысяч строковых объектов.
+
+    Точный путь файла внутри носителя при этом не хранится. Если он
+    понадобится для разбора единичного случая, он находится по хешу
+    в самом {носитель}_src.json одной командой grep.
+
+    Обращение по строковому хешу, как и к обычному dict.
+    """
+
+    __slots__ = ('_by_hash', '_pool', 'labels', 'counts')
+
+    def __init__(self):
+        self._by_hash = {}
+        self._pool = {}
+        self.labels = []
+        self.counts = {}
+
+    def _intern(self, s):
+        got = self._pool.get(s)
+        if got is None:
+            self._pool[s] = s
+            got = s
+        return got
+
+    def add(self, h_str, label, kind, container):
+        hi = _hash_to_int(h_str)
+        if hi is None or hi in self._by_hash:
+            return False
+        self._by_hash[hi] = (self._intern(label),
+                             self._intern(kind),
+                             self._intern(container))
+        return True
+
+    def __contains__(self, h_str):
+        hi = _hash_to_int(h_str)
+        return hi is not None and hi in self._by_hash
+
+    def __getitem__(self, h_str):
+        return self._by_hash[_hash_to_int(h_str)]
+
+    def get(self, h_str, default=None):
+        hi = _hash_to_int(h_str)
+        if hi is None:
+            return default
+        return self._by_hash.get(hi, default)
+
+    def __len__(self):
+        return len(self._by_hash)
+
+    @property
+    def pool_size(self):
+        return len(self._pool)
+
+
 def load_trusted_inventory(trusted_dirs):
     """
-    Загружает инвентаризации согласованных носителей.
+    Загружает инвентаризации согласованных носителей в TrustedIndex.
 
-    Возвращает dict:
-      {
-        'by_hash': { hash_str: (label, kind, path) },   # kind: 'src' | 'bin'
-        'labels' : [имена носителей],
-        'counts' : { label: количество записей },
-      }
+    Хранится только первое вхождение каждого хеша — для атрибуции
+    достаточно одного основания, а дубли внутри носителя ничего не дают.
 
-    Хранится только первое вхождение каждого хеша — для атрибуции достаточно
-    одного основания, а дубли внутри носителя ничего не добавляют.
+    Разбор потоковый. Если потоковый разбор не дал ни одной записи на
+    непустом файле (например, формат генератора изменился), выполняется
+    откат на обычный json.load с ГРОМКИМ сообщением — чтобы расхождение
+    форматов было видно, а не проявлялось нехваткой памяти.
     """
-    by_hash = {}
-    counts  = {}
-    labels  = []
+    idx = TrustedIndex()
 
     for label in trusted_dirs:
-        labels.append(label)
+        idx.labels.append(label)
         n = 0
         for kind in ("src", "bin"):
             jpath = os.path.join(RESULTS_DIR, label, "sources",
@@ -769,27 +889,61 @@ def load_trusted_inventory(trusted_dirs):
                 print(_ts() + "   [{}] {}.json отсутствует — пропускаем".format(
                     label, kind))
                 continue
+
+            size_mb = os.path.getsize(jpath) / (1024.0 * 1024.0)
+            print(_ts() + "   [{}] {}.json: {:.0f} МБ, потоковый разбор...".format(
+                label, kind, size_mb))
+
+            seen = 0
+            added = 0
             try:
-                with open(jpath, 'r', encoding='utf-8', errors='replace') as f:
-                    data = json.load(f)
-            except (ValueError, OSError) as exc:
-                print(_ts() + "   [{}] не удалось прочитать {}.json: {}".format(
+                for h, p in _stream_signatures(jpath):
+                    seen += 1
+                    if idx.add(h, label, kind, _trusted_container(p)):
+                        added += 1
+                    if seen % 500000 == 0:
+                        print(_ts() + "     [{}] {}: прочитано {}, "
+                                      "уникальных {}".format(label, kind,
+                                                             seen, len(idx)))
+            except OSError as exc:
+                print(_ts() + "   [{}] ошибка чтения {}.json: {}".format(
                     label, kind, exc))
                 continue
-            sigs = data.get('signatures', [])
-            for e in sigs:
-                h = (e.get('hash') or '').strip()
-                if not h or h in by_hash:
-                    continue
-                by_hash[h] = (label, kind, e.get('path', ''))
-                n += 1
-            print(_ts() + "   [{}] {}.json: {} записей".format(
-                label, kind, len(sigs)))
-        counts[label] = n
 
-    if labels:
-        print(_ts() + "   Доверенных хешей всего: {}".format(len(by_hash)))
-    return {'by_hash': by_hash, 'labels': labels, 'counts': counts}
+            if seen == 0 and size_mb > 0:
+                print(_ts() + "   [{}] [WARNING] потоковый разбор {}.json не дал "
+                              "ни одной записи.".format(label, kind))
+                print(_ts() + "   [{}] [WARNING] Вероятно изменился формат "
+                              "generate_json.sh. Откат на json.load — "
+                              "возможен большой расход памяти.".format(label))
+                try:
+                    with open(jpath, 'r', encoding='utf-8',
+                              errors='replace') as f:
+                        data = json.load(f)
+                    for e in data.get('signatures', []):
+                        h = (e.get('hash') or '').strip()
+                        seen += 1
+                        if idx.add(h, label, kind,
+                                   _trusted_container(e.get('path', ''))):
+                            added += 1
+                    del data
+                    gc.collect()
+                except (ValueError, OSError) as exc:
+                    print(_ts() + "   [{}] не удалось прочитать {}.json: "
+                                  "{}".format(label, kind, exc))
+                    continue
+
+            n += added
+            print(_ts() + "   [{}] {}.json: записей {}, уникальных "
+                          "хешей {}".format(label, kind, seen, added))
+        idx.counts[label] = n
+
+    if idx.labels:
+        print(_ts() + "   Доверенных хешей всего: {} "
+                      "(различных контейнеров: {})".format(
+                          len(idx), idx.pool_size))
+        _log_memory("после загрузки TRUSTED")
+    return idx
 
 
 def load_buildography_data(paths):
@@ -3025,16 +3179,22 @@ def collect_producers(buildography_files, target_hashes,
 
 def _trusted_container(trusted_path):
     """
-    Из пути внутри согласованного носителя достаёт ближайший архив/пакет —
+    Из пути внутри согласованного носителя достаёт БЛИЖАЙШИЙ архив/пакет —
     то, что имеет смысл называть основанием доверия.
 
-      TRUSTED.GENERAL/src/pypi-cache/distlib/distlib-0.3.4.zip_dir/distlib/t64-arm.exe
-        -> pypi-cache/distlib/distlib-0.3.4.zip
+      .../svvp.iso_dir/НПУР.../pypi-cache/distlib/distlib-0.3.4.zip_dir/distlib/t64-arm.exe
+        -> svvp.iso_dir/НПУР.../pypi-cache/distlib/distlib-0.3.4.zip
+
+    Берётся ПОСЛЕДНЕЕ вхождение "_dir/", а не первое. Вложенность на
+    реальном носителе глубокая: образ -> каталог изделия -> архив пакета
+    -> содержимое. По первому вхождению в основание всегда попадал бы
+    сам образ, что для атрибуции бесполезно — надо знать, какой именно
+    пакет внутри него.
     """
     if not trusted_path:
         return ''
     marker = '_dir/'
-    idx = trusted_path.find(marker)
+    idx = trusted_path.rfind(marker)
     if idx < 0:
         return trusted_path
     head = trusted_path[:idx]
@@ -3043,11 +3203,14 @@ def _trusted_container(trusted_path):
     return parts[2] if len(parts) == 3 else head
 
 
-def resolve_origins(entries, src_hashes, trusted_by_hash, buildography_files,
+def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     compiler_basenames=None, linker_basenames=None,
                     max_rounds=_ORIGIN_MAX_ROUNDS):
     """
     Для списка записей (dict с полями path/hash) устанавливает происхождение.
+
+    trusted — TrustedIndex: обращение по строковому хешу, как к dict,
+    значение (label, kind, container), где container — архив-основание.
 
     В каждую запись добавляются поля:
       operation      — род операции производящей команды
@@ -3081,10 +3244,10 @@ def resolve_origins(entries, src_hashes, trusted_by_hash, buildography_files,
             continue
         if h in src_hashes:
             _set(h, ORIGIN_PRODUCT_SRC, 'хеш файла есть в src.json')
-        elif h in trusted_by_hash:
-            label, kind, tpath = trusted_by_hash[h]
+        elif h in trusted:
+            label, kind, container = trusted[h]
             _set(h, ORIGIN_APPROVED,
-                 '{}/{}: {}'.format(label, kind, _trusted_container(tpath)))
+                 '{}/{}: {}'.format(label, kind, container))
 
     # --- Раунды 1..N: обратный обход ---------------------------------------
     # dependents[x] — множество исходных хешей, судьба которых зависит от x
@@ -3136,7 +3299,7 @@ def resolve_origins(entries, src_hashes, trusted_by_hash, buildography_files,
             hit_trusted = None
             hit_src     = None
             for dp, dh in prod['deps']:
-                if hit_trusted is None and dh in trusted_by_hash:
+                if hit_trusted is None and dh in trusted:
                     hit_trusted = (dp, dh)
                     break
             if hit_trusted is None:
@@ -3146,9 +3309,8 @@ def resolve_origins(entries, src_hashes, trusted_by_hash, buildography_files,
                         break
 
             if hit_trusted is not None:
-                label, kind, tpath = trusted_by_hash[hit_trusted[1]]
-                detail = '{}/{}: {}'.format(label, kind,
-                                            _trusted_container(tpath))
+                label, kind, container = trusted[hit_trusted[1]]
+                detail = '{}/{}: {}'.format(label, kind, container)
                 for r in unresolved_roots:
                     _set(r, ORIGIN_APPROVED, detail)
                 continue
@@ -4192,7 +4354,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                 len(p4_compiled_from_src)))
             (p4_origin_product, p4_origin_approved,
              p4_origin_download, p4_origin_unresolved) = resolve_origins(
-                p4_compiled_from_src, src_hashes, trusted['by_hash'],
+                p4_compiled_from_src, src_hashes, trusted,
                 buildography_files,
                 compiler_basenames=compiler_basenames,
                 linker_basenames=linker_basenames)
