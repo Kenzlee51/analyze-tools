@@ -137,9 +137,50 @@ analyze-json.py — Анализ происхождения файлов сбо�
   откуда он взялся. Категории упорядочены от "чистых" к "подозрительным".
 
   {project}_compiled_from_src.json / .txt
-      Бинарь собран из исходников проекта: трассировщик видит цепочку
-      компиляции и все зависимости из src.json. Чисто.
-      Поля: path, hash, container (если внутри пакета)
+      Файл появился в ходе сборки: его хеш является выходом прослеженной
+      команды, и при этом отсутствует в src.json.
+
+      ВНИМАНИЕ: категория НЕ означает, что файл собран из исходных текстов
+      изделия. Это else-ветка Pass 4, то есть попадание в неё означает
+      отсутствие возражений, а не доказательство. Сюда уходит всё, что
+      сборка так или иначе произвела, включая переупакованные и подписанные
+      сторонние пакеты. Измерение на NPUR.34018-01: из 124 уникальных файлов
+      этой категории 53 произведены wheel pack, 27 — python -m build,
+      22 — bsign, 6 — unzip, остальные — pip/dpkg/node/tar. Компиляторов
+      среди производителей нет ни одного.
+
+      Разбор по действительному происхождению лежит рядом, см. ниже
+      origin_*. В summary{N}/ выносится только этот файл, единым списком.
+      Поля: path, hash, container (если внутри пакета),
+            operation, operation_cmd, origin, origin_detail, origin_chain
+
+  {project}_origin_product_src.json / .txt
+  {project}_origin_approved_source.json / .txt
+  {project}_origin_download.json / .txt
+  {project}_origin_unresolved.json / .txt
+      Разбор предыдущей категории по ТЕРМИНАЛУ цепочки происхождения —
+      по тому файлу, из содержимого которого получен данный.
+
+      Две независимые оси:
+        origin (категория)  — где цепочка заканчивается:
+            product_src      терминал в src.json изделия
+            approved_source  терминал на согласованном носителе (TRUSTED),
+                             совпадение ПО ХЕШУ; в origin_detail указаны
+                             носитель и архив-основание
+            download         терминал на сетевой загрузке; в origin_detail
+                             адрес источника из командной строки
+            unresolved       терминал не опознан — проверка не смогла
+                             подтвердить происхождение
+        operation (атрибут) — чем файл произведён: compiled, built,
+            repacked, signed, extracted, copied, transformed, downloaded,
+            other. Переупаковка, подпись, распаковка и копирование
+            содержимое не создают, поэтому для них происхождение ищется
+            во входе команды.
+
+      Порядок проверки: src.json -> TRUSTED -> загрузка -> не установлено.
+      Поскольку TRUSTED проверяется раньше загрузки, в origin_download
+      остаётся только то, что скачано И не найдено ни на одном
+      согласованном носителе.
 
   {project}_binaries_from_src.json / .txt
       Хеш бинаря найден в src.json — бинарь хранился прямо в исходниках
@@ -299,6 +340,28 @@ BUILDOGRAPHY_DIR = os.path.join(BASE_DIR, "buildography", "builds")
 RESULTS_DIR      = os.path.join(BASE_DIR, "results")
 UTILITIES_FILE   = os.path.join(BASE_DIR, "lib", "utilities.yaml")
 GENERATE_JSON_SCRIPT = os.path.join(BASE_DIR, "scripts", "generate_json_v2_test.sh")
+
+# -----------------------------------------------------------------------------
+# СОГЛАСОВАННЫЕ (ДОВЕРЕННЫЕ) НОСИТЕЛИ
+# -----------------------------------------------------------------------------
+# Доверенные материалы кладутся в src/ как обычные "проекты" с плоским именем:
+#
+#   src/TRUSTED.GENERAL/{src,bin}          — действует для ВСЕХ изделий
+#   src/TRUSTED.<ИМЯ ИЗДЕЛИЯ>/{src,bin}    — действует только для этого изделия
+#
+# Плоское имя (точка вместо вложенности) выбрано сознательно: unpack.sh и
+# generate_json.sh строго двухуровневые — они обходят src/*/ и ищут внутри
+# ровно src и bin. Вложенность src/TRUSTED/GENERAL/ они бы молча пропустили
+# ("Subdir not found, skipping") и вышли с кодом 0, не создав ни одного json.
+# При плоском имени оба скрипта работают без правок.
+#
+# Инвентаризация делается тем же generate_json.sh, поэтому сверка идёт
+# ПО ХЕШАМ, а не по путям: путь говорит "откуда взяли", хеш — "что именно
+# взяли", и только второе отличает согласованный носитель от постороннего
+# кэша, поднятого по тому же адресу.
+# -----------------------------------------------------------------------------
+TRUSTED_PREFIX  = "TRUSTED."
+TRUSTED_GENERAL = "TRUSTED.GENERAL"
 # =============================================================================
 
 
@@ -589,6 +652,146 @@ def load_bin_signatures(project_name):
     return hashes, paths
 
 
+# =============================================================================
+# СОГЛАСОВАННЫЕ НОСИТЕЛИ: ПОИСК, ПРОВЕРКА ИМЁН, ЗАГРУЗКА
+# =============================================================================
+def _expected_trusted_names(project_name):
+    """Имена каталогов доверенных носителей, допустимые для данного изделия."""
+    return [TRUSTED_GENERAL, TRUSTED_PREFIX + project_name]
+
+
+def discover_trusted_dirs(project_name, interactive=True):
+    """
+    Ищет в results/ каталоги согласованных носителей для данного изделия.
+
+    Возвращает список имён каталогов, пригодных к использованию.
+
+    Проверка имени строгая и регистрозависимая. Каталог, который совпадает
+    с ожидаемым без учёта регистра, но не совпадает точно (trusted.general
+    вместо TRUSTED.GENERAL), считается ОШИБКОЙ: о нём печатается
+    предупреждение и, если interactive, задаётся вопрос о продолжении.
+    Это сделано намеренно — молча проигнорированный доверенный носитель
+    приводит к тому, что весь его состав уезжает в "происхождение не
+    установлено", и причина этого неочевидна.
+    """
+    if not os.path.isdir(RESULTS_DIR):
+        return []
+
+    expected = _expected_trusted_names(project_name)
+    expected_ci = {name.lower(): name for name in expected}
+
+    present = sorted([
+        entry for entry in os.listdir(RESULTS_DIR)
+        if os.path.isdir(os.path.join(RESULTS_DIR, entry))
+    ])
+
+    good = []
+    problems = []   # (найденное_имя, ожидаемое_имя, причина)
+
+    for entry in present:
+        low = entry.lower()
+        if not low.startswith(TRUSTED_PREFIX.lower()):
+            continue
+
+        if entry in expected:
+            good.append(entry)
+            continue
+
+        if low in expected_ci:
+            # Совпало без учёта регистра — расхождение именно в регистре
+            problems.append((entry, expected_ci[low], "регистр имени"))
+            continue
+
+        # Каталог вида TRUSTED.* , но не относящийся к этому изделию.
+        # Это нормально (доверенный носитель другого изделия) — молчим,
+        # кроме случая, когда он похож на имя текущего изделия по регистру.
+        suffix = entry[len(TRUSTED_PREFIX):]
+        if suffix.lower() == project_name.lower() and suffix != project_name:
+            problems.append((entry, TRUSTED_PREFIX + project_name,
+                             "регистр имени изделия"))
+
+    if problems:
+        print("")
+        print(_ts() + "   [WARNING] Каталоги согласованных носителей с неверным именем:")
+        for found, exp, why in problems:
+            print(_ts() + "     найдено : {}".format(found))
+            print(_ts() + "     ожидается: {}   ({})".format(exp, why))
+        print(_ts() + "   Такие каталоги НЕ будут использованы как доверенные.")
+        print(_ts() + "   Всё их содержимое попадёт в 'происхождение не установлено'.")
+        print("")
+        if interactive and sys.stdin is not None and sys.stdin.isatty():
+            try:
+                answer = input("   Продолжить без этих носителей? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            if answer not in ("y", "yes", "д", "да"):
+                print(_ts() + "   Остановлено пользователем. "
+                              "Исправьте имена каталогов и запустите заново.")
+                sys.exit(1)
+            print(_ts() + "   Продолжаем без этих носителей (решение пользователя).")
+        else:
+            print(_ts() + "   [NOTE] Неинтерактивный запуск — продолжаем "
+                          "без этих носителей.")
+
+    if good:
+        print(_ts() + "   Согласованные носители: {}".format(", ".join(good)))
+    else:
+        print(_ts() + "   Согласованные носители не найдены "
+                      "(ожидались: {})".format(", ".join(expected)))
+    return good
+
+
+def load_trusted_inventory(trusted_dirs):
+    """
+    Загружает инвентаризации согласованных носителей.
+
+    Возвращает dict:
+      {
+        'by_hash': { hash_str: (label, kind, path) },   # kind: 'src' | 'bin'
+        'labels' : [имена носителей],
+        'counts' : { label: количество записей },
+      }
+
+    Хранится только первое вхождение каждого хеша — для атрибуции достаточно
+    одного основания, а дубли внутри носителя ничего не добавляют.
+    """
+    by_hash = {}
+    counts  = {}
+    labels  = []
+
+    for label in trusted_dirs:
+        labels.append(label)
+        n = 0
+        for kind in ("src", "bin"):
+            jpath = os.path.join(RESULTS_DIR, label, "sources",
+                                 "{}_{}.json".format(label, kind))
+            if not os.path.exists(jpath):
+                print(_ts() + "   [{}] {}.json отсутствует — пропускаем".format(
+                    label, kind))
+                continue
+            try:
+                with open(jpath, 'r', encoding='utf-8', errors='replace') as f:
+                    data = json.load(f)
+            except (ValueError, OSError) as exc:
+                print(_ts() + "   [{}] не удалось прочитать {}.json: {}".format(
+                    label, kind, exc))
+                continue
+            sigs = data.get('signatures', [])
+            for e in sigs:
+                h = (e.get('hash') or '').strip()
+                if not h or h in by_hash:
+                    continue
+                by_hash[h] = (label, kind, e.get('path', ''))
+                n += 1
+            print(_ts() + "   [{}] {}.json: {} записей".format(
+                label, kind, len(sigs)))
+        counts[label] = n
+
+    if labels:
+        print(_ts() + "   Доверенных хешей всего: {}".format(len(by_hash)))
+    return {'by_hash': by_hash, 'labels': labels, 'counts': counts}
+
+
 def load_buildography_data(paths):
     hashes = set()
     raw_cmds = []
@@ -763,6 +966,10 @@ def link_compiler_output_via_consumers(raw_cmds):
     """
     # Индекс .o из ВХОДОВ (dependencies) всех команд.
     o_index = {}  # basename -> list[(normpath, hash)]
+    # Все хеши, которые ХОТЬ КТО-ТО заявляет своим выходом. Нужно для
+    # самоограничения: если хеш нужного .o уже кем-то производится, цепочка
+    # замкнута по хешу и вмешиваться НЕЛЬЗЯ (иначе замаскируем реальную картину).
+    all_output_hashes = set()
     for cmd in raw_cmds:
         deps = cmd.get('dependencies', {})
         if isinstance(deps, dict):
@@ -781,10 +988,24 @@ def link_compiler_output_via_consumers(raw_cmds):
             o_index.setdefault(os.path.basename(path), []).append(
                 (os.path.normpath(path), h))
 
+        outs = cmd.get('output', {})
+        if isinstance(outs, dict):
+            out_items = outs.items()
+        elif isinstance(outs, list):
+            out_items = [(o.get('path', ''), o.get('hash', '')) for o in outs
+                         if isinstance(o, dict)]
+        else:
+            out_items = []
+        for _p, h in out_items:
+            h = h.strip() if h else ''
+            if h:
+                all_output_hashes.add(h)
+
     if not o_index:
-        return 0
+        return 0, 0
 
     linked = 0
+    intact = 0
     for cmd in raw_cmds:
         cl = cmd.get('command', [])
         if not cl:
@@ -822,11 +1043,17 @@ def link_compiler_output_via_consumers(raw_cmds):
             # >1 суффикса — неоднозначно, пропускаем (безопаснее не гадать)
 
         if hit:
+            # САМООГРАНИЧЕНИЕ: если этот хеш уже кем-то производится (например,
+            # дочерним 'clang -cc1', который записал объектник во временный файл),
+            # цепочка замкнута по хешу — не вмешиваемся.
+            if hit[1] in all_output_hashes:
+                intact += 1
+                continue
             cmd['output'] = [{'path': ot, 'hash': hit[1],
                               'synthesized': 'clang_o_from_consumer'}]
             linked += 1
 
-    return linked
+    return linked, intact
 
 
 # =============================================================================
@@ -1726,6 +1953,39 @@ SYSTEM_PATH_PREFIXES = (
     # Python / Perl stdlib
     '/usr/lib/python', '/usr/lib/python3',
     '/usr/lib/perl', '/usr/lib/perl5',
+    # -------------------------------------------------------------------------
+    # Каталоги исполняемых файлов сборочной машины.
+    #
+    # Это инструментарий хоста сборки: компиляторы, cmake, упаковщики, утилиты.
+    # Его никто не передаёт как носитель, сверять его по хешу не с чем, и
+    # компилятор физически не может быть источником СОДЕРЖИМОГО файла
+    # дистрибутива — он его производит, но не является его материалом.
+    # Поэтому здесь путь — оправданный и единственный доступный признак.
+    #
+    # Проверено на трассе NPUR.34018-01: все 235 выходов в этих каталогах —
+    # файлы *.dpkg-new, которые создаёт dpkg при установке пакетов сборочной
+    # машины. Ни одного файла изделия, staged install в системные каталоги
+    # сборка не делает.
+    #
+    # ВНИМАНИЕ: этот список относится к путям на ХОСТЕ СБОРКИ. Не путать с
+    # DISTRIB_SYSTEM_PREFIXES внутри analyze_pass4 — там пути ВНУТРИ
+    # дистрибутива, и usr/bin/ в том списке привёл бы к тому, что собственные
+    # бинари изделия стали бы считаться системными.
+    # -------------------------------------------------------------------------
+    '/usr/bin/', '/bin/', '/sbin/', '/usr/sbin/',
+    '/usr/local/bin/', '/usr/local/sbin/',
+    '/usr/doc/',
+    # -------------------------------------------------------------------------
+    # ТПО — многоязычный тулчейн сборочной машины (clang/gcc/cmake/JDK/node/
+    # Go/Rust/PHP/Bazel), разворачиваемый в /opt/centrem/tpo.
+    #
+    # Намеренно НЕ '/opt/centrem/' целиком: в /opt/centrem/svvp лежит СВВП, у
+    # которого есть инвентаризация, и он должен проверяться ПО ХЕШУ через
+    # TRUSTED. Списание СВВП по пути вернуло бы ровно ту дыру, ради закрытия
+    # которой всё это и делается: путь сказал бы "взято из СВВП", а что именно
+    # оттуда взяли — не проверил бы никто.
+    # -------------------------------------------------------------------------
+    '/opt/centrem/tpo/',
 )
 
 import re as _re
@@ -1752,6 +2012,29 @@ def _so_base_name(filename):
 def _is_system_path(path):
     """Возвращает True если путь относится к системным файлам хоста сборки."""
     return any(path.startswith(pfx) for pfx in SYSTEM_PATH_PREFIXES)
+
+
+# Каталоги исполняемых файлов хоста — для отдельного reason в filtered_deps
+_HOST_BIN_PREFIXES = ('/usr/bin/', '/bin/', '/sbin/', '/usr/sbin/',
+                      '/usr/local/bin/', '/usr/local/sbin/')
+
+
+def _filter_reason(path):
+    """
+    Основание, по которому зависимость отфильтрована.
+
+    Фильтр по пути всегда грубее фильтра по хешу, поэтому он обязан быть
+    видимым в отчёте: иначе через месяц никто не восстановит, что именно он
+    съел и почему.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.h', '.hpp', '.hxx', '.h++', '.hh'):
+        return 'header'
+    if path.startswith('/opt/centrem/tpo/'):
+        return 'build_host_toolchain_tpo'
+    if any(path.startswith(pfx) for pfx in _HOST_BIN_PREFIXES):
+        return 'build_host_executable'
+    return 'system_path'
 
 
 def _is_allowed_external_dep(dep_path):
@@ -2045,6 +2328,241 @@ _PKG_TOOL_TO_CMD = {
 }
 for _v in ['pip3.5','pip3.6','pip3.7','pip3.8','pip3.9','pip3.10','pip3.11']:
     _PKG_TOOL_TO_CMD[_v] = 'pip install'
+
+
+# =============================================================================
+# ОПОЗНАНИЕ ОПЕРАЦИИ КОМАНДЫ
+# =============================================================================
+# Определять инструмент по argv[0] недостаточно. В реальной трассе встречается:
+#
+#   /usr/bin/python3 /usr/bin/pip3 download --index http://localhost:9000 ...
+#   xargs -i wheel pack {}
+#   /usr/bin/python3 -c "import sys, setuptools, tokenize; ... 'setup.py' ..."
+#   /usr/bin/python3 .../pep517/_in_process.py prepare_metadata_for_build_wheel
+#
+# В первых двух случаях argv[0] — это python3 и xargs, то есть интерпретатор и
+# обвязка; настоящий инструмент стоит дальше. В третьем случае имя собираемого
+# пакета и путь к setup.py вообще находятся ВНУТРИ строки после -c и ни одним
+# отдельным элементом argv не представлены.
+#
+# Поэтому опознание идёт по двум каналам: цепочка первых неопционных токенов
+# (она покрывает обвязки) и текстовый поиск ключевых слов по всей команде
+# (он покрывает тела -c).
+# =============================================================================
+
+# Операции, при которых содержимое файла СОЗДАЁТСЯ
+_OP_COMPILED  = 'compiled'    # компилятор/ассемблер/линковщик
+_OP_BUILT     = 'built'       # сборка пакета из исходников (setup.py, -m build)
+# Операции, при которых содержимое ПЕРЕНОСИТСЯ или ПРЕОБРАЗУЕТСЯ
+_OP_REPACKED  = 'repacked'    # переупаковка (wheel pack, dpkg-deb -b, tar -c)
+_OP_SIGNED    = 'signed'      # подпись готового файла (bsign, gpg)
+_OP_EXTRACTED = 'extracted'   # распаковка (unzip, tar -x, dpkg -x)
+_OP_COPIED    = 'copied'      # копирование (cp, install, mv)
+_OP_TRANSFORMED = 'transformed'  # правка готового бинаря (strip, objcopy, patchelf)
+_OP_DOWNLOADED = 'downloaded' # получение по сети (pip download, wget, curl)
+_OP_OTHER     = 'other'
+
+# Операции, которые НЕ создают содержимое, а только переносят или правят его.
+# Для них происхождение файла надо искать во входе команды.
+#
+# strip и objcopy попадают сюда по той же причине, что bsign: они меняют байты
+# готового файла, значит его хеш не совпадёт ни с одним исходником, и файл
+# выглядит "новым" — хотя содержательно это тот же сторонний бинарь.
+DERIVING_OPERATIONS = frozenset((_OP_REPACKED, _OP_SIGNED, _OP_EXTRACTED,
+                                 _OP_COPIED, _OP_TRANSFORMED))
+
+_OP_TRANSFORM_TOOLS = frozenset((
+    'strip', 'objcopy', 'patchelf', 'chrpath', 'genchecksum',
+    'llvm-strip', 'llvm-objcopy', 'ranlib', 'llvm-ranlib',
+))
+_OP_JS_TOOLS = frozenset(('node', 'nodejs', 'npm', 'npx', 'yarn',
+                          'webpack', 'rollup', 'esbuild', 'tsc'))
+
+_OP_SIGN_TOOLS    = frozenset(('bsign', 'gpg', 'gpg2', 'gostsum', 'gostsum12'))
+_OP_REPACK_TOOLS  = frozenset(('wheel', 'dpkg-deb', 'jar', 'cpack', 'zip'))
+_OP_EXTRACT_TOOLS = frozenset(('unzip', 'dpkg-split', 'unxz', 'gunzip', 'bunzip2'))
+_OP_COPY_TOOLS    = frozenset(('cp', 'install', 'mv', 'copy', 'rsync'))
+_OP_PIP_TOOLS     = frozenset(('pip', 'pip2', 'pip3', 'pip3.5', 'pip3.6', 'pip3.7',
+                               'pip3.8', 'pip3.9', 'pip3.10', 'pip3.11'))
+_OP_NET_TOOLS     = frozenset(('wget', 'curl'))
+
+# Токены, после которых идёт адрес индекса/репозитория
+_OP_URL_OPTS = frozenset(('--index', '--index-url', '-i', '--extra-index-url',
+                          '--find-links', '-f'))
+
+_OP_MAX_SCAN = 8000   # ограничение на длину склеенной команды для поиска слов
+
+
+def _op_head_names(argv, limit=6):
+    """
+    Базовые имена первых неопционных токенов команды.
+    Покрывает обвязки: python3 -> pip3 -> download, xargs -> wheel -> pack.
+    """
+    names = []
+    for tok in argv:
+        if not isinstance(tok, str) or not tok or tok.startswith('-'):
+            continue
+        names.append(os.path.basename(tok))
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _op_extract_url(argv):
+    """Первый http(s)-адрес в команде: явный токен или значение --index и т.п."""
+    for i, tok in enumerate(argv):
+        if not isinstance(tok, str):
+            continue
+        if tok.startswith('http://') or tok.startswith('https://'):
+            return tok
+        if '=' in tok:
+            opt, _, val = tok.partition('=')
+            if opt in _OP_URL_OPTS and val.startswith(('http://', 'https://')):
+                return val
+        if tok in _OP_URL_OPTS and i + 1 < len(argv):
+            nxt = argv[i + 1]
+            if isinstance(nxt, str) and nxt.startswith(('http://', 'https://')):
+                return nxt
+    return ''
+
+
+def _op_tar_mode(argv):
+    """Для tar: 'create' | 'extract' | '' — по флагам команды."""
+    for tok in argv:
+        if not isinstance(tok, str) or not tok.startswith('-'):
+            continue
+        if tok in ('--create',):
+            return 'create'
+        if tok in ('--extract', '--get'):
+            return 'extract'
+        if tok.startswith('--'):
+            continue
+        # Короткие флаги могут быть склеены: -czf, -xvf
+        body = tok[1:]
+        if 'c' in body:
+            return 'create'
+        if 'x' in body or 't' in body:
+            return 'extract'
+    # tar без ведущего дефиса: tar cf / tar xf
+    if len(argv) > 1 and isinstance(argv[1], str) and not argv[1].startswith('-'):
+        body = argv[1]
+        if body and body[0] == 'c':
+            return 'create'
+        if body and body[0] in ('x', 't'):
+            return 'extract'
+    return ''
+
+
+def detect_operation(argv, compiler_basenames=None, linker_basenames=None):
+    """
+    Определяет род операции команды и уточняющую подробность.
+
+    Возвращает (operation, detail), где operation — одна из констант _OP_*,
+    а detail — имя инструмента либо, для загрузки, адрес источника.
+
+    Порядок проверок важен: от самого определённого признака к самому общему.
+    Компилятор проверяется первым, потому что это единственная операция,
+    которая действительно создаёт содержимое из исходного текста.
+    """
+    if not argv or not isinstance(argv, (list, tuple)):
+        return _OP_OTHER, ''
+
+    names = _op_head_names(argv)
+    nameset = set(names)
+    text = ' '.join(t for t in argv if isinstance(t, str))[:_OP_MAX_SCAN]
+
+    # 1. Компиляция / сборка объектного кода
+    if compiler_basenames and (nameset & set(compiler_basenames)):
+        return _OP_COMPILED, (nameset & set(compiler_basenames)).pop()
+    if linker_basenames and (nameset & set(linker_basenames)):
+        return _OP_COMPILED, (nameset & set(linker_basenames)).pop()
+
+    # 2. Получение по сети
+    net = nameset & _OP_NET_TOOLS
+    if net:
+        return _OP_DOWNLOADED, _op_extract_url(argv) or net.pop()
+    pip = nameset & _OP_PIP_TOOLS
+    if pip and 'download' in nameset:
+        return _OP_DOWNLOADED, _op_extract_url(argv) or 'pip download'
+    if ('apt' in nameset or 'apt-get' in nameset) and 'download' in nameset:
+        return _OP_DOWNLOADED, 'apt download'
+
+    # 3. Подпись готового файла
+    sign = nameset & _OP_SIGN_TOOLS
+    if sign:
+        tool = sign.pop()
+        if tool.startswith('gpg') and not any(
+                t in text for t in ('--sign', '--detach-sign', '--clearsign')):
+            pass   # gpg без подписи — не считаем операцией подписи
+        else:
+            return _OP_SIGNED, tool
+
+    # 4. Переупаковка
+    if 'wheel' in nameset and 'pack' in nameset:
+        return _OP_REPACKED, 'wheel pack'
+    if 'dpkg-deb' in nameset and ('-b' in argv or '--build' in argv):
+        return _OP_REPACKED, 'dpkg-deb --build'
+    if 'tar' in nameset:
+        mode = _op_tar_mode(argv)
+        if mode == 'create':
+            return _OP_REPACKED, 'tar --create'
+        if mode == 'extract':
+            return _OP_EXTRACTED, 'tar --extract'
+    rep = nameset & _OP_REPACK_TOOLS
+    if rep:
+        return _OP_REPACKED, rep.pop()
+
+    # 5. Сборка пакета из исходников.
+    #    Признаки ищем по всему тексту команды, т.к. setup.py и имя пакета
+    #    часто находятся внутри строки после -c.
+    if '-m' in argv:
+        try:
+            mi = list(argv).index('-m')
+            if mi + 1 < len(argv) and argv[mi + 1] in ('build', 'pip', 'setuptools'):
+                if argv[mi + 1] == 'build':
+                    return _OP_BUILT, 'python -m build'
+                if argv[mi + 1] == 'pip' and 'download' in nameset:
+                    return _OP_DOWNLOADED, _op_extract_url(argv) or 'pip download'
+                if argv[mi + 1] == 'pip':
+                    return _OP_BUILT, 'python -m pip'
+        except ValueError:
+            pass
+    if 'setup.py' in text or 'bdist_wheel' in text or 'sdist' in text:
+        return _OP_BUILT, 'setup.py'
+    if 'pep517' in text or '_in_process.py' in text:
+        return _OP_BUILT, 'pep517'
+    if pip and ('install' in nameset or 'wheel' in nameset):
+        return _OP_BUILT, 'pip install'
+
+    # 6. Распаковка
+    ext = nameset & _OP_EXTRACT_TOOLS
+    if ext:
+        return _OP_EXTRACTED, ext.pop()
+    if 'dpkg' in nameset and any(t in argv for t in ('-x', '-X', '--extract',
+                                                    '--unpack', '--fsys-tarfile')):
+        return _OP_EXTRACTED, 'dpkg --unpack'
+    if 'ar' in nameset and any(isinstance(t, str) and t.startswith('x')
+                               for t in argv[1:2]):
+        return _OP_EXTRACTED, 'ar x'
+
+    # 7. Правка готового бинаря — меняет байты, но не создаёт содержимое
+    tr = nameset & _OP_TRANSFORM_TOOLS
+    if tr:
+        return _OP_TRANSFORMED, tr.pop()
+
+    # 8. Сборка средствами JS-тулчейна.
+    #    node/npm в сборочной трассе, производящие файл дистрибутива, именно
+    #    генерируют его (бандл, минификат), поэтому это создание содержимого.
+    js = nameset & _OP_JS_TOOLS
+    if js:
+        return _OP_BUILT, js.pop()
+
+    # 9. Копирование
+    cp = nameset & _OP_COPY_TOOLS
+    if cp:
+        return _OP_COPIED, cp.pop()
+
+    return _OP_OTHER, (names[0] if names else '')
 
 
 def _detect_package_type(path):
@@ -2354,6 +2872,360 @@ def build_apt_download_hashes(buildography_files):
 
     print(_ts() + "   apt download index: {} .deb packages known".format(len(apt_deb_names)))
     return apt_deb_names
+
+
+# =============================================================================
+# ОПРЕДЕЛЕНИЕ ПРОИСХОЖДЕНИЯ ФАЙЛА ДИСТРИБУТИВА
+# =============================================================================
+# Задача: для файла, который текущая логика относит к compiled_from_src,
+# установить ТЕРМИНАЛ его цепочки происхождения — то есть файл, из содержимого
+# которого он в конечном счёте получен.
+#
+# Зачем это нужно. Категория compiled_from_src — это else-ветка Pass 4. Файл
+# попадает в неё при трёх условиях: его хеш является выходом прослеженной
+# команды; среди переживших фильтрацию зависимостей нет подозрительных
+# внешних; хеша нет в src.json. Участие исходного текста изделия не
+# проверяется ни на одном шаге, поэтому название категории утверждает больше,
+# чем код измеряет.
+#
+# Измерения на реальном изделии (NPUR.34018-01, 124 уникальных файла):
+#   wheel pack       53   переупаковка распакованного чужого колеса
+#   python -m build  27   сборка чужого пакета из чужого sdist
+#   bsign            22   ГОСТ-подпись готового ELF внутри .deb
+#   unzip             6   побайтовая распаковка из архива
+#   pip install       5
+#   dpkg              4
+#   node              4
+#   tar               2
+#   pip download      1
+# Ни одного компилятора. То есть ни один из этих файлов не собран из исходных
+# текстов изделия, хотя все они так помечены.
+#
+# Происхождение (ОСЬ 1, она же категория):
+#   product_src       — терминал в src.json изделия
+#   approved_source   — терминал на согласованном носителе (TRUSTED), по хешу
+#   download          — терминал на сетевой загрузке, с адресом источника
+#   unresolved        — терминал не опознан
+#
+# Операция (ОСЬ 2, атрибут записи, не категория):
+#   compiled / built / repacked / signed / extracted / copied / transformed /
+#   downloaded / other — см. detect_operation.
+# =============================================================================
+
+ORIGIN_PRODUCT_SRC = 'product_src'
+ORIGIN_APPROVED    = 'approved_source'
+ORIGIN_DOWNLOAD    = 'download'
+ORIGIN_UNRESOLVED  = 'unresolved'
+
+# Максимум зависимостей, разбираемых у одной команды. Защита от "жирных"
+# команд: у распаковщиков и линковщиков в трассе встречаются списки на
+# сотни тысяч записей, и без ограничения проход по ним съедает память.
+_ORIGIN_MAX_DEPS_PER_CMD = 3000
+# Максимум хешей во фронтире одного раунда
+_ORIGIN_MAX_FRONTIER = 20000
+# Сколько раз расширять поиск назад по цепочке.
+# Каждый раунд — один проход по buildography, поэтому значение не задирается.
+# Трёх хватает на цепочки вида бинарь <- .o <- .c и колесо <- каталог <- архив.
+# Переопределяется переменной окружения ORIGIN_ROUNDS для экспериментов.
+try:
+    _ORIGIN_MAX_ROUNDS = max(1, int(os.environ.get('ORIGIN_ROUNDS', '3')))
+except ValueError:
+    _ORIGIN_MAX_ROUNDS = 3
+
+
+def _iter_cmd_pairs(section):
+    """
+    Обходит dependencies/output команды, которые в buildography встречаются
+    в двух форматах: dict {путь: хеш} и list [{path:..., hash:...}].
+    Отдаёт пары (путь, хеш).
+    """
+    if isinstance(section, dict):
+        for p, h in section.items():
+            yield p, (h.strip() if isinstance(h, str) else '')
+    elif isinstance(section, list):
+        for item in section:
+            if isinstance(item, dict):
+                yield (item.get('path', ''),
+                       (item.get('hash') or '').strip())
+
+
+def collect_producers(buildography_files, target_hashes,
+                      compiler_basenames=None, linker_basenames=None,
+                      max_deps=_ORIGIN_MAX_DEPS_PER_CMD):
+    """
+    Один проход по buildography. Для каждого хеша из target_hashes находит
+    первую команду, у которой этот хеш стоит в output, и запоминает:
+      operation, detail, id, argv (укороченный), deps [(путь, хеш)].
+
+    Системные зависимости отбрасываются сразу — они составляют подавляющую
+    часть списка (libc, locale-archive, gconv-modules и прочие чтения
+    динамического загрузчика) и для происхождения бесполезны.
+    """
+    if not target_hashes:
+        return {}
+
+    producers = {}
+    remaining = set(target_hashes)
+
+    for file_path in buildography_files:
+        if not remaining:
+            break
+        with open(file_path, 'rb') as f:
+            data = _json_loads(f.read())
+        for cmd in data.get('component_commands', []):
+            if not remaining:
+                break
+            hits = []
+            for _p, h in _iter_cmd_pairs(cmd.get('output', {})):
+                if h and h in remaining:
+                    hits.append(h)
+            if not hits:
+                continue
+
+            argv = cmd.get('command') or []
+            operation, detail = detect_operation(
+                argv, compiler_basenames, linker_basenames)
+
+            deps = []
+            if operation != _OP_DOWNLOADED:
+                n = 0
+                for dp, dh in _iter_cmd_pairs(cmd.get('dependencies', {})):
+                    if not dh:
+                        continue
+                    # Отбрасываем ТОЛЬКО файлы хоста сборки по абсолютному
+                    # пути. _is_allowed_external_dep здесь намеренно НЕ
+                    # применяется: он отвечает на другой вопрос ("является ли
+                    # зависимость подозрительной для external_built") и для
+                    # этого разрешает любой .so, в пути которого есть /lib/.
+                    # Для происхождения это гибельно — вход bsign вида
+                    # ./usr/lib/apache2/modules/mod_x.so, то есть ровно тот
+                    # файл, из которого получен подписанный, отбрасывался бы
+                    # как "системная библиотека", и терминал цепочки терялся.
+                    if _is_system_path(dp):
+                        continue
+                    deps.append((dp, dh))
+                    n += 1
+                    if n >= max_deps:
+                        break
+
+            argv_short = ' '.join(t for t in argv if isinstance(t, str))[:300]
+            for h in hits:
+                producers[h] = {
+                    'operation': operation,
+                    'detail':    detail,
+                    'cmd_id':    cmd.get('id'),
+                    'argv':      argv_short,
+                    'deps':      deps,
+                }
+                remaining.discard(h)
+        del data
+
+    return producers
+
+
+def _trusted_container(trusted_path):
+    """
+    Из пути внутри согласованного носителя достаёт ближайший архив/пакет —
+    то, что имеет смысл называть основанием доверия.
+
+      TRUSTED.GENERAL/src/pypi-cache/distlib/distlib-0.3.4.zip_dir/distlib/t64-arm.exe
+        -> pypi-cache/distlib/distlib-0.3.4.zip
+    """
+    if not trusted_path:
+        return ''
+    marker = '_dir/'
+    idx = trusted_path.find(marker)
+    if idx < 0:
+        return trusted_path
+    head = trusted_path[:idx]
+    # Отрезаем префикс "<носитель>/<src|bin>/"
+    parts = head.split('/', 2)
+    return parts[2] if len(parts) == 3 else head
+
+
+def resolve_origins(entries, src_hashes, trusted_by_hash, buildography_files,
+                    compiler_basenames=None, linker_basenames=None,
+                    max_rounds=_ORIGIN_MAX_ROUNDS):
+    """
+    Для списка записей (dict с полями path/hash) устанавливает происхождение.
+
+    В каждую запись добавляются поля:
+      operation      — род операции производящей команды
+      operation_cmd  — укороченная командная строка
+      origin         — одна из ORIGIN_*
+      origin_detail  — основание: путь в src.json / носитель+путь / URL / причина
+      origin_chain   — краткая цепочка операций от файла к терминалу
+
+    Возвращает (product_src, approved, download, unresolved) — четыре списка
+    тех же самых записей, разложенные по происхождению.
+    """
+    print(_ts() + "   Origin: входных записей {}".format(len(entries)))
+
+    # Группируем записи по хешу — один хеш часто лежит по нескольким путям
+    by_hash = {}
+    for e in entries:
+        h = (e.get('hash') or '').strip()
+        by_hash.setdefault(h, []).append(e)
+    print(_ts() + "   Origin: уникальных хешей {}".format(len(by_hash)))
+
+    verdict = {}    # hash -> (origin, detail)
+    chains  = {}    # hash -> [строки цепочки]
+
+    def _set(h, origin, detail):
+        verdict[h] = (origin, detail)
+
+    # --- Раунд 0: прямая сверка самого файла -------------------------------
+    for h in by_hash:
+        if not h:
+            _set(h, ORIGIN_UNRESOLVED, 'пустой хеш')
+            continue
+        if h in src_hashes:
+            _set(h, ORIGIN_PRODUCT_SRC, 'хеш файла есть в src.json')
+        elif h in trusted_by_hash:
+            label, kind, tpath = trusted_by_hash[h]
+            _set(h, ORIGIN_APPROVED,
+                 '{}/{}: {}'.format(label, kind, _trusted_container(tpath)))
+
+    # --- Раунды 1..N: обратный обход ---------------------------------------
+    # dependents[x] — множество исходных хешей, судьба которых зависит от x
+    dependents = {}
+    frontier = set(h for h in by_hash if h not in verdict)
+    for h in frontier:
+        dependents[h] = {h}
+    seen = set(frontier)
+
+    rnd = 0
+    while frontier and rnd < max_rounds:
+        rnd += 1
+        print(_ts() + "   Origin: раунд {}, во фронтире {} хешей".format(
+            rnd, len(frontier)))
+        producers = collect_producers(
+            buildography_files, frontier,
+            compiler_basenames, linker_basenames)
+        print(_ts() + "   Origin: раунд {}, найдено производителей {}".format(
+            rnd, len(producers)))
+
+        next_frontier = set()
+        for h in frontier:
+            roots = dependents.get(h, set())
+            unresolved_roots = [r for r in roots if r not in verdict]
+            if not unresolved_roots:
+                continue
+
+            prod = producers.get(h)
+            if prod is None:
+                for r in unresolved_roots:
+                    if r == h:
+                        _set(r, ORIGIN_UNRESOLVED,
+                             'производящая команда в трассе не найдена')
+                continue
+
+            step = '{}({})'.format(prod['operation'], prod['detail'] or '?')
+            for r in unresolved_roots:
+                chains.setdefault(r, []).append(step)
+
+            # Операция сама является терминалом
+            if prod['operation'] == _OP_DOWNLOADED:
+                for r in unresolved_roots:
+                    _set(r, ORIGIN_DOWNLOAD,
+                         prod['detail'] or 'сетевая загрузка')
+                continue
+
+            # Ищем терминал среди зависимостей: сначала согласованный
+            # носитель, затем исходные тексты изделия.
+            hit_trusted = None
+            hit_src     = None
+            for dp, dh in prod['deps']:
+                if hit_trusted is None and dh in trusted_by_hash:
+                    hit_trusted = (dp, dh)
+                    break
+            if hit_trusted is None:
+                for dp, dh in prod['deps']:
+                    if dh in src_hashes:
+                        hit_src = (dp, dh)
+                        break
+
+            if hit_trusted is not None:
+                label, kind, tpath = trusted_by_hash[hit_trusted[1]]
+                detail = '{}/{}: {}'.format(label, kind,
+                                            _trusted_container(tpath))
+                for r in unresolved_roots:
+                    _set(r, ORIGIN_APPROVED, detail)
+                continue
+            if hit_src is not None:
+                for r in unresolved_roots:
+                    _set(r, ORIGIN_PRODUCT_SRC,
+                         'вход команды есть в src.json: {}'.format(
+                             hit_src[0][:120]))
+                continue
+
+            # У команды нет неотфильтрованных входов — идти дальше некуда.
+            # Формулировка различается по тому, создаёт операция содержимое
+            # или только переносит его: во втором случае отсутствие входа —
+            # это пробел трассы, в первом может быть и нормой.
+            if not prod['deps']:
+                if prod['operation'] in DERIVING_OPERATIONS:
+                    why = ('операция {} только переносит содержимое, но её '
+                           'вход в трассе отсутствует'.format(prod['operation']))
+                else:
+                    why = ('у производящей команды ({}) нет неотфильтрованных '
+                           'входов'.format(prod['operation']))
+                for r in unresolved_roots:
+                    _set(r, ORIGIN_UNRESOLVED, why)
+                continue
+
+            # Терминал не найден — продолжаем обход назад по зависимостям
+            if rnd < max_rounds and len(next_frontier) < _ORIGIN_MAX_FRONTIER:
+                for dp, dh in prod['deps']:
+                    if dh in seen:
+                        continue
+                    next_frontier.add(dh)
+                    seen.add(dh)
+                    dependents.setdefault(dh, set()).update(unresolved_roots)
+                    if len(next_frontier) >= _ORIGIN_MAX_FRONTIER:
+                        break
+            else:
+                for r in unresolved_roots:
+                    if r not in verdict:
+                        _set(r, ORIGIN_UNRESOLVED,
+                             'цепочка не дошла до опознанного источника '
+                             '(операция {})'.format(prod['operation']))
+
+        frontier = next_frontier
+
+    # Всё, что осталось без вердикта после последнего раунда
+    for h in by_hash:
+        if h not in verdict:
+            _set(h, ORIGIN_UNRESOLVED, 'обход прерван по глубине')
+
+    # --- Раскладываем записи и дописываем поля ------------------------------
+    out = {ORIGIN_PRODUCT_SRC: [], ORIGIN_APPROVED: [],
+           ORIGIN_DOWNLOAD: [], ORIGIN_UNRESOLVED: []}
+
+    # Операцию берём у производителя самого файла (первый шаг цепочки)
+    own_producers = collect_producers(
+        buildography_files, set(by_hash.keys()),
+        compiler_basenames, linker_basenames, max_deps=1)
+
+    for h, elist in by_hash.items():
+        origin, detail = verdict.get(h, (ORIGIN_UNRESOLVED, ''))
+        prod = own_producers.get(h) or {}
+        for e in elist:
+            e['operation']     = prod.get('operation', _OP_OTHER)
+            e['operation_cmd'] = prod.get('argv', '')
+            e['origin']        = origin
+            e['origin_detail'] = detail
+            ch = chains.get(h)
+            if ch:
+                e['origin_chain'] = ' <- '.join(ch[:6])
+            out[origin].append(e)
+
+    print(_ts() + "   Origin: product_src={}, approved_source={}, "
+                  "download={}, unresolved={}".format(
+                      len(out[ORIGIN_PRODUCT_SRC]), len(out[ORIGIN_APPROVED]),
+                      len(out[ORIGIN_DOWNLOAD]), len(out[ORIGIN_UNRESOLVED])))
+    return (out[ORIGIN_PRODUCT_SRC], out[ORIGIN_APPROVED],
+            out[ORIGIN_DOWNLOAD], out[ORIGIN_UNRESOLVED])
 
 
 def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
@@ -2749,6 +3621,34 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
             if h_str in src_hashes:
                 binaries_from_src.append(_make_entry())
             else:
+                # ------------------------------------------------------------
+                # ОТЛОЖЕННАЯ ЗАДАЧА: обрыв обратной цепочки.
+                #
+                # Это else-ветка, и сюда файл попадает по отсутствию
+                # возражений, а не по доказательству. Условие "подозрительных
+                # зависимостей не осталось" выполняется слишком легко: у
+                # команды в трассе 280-320 зависимостей, и подавляющая их
+                # часть — чтения динамического загрузчика (libc,
+                # locale-archive, gconv-modules, libz), которые целиком
+                # уходят в системный фильтр. Проверять оказывается нечего.
+                #
+                # Кроме того цепочка обрывается по трём техническим причинам:
+                #   - расширение фронтира ограничено MAX_ITERATIONS = 3;
+                #   - _scan_pass выбрасывает ПУТЬ зависимости, если её хеш
+                #     является чьим-то выходом (считает промежуточным
+                #     артефактом) — так молча проглатываются внешние архивы;
+                #   - команда может не опознаваться как инструмент, если её
+                #     настоящий исполнитель стоит не в argv[0].
+                #
+                # Сейчас это НЕ исправляется сознательно: расширение фронтира
+                # и сохранение путей архивов требуют отдельного решения,
+                # более изящного, чем увеличение лимита итераций. Пока
+                # компенсация сделана снаружи — resolve_origins() разбирает
+                # эту категорию по действительному терминалу цепочки и
+                # раскладывает её на origin_* отчёты в try{N}.
+                #
+                # К самому обрыву вернуться нужно.
+                # ------------------------------------------------------------
                 compiled_from_src.append(_make_entry())
 
     del full_out_to_deps, all_output_hashes, all_dep_hashes
@@ -2806,10 +3706,8 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
                         continue
                     if _is_system_path(path) or _is_allowed_external_dep(path):
                         seen_paths.add(path)
-                        reason = "header" if os.path.splitext(path)[1].lower() in (
-                            ".h", ".hpp", ".hxx") else "system_path"
                         filtered.append({"path": path, "hash": h.strip() if h else "",
-                                          "reason": reason})
+                                          "reason": _filter_reason(path)})
 
                 # Добавляем filtered_deps к нужным записям
                 for out_hi in relevant:
@@ -2898,6 +3796,12 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     output_dir = os.path.join(RESULTS_DIR, project_name, "izb")
     os.makedirs(output_dir, exist_ok=True)
 
+    # Согласованные носители — ищем до начала разбора, чтобы предупреждение
+    # о неверно названном каталоге и вопрос пользователю прозвучали сразу,
+    # а не через полчаса анализа.
+    trusted_dirs = discover_trusted_dirs(project_name)
+    trusted      = load_trusted_inventory(trusted_dirs)
+
     try:
         signatures = load_signatures(signatures_files)
         buildography_hashes, raw_cmds = load_buildography_data(buildography_files)
@@ -2913,14 +3817,40 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         # трассировщик не пишет .o в output команды 'clang++ -c ... -o X.o',
         # но .o есть во входах ld. Берём hash .o из потребителя и синтезируем
         # выход компилятору, чтобы .cpp не попал в избыточные ложно.
-        # Переключатель для отладки: NO_CLANG_LINK=1 отключает сшивку,
-        # чтобы сравнить результат с/без неё на одном и том же buildography.
+        # Сшивка clang -> .o через потребителя ОТКЛЮЧЕНА ПО УМОЛЧАНИЮ.
+        #
+        # Проверено на buildography ТДС (60085 и 60099): цепочка .cpp -> .o -> бинарь
+        # НЕ разорвана, и правка не нужна. Механика: clang пишет объектный файл во
+        # временный файл со случайным именем в /tmp (вида /tmp/xxxx.o.tmp) и затем
+        # переименовывает его в целевой .o. Трассировщик записывает ВРЕМЕННЫЙ путь
+        # (событие переименования в JSON не сохраняется), но ХЕШ содержимого при
+        # переименовании не меняется. При этом дочерний процесс 'clang -cc1' имеет
+        # исходник в dependencies и хеш объектника в output, а BFS в
+        # build_transitive_good_commands сопоставляет узлы И ПО ХЕШУ — поэтому связь
+        # .cpp -> .o -> ld -> бинарь замыкается сама.
+        #
+        # Замеры (60085): 1106 хешей .o.tmp на выходе, все 1106 совпали с хешами .o
+        # во входах ld; 1109 команд с .o.tmp содержат исходник в deps (все -cc1).
+        # Эксперимент вкл/выкл на одном buildography: классификация не изменилась
+        # (moved to not_compiled = 353 в обоих случаях), менялось лишь число
+        # "good commands" (2887 против 1950) за счёт лишних синтезированных рёбер.
+        #
+        # Работает как САМООГРАНИЧИВАЮЩИЙСЯ фолбэк: сшивает только те команды,
+        # для которых хеш .o не заявлен выходом НИ ОДНОЙ команды (т.е. цепочка
+        # действительно разорвана). Если хеш уже кем-то производится — не
+        # вмешивается и сообщает об этом. Отключить полностью: NO_CLANG_LINK=1
         if os.environ.get('NO_CLANG_LINK') == '1':
-            print(_ts() + "   [NO_CLANG_LINK=1] clang(integrated-as)->.o linking DISABLED")
+            print(_ts() + "   [NO_CLANG_LINK=1] clang->.o fallback DISABLED")
         else:
-            _linked_clang = link_compiler_output_via_consumers(raw_cmds)
+            _linked_clang, _intact_clang = link_compiler_output_via_consumers(raw_cmds)
+            if _intact_clang:
+                print(_ts() + "   clang->.o chain already closed by hash for {} commands "
+                              "(fallback not needed)".format(_intact_clang))
             if _linked_clang:
-                print(_ts() + "   Linked clang(integrated-as)->.o via consumers: {} .cpp->.o pairs".format(_linked_clang))
+                print(_ts() + "   WARNING: clang->.o chain BROKEN for {} commands — "
+                              "synthesized outputs via consumers. Трасса не записала "
+                              "выход компилятора; результаты проверить отдельно."
+                              .format(_linked_clang))
 
         bin_hashes, bin_paths = load_bin_signatures(project_name)
     except Exception as e:
@@ -3127,7 +4057,10 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             compiler_basenames=compiler_basenames,
             linker_basenames=linker_basenames
         )
-        del bin_entries, src_hashes
+
+        # src_hashes нужен дальше для разбора происхождения — он удаляется
+        # после java-эвристики, которая досыпает записи в compiled_from_src.
+        del bin_entries
         gc.collect()
 
         # Выделяем содержимое внешних пакетов из untraced_external
@@ -3242,12 +4175,39 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         elif trust_java:
             print(_ts() + "   Pass 4: Java heuristic: external_built is empty, skipping")
 
+        # ------------------------------------------------------------------
+        # ПРОИСХОЖДЕНИЕ файлов, попавших в else-ветку Pass 4.
+        #
+        # Выполняется ПОСЛЕ java-эвристики, потому что она досыпает записи
+        # в compiled_from_src и они тоже должны получить разбор.
+        #
+        # Сама категория compiled_from_src не меняется: её состав и её
+        # единственный файл в summary остаются прежними. Разбор добавляется
+        # рядом, в try{N}, и текущих цифр не ломает.
+        # ------------------------------------------------------------------
+        p4_origin_product, p4_origin_approved = [], []
+        p4_origin_download, p4_origin_unresolved = [], []
+        if p4_compiled_from_src:
+            print(_ts() + "   Starting origin resolution for {} entries...".format(
+                len(p4_compiled_from_src)))
+            (p4_origin_product, p4_origin_approved,
+             p4_origin_download, p4_origin_unresolved) = resolve_origins(
+                p4_compiled_from_src, src_hashes, trusted['by_hash'],
+                buildography_files,
+                compiler_basenames=compiler_basenames,
+                linker_basenames=linker_basenames)
+
+        del src_hashes
+        gc.collect()
+
     else:
         print(_ts() + "   Pass 4 skipped (no bin entries)")
         p4_compiled_from_src = p4_binaries_from_src = p4_untraced_from_src = \
         p4_external_built = p4_external_prebuilt = p4_untraced_external = \
         p4_system_binaries = []
         p4_external_package_content = []
+        p4_origin_product = p4_origin_approved = []
+        p4_origin_download = p4_origin_unresolved = []
         pass4_ran = False
         del src_hashes
         gc.collect()
@@ -3310,7 +4270,15 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     # --- Pass 4 ---
     if pass4_ran:
         print(_ts() + "   Writing pass 4 results...")
-        jt(pass4_dir, "compiled_from_src",  "compiled_from_src",  p4_compiled_from_src)
+        # compiled_from_src — единый файл и в try{N}, и в summary.
+        # Разбор по происхождению лежит рядом отдельными отчётами и в
+        # summary не тянется (договорённость: сущности не множим).
+        jt(pass4_dir, "compiled_from_src",  "compiled_from_src",  p4_compiled_from_src,
+           summary_bin_files, "compiled_from_src")
+        jt(pass4_dir, "origin_product_src",     "origin_product_src",     p4_origin_product)
+        jt(pass4_dir, "origin_approved_source", "origin_approved_source", p4_origin_approved)
+        jt(pass4_dir, "origin_download",        "origin_download",        p4_origin_download)
+        jt(pass4_dir, "origin_unresolved",      "origin_unresolved",      p4_origin_unresolved)
         jt(pass4_dir, "binaries_from_src",  "binaries_from_src",  p4_binaries_from_src,
            summary_bin_files, "binaries_from_src")
         jt(pass4_dir, "untraced_from_src",  "untraced_from_src",  p4_untraced_from_src)
@@ -3383,7 +4351,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                      len(p4_system_binaries) + len(p4_external_package_content))
         print("\n  Происхождение бинарей дистрибутива ({} файлов)".format(total_bin))
         print(sep)
-        print("  Compiled from src  (собран из src.json)            : {:>7}  ({:.1f}%)".format(
+        print("  Compiled from src  (появился в ходе сборки)         : {:>7}  ({:.1f}%)".format(
             len(p4_compiled_from_src),  pct(len(p4_compiled_from_src),  total_bin)))
         print("  Binaries from src  (бинарь из src.json, скопирован): {:>7}  ({:.1f}%)".format(
             len(p4_binaries_from_src),  pct(len(p4_binaries_from_src),  total_bin)))
@@ -3400,6 +4368,29 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         print("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(
             len(p4_external_package_content),
             pct(len(p4_external_package_content), total_bin)))
+
+        # Разбор первой строки по происхождению. В summary.txt не выносится
+        # (сущности не множим), но в консоли и в try{N} он нужен — именно он
+        # отвечает на вопрос, что в действительности означает первая цифра.
+        if p4_compiled_from_src:
+            n_cfs = len(p4_compiled_from_src)
+            print("\n  из них по происхождению:")
+            print("    Product src      (терминал в src.json изделия)   : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_product),    pct(len(p4_origin_product),    n_cfs)))
+            print("    Approved source  (согласованный носитель)        : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_approved),   pct(len(p4_origin_approved),   n_cfs)))
+            print("    Download         (получен по сети)               : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_download),   pct(len(p4_origin_download),   n_cfs)))
+            print("    Unresolved       (происхождение не установлено)  : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_unresolved), pct(len(p4_origin_unresolved), n_cfs)))
+            _ops = {}
+            for _e in p4_compiled_from_src:
+                _ops[_e.get('operation', 'other')] = \
+                    _ops.get(_e.get('operation', 'other'), 0) + 1
+            if _ops:
+                print("  по операциям: " + ", ".join(
+                    "{}={}".format(k, v)
+                    for k, v in sorted(_ops.items(), key=lambda x: -x[1])))
     else:
         total_bin = 0
 
@@ -3450,7 +4441,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         _summary_lines.append("")
         _summary_lines.append("  Происхождение бинарей дистрибутива ({} файлов)".format(total_bin))
         _summary_lines.append(_sep)
-        _summary_lines.append("  Compiled from src  (собран из src.json)            : {:>7}  ({:.1f}%)".format(len(p4_compiled_from_src),       pct(len(p4_compiled_from_src),       total_bin)))
+        _summary_lines.append("  Compiled from src  (появился в ходе сборки)         : {:>7}  ({:.1f}%)".format(len(p4_compiled_from_src),       pct(len(p4_compiled_from_src),       total_bin)))
         _summary_lines.append("  Binaries from src  (бинарь из src.json, скопирован): {:>7}  ({:.1f}%)".format(len(p4_binaries_from_src),       pct(len(p4_binaries_from_src),       total_bin)))
         _summary_lines.append("  Untraced from src  (в src.json, трасс. не видит)   : {:>7}  ({:.1f}%)".format(len(p4_untraced_from_src),       pct(len(p4_untraced_from_src),       total_bin)))
         _summary_lines.append("  External built     (компил. из внешних исх.)       : {:>7}  ({:.1f}%)".format(len(p4_external_built),           pct(len(p4_external_built),          total_bin)))
@@ -3532,6 +4523,18 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "  компилировались и не скопированы в дистрибутив."
         ),
         # bin/
+        "compiled_from_src": (
+            "bin/",
+            "Файлы дистрибутива, появившиеся в ходе сборки",
+            "Файлы, чей хеш является выходом прослеженной команды, и при этом\n"
+            "  отсутствует в переданных исходных текстах (src.json).\n"
+            "  ВАЖНО: категория НЕ означает, что файл собран из исходных\n"
+            "  текстов изделия. Сюда попадает всё, что сборка так или иначе\n"
+            "  произвела, включая переупакованные и подписанные сторонние\n"
+            "  пакеты. Разбор по действительному происхождению лежит рядом,\n"
+            "  в try{N}/pass4/: origin_product_src, origin_approved_source,\n"
+            "  origin_download, origin_unresolved."
+        ),
         "external_built": (
             "bin/",
             "Бинари, в которые попали сторонние исходные тексты",
