@@ -97,6 +97,11 @@ declare -A BINARY_EXTENSIONS=(
 # Размер батча для вызова file(1) — сколько файлов за раз
 FILE_BATCH_SIZE=2000
 
+# Как часто печатать прогресс при проходе по файлам.
+# На носителях вроде СВВП (2.23 млн файлов) проходы идут десятками минут,
+# и без этого скрипт выглядит зависшим.
+PROGRESS_EVERY=10000
+
 # --- Параметры по умолчанию ---
 SINGLE_PROJECT=""
 NO_REWRITE=false
@@ -152,6 +157,33 @@ log_error() {
 }
 
 # =============================================================================
+# Логирование прогресса — ТОЛЬКО в stderr и в файл лога.
+#
+# В stdout писать нельзя: count_extensions отдаёт через stdout подсчитанные
+# расширения, а find_executables — итоговый счётчик, который ловится как
+# bin_count=$(find_executables ...). Любая лишняя строка в stdout испортит
+# возвращаемое значение.
+# =============================================================================
+log_progress() {
+    echo "$1" | tee -a "$RUN_LOG" >&2
+}
+
+# Формат "123456 файлов за 5м12с (395 ф/с)"
+fmt_progress() {
+    local n="$1" elapsed="$2"
+    local h=$(( elapsed / 3600 ))
+    local m=$(( (elapsed % 3600) / 60 ))
+    local s=$(( elapsed % 60 ))
+    local rate=0
+    (( elapsed > 0 )) && rate=$(( n / elapsed ))
+    if (( h > 0 )); then
+        printf '%d файлов за %dч%02dм%02dс (%d ф/с)' "$n" "$h" "$m" "$s" "$rate"
+    else
+        printf '%d файлов за %dм%02dс (%d ф/с)' "$n" "$m" "$s" "$rate"
+    fi
+}
+
+# =============================================================================
 # Возвращает расширение файла в нижнем регистре.
 # =============================================================================
 get_extension() {
@@ -192,14 +224,22 @@ is_binary_extension() {
 # =============================================================================
 count_extensions() {
     local dir="$1"
+    local label="${2:-}"
     local tmpfile
     tmpfile=$(mktemp)
     local total=0
+    local t0=$SECONDS
 
     while IFS= read -r -d '' f; do
         get_extension "$f"
         (( total++ )) || true
+        if (( total % PROGRESS_EVERY == 0 )); then
+            log_progress "$label [INFO] [ext] $(fmt_progress "$total" $(( SECONDS - t0 )))"
+        fi
     done < <(find "$dir" -type f -print0 2>/dev/null) >> "$tmpfile"
+
+    log_progress "$label [INFO] [ext] обход завершён: $(fmt_progress "$total" $(( SECONDS - t0 )))"
+    log_progress "$label [INFO] [ext] группировка расширений..."
 
     sort "$tmpfile" | uniq -c | sort -rn | awk '{print $1, $2}'
     echo "TOTAL $total"
@@ -461,7 +501,12 @@ find_executables() {
     local dir="$1"
     local project_dir="$2"
     local output_file="$3"
+    local label="${4:-}"
     local _bin_count=0
+
+    # Счётчики для прогресса: сколько файлов прошло и по каким корзинам
+    local _seen=0 _n_binext=0 _n_safe=0 _n_magic=0
+    local t0=$SECONDS
 
     # Временный файл для BINARY_EXT результатов (пишем сразу)
     local tmp_binary_ext tmp_magic
@@ -496,24 +541,37 @@ find_executables() {
             # Корзина 1: бинарный по расширению — сразу пишем, file(1) не нужен
             printf "%-12s  %s\n" "BINARY_EXT" "${f#$project_dir/}" >> "$tmp_binary_ext"
             (( _bin_count++ )) || true
+            (( _n_binext++ )) || true
 
         elif is_safe_extension "$ext"; then
             # Корзина 2: заведомо не исполняемый — пропускаем
-            true
+            (( _n_safe++ )) || true
 
         else
             # Корзина 3: неизвестное расширение или нет расширения — в батч file(1)
             magic_batch+=("$f")
             (( magic_batch_size++ )) || true
+            (( _n_magic++ )) || true
             if (( magic_batch_size >= FILE_BATCH_SIZE )); then
                 flush_magic_batch
             fi
+        fi
+
+        (( _seen++ )) || true
+        if (( _seen % PROGRESS_EVERY == 0 )); then
+            log_progress "$label [INFO] [bin] $(fmt_progress "$_seen" $(( SECONDS - t0 )))\
+ | по расширению: $_n_binext, пропущено: $_n_safe, в file(1): $_n_magic\
+ | найдено: $_bin_count"
         fi
 
     done < <(find "$dir" -type f -print0 2>/dev/null)
 
     # Сбрасываем остаток батча
     flush_magic_batch
+
+    log_progress "$label [INFO] [bin] проход завершён: $(fmt_progress "$_seen" $(( SECONDS - t0 )))\
+ | по расширению: $_n_binext, пропущено: $_n_safe, в file(1): $_n_magic\
+ | найдено: $_bin_count"
 
     # Собираем итоговый файл
     {
@@ -566,7 +624,7 @@ process_project() {
             else
                 src_counts+=("$line")
             fi
-        done < <(count_extensions "$src_dir")
+        done < <(count_extensions "$src_dir" "[$project_name]")
 
         log "[$project_name] [INFO] src total files: $src_total"
 
@@ -601,7 +659,7 @@ process_project() {
             else
                 bin_counts+=("$line")
             fi
-        done < <(count_extensions "$bin_dir")
+        done < <(count_extensions "$bin_dir" "[$project_name]")
 
         log "[$project_name] [INFO] bin total files: $bin_total"
 
@@ -630,7 +688,7 @@ process_project() {
 
     if [[ -d "$src_dir" ]]; then
         log "[$project_name] [INFO] Searching for executables and binaries in src..."
-        bin_count=$(find_executables "$src_dir" "$project_dir" "$binaries_src_file")
+        bin_count=$(find_executables "$src_dir" "$project_dir" "$binaries_src_file" "[$project_name]")
         log "[$project_name] [INFO] Executables/binaries found in src: $bin_count"
         log "[$project_name] [INFO] Written: binaries_in_src.txt"
     else
@@ -647,7 +705,7 @@ process_project() {
 
     if [[ -d "$bin_dir" ]]; then
         log "[$project_name] [INFO] Searching for executables and binaries in bin..."
-        bin_bin_count=$(find_executables "$bin_dir" "$project_dir" "$binaries_bin_file")
+        bin_bin_count=$(find_executables "$bin_dir" "$project_dir" "$binaries_bin_file" "[$project_name]")
         log "[$project_name] [INFO] Executables/binaries found in bin: $bin_bin_count"
         log "[$project_name] [INFO] Written: binaries_in_bin.txt"
     else
