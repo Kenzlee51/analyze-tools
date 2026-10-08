@@ -2488,6 +2488,59 @@ _PKG_TOOL_TO_CMD = {
 for _v in ['pip3.5','pip3.6','pip3.7','pip3.8','pip3.9','pip3.10','pip3.11']:
     _PKG_TOOL_TO_CMD[_v] = 'pip install'
 
+# Инструменты, которые пакет действительно получают или создают. Только они
+# могут быть записаны источником пакета в build_package_source_index.
+#
+# Измерено на NPUR.69035-01: build.sh для воспроизводимости сборки делает
+#     find . -exec touch -d @${SOURCE_DATE_EPOCH} {} \;
+# по всему каталогу, поэтому touch попадает в трассу со ВСЕМИ 213 пакетами в
+# выходах и опережает настоящего производителя. Раньше принимался любой
+# инструмент и запоминался первый, и источником пакета оказывался "touch".
+_PKG_SOURCE_TOOLS = frozenset([
+    'apt', 'apt-get', 'aptitude',
+    'pip', 'pip2', 'pip3', 'pip3.5', 'pip3.6', 'pip3.7', 'pip3.8',
+    'pip3.9', 'pip3.10', 'pip3.11',
+    'npm', 'npx', 'yarn',
+    'wget', 'curl',
+    'dpkg-deb', 'dpkg-buildpackage', 'dpkg-source', 'debuild', 'dh_builddeb',
+    'rpmbuild', 'wheel',
+])
+
+# Из них — те, что дают адрес источника. Их основание содержательнее сборки
+# или переупаковки, поэтому при конкуренции они побеждают.
+_PKG_DOWNLOAD_TOOLS = frozenset(['apt', 'apt-get', 'aptitude',
+                                 'wget', 'curl',
+                                 'pip', 'pip2', 'pip3'])
+_PKG_DOWNLOAD_CMDS = frozenset(['apt download', 'apt-get install',
+                                'pip install', 'wget', 'curl'])
+
+
+def _deb_name_variants(name):
+    """
+    Варианты имени Debian-пакета, различающиеся кодировкой эпохи версии.
+
+    На диске эпоха записывается как %3a (cpp_4%3a6.3.0-4_amd64.deb), а в
+    трассе встречается и двоеточием, и без эпохи вовсе. Без нормализации
+    4 пакета из 66 на NPUR.69035-01 не сопоставлялись по имени.
+    """
+    out = set()
+    low = name
+    if '%3a' in low or '%3A' in low:
+        plain = low.replace('%3a', ':').replace('%3A', ':')
+        out.add(plain)
+        # и совсем без эпохи: name_4:6.3.0-4_amd64.deb -> name_6.3.0-4_amd64.deb
+        if '_' in plain:
+            head, rest = plain.split('_', 1)
+            if ':' in rest:
+                out.add('{}_{}'.format(head, rest.split(':', 1)[1]))
+    elif ':' in low:
+        out.add(low.replace(':', '%3a'))
+        head, _, rest = low.partition('_')
+        if ':' in rest:
+            out.add('{}_{}'.format(head, rest.split(':', 1)[1]))
+    out.discard(name)
+    return out
+
 
 # =============================================================================
 # ОПОЗНАНИЕ ОПЕРАЦИИ КОМАНДЫ
@@ -2794,6 +2847,10 @@ def build_external_package_index(buildography_files):
             if not cmd_list:
                 continue
             tool = os.path.basename(str(cmd_list[0]))
+            # Источником пакета может быть только инструмент, который пакет
+            # получает или создаёт (см. комментарий к _PKG_SOURCE_TOOLS).
+            if tool not in _PKG_SOURCE_TOOLS:
+                continue
             readable_cmd = _PKG_TOOL_TO_CMD.get(tool, tool)
 
             # Смотрим зависимости — там исходный путь пакета (откуда скачан)
@@ -2842,12 +2899,19 @@ def build_external_package_index(buildography_files):
                     else:
                         pkg_type = 'pip'
 
-                    if bn not in index:
-                        index[bn] = {
-                            'package_type': pkg_type,
-                            'source':       source or out_path,
-                            'command':      readable_cmd,
-                        }
+                    rec = {
+                        'package_type': pkg_type,
+                        'source':       source or out_path,
+                        'command':      readable_cmd,
+                    }
+                    prev = index.get(bn)
+                    if prev is None:
+                        index[bn] = rec
+                    elif (tool in _PKG_DOWNLOAD_TOOLS and
+                          prev.get('command') not in _PKG_DOWNLOAD_CMDS):
+                        # Загрузка содержательнее сборки: у неё есть адрес
+                        # источника. Поэтому перебивает ранее найденное.
+                        index[bn] = rec
 
         del data
 
@@ -3004,9 +3068,14 @@ def build_apt_download_hashes(buildography_files):
             if not cmd_list:
                 continue
             tool = os.path.basename(str(cmd_list[0]))
-            if tool != 'apt':
+            # И apt, и apt-get: build.sh изделий вызывает
+            #     apt-get download ${pkg}
+            # а принимался только apt, из-за чего индекс оставался пустым и
+            # нулевой фильтр Прохода 4 не срабатывал ни разу.
+            # detect_operation оба варианта знает — выравниваем.
+            if tool not in ('apt', 'apt-get'):
                 continue
-            if len(cmd_list) < 2 or cmd_list[1] != 'download':
+            if 'download' not in [str(x) for x in cmd_list[1:3]]:
                 continue
 
             # Это apt download — берём все .deb из output
@@ -3026,6 +3095,7 @@ def build_apt_download_hashes(buildography_files):
                 bn = os.path.basename(path)
                 if bn.lower().endswith('.deb'):
                     apt_deb_names.add(bn)
+                    apt_deb_names.update(_deb_name_variants(bn))
 
         del data
 
@@ -3180,7 +3250,20 @@ def collect_producers(buildography_files, target_hashes,
                 argv, compiler_basenames, linker_basenames)
 
             deps = []
-            if operation != _OP_DOWNLOADED:
+            if operation == _OP_DOWNLOADED:
+                # Загрузка — терминал, обходить дальше по её входам не надо.
+                # Но сам АДРЕС источника лежит именно во входах: apt копирует
+                # пакет из репозитория, и копия побайтно совпадает с
+                # оригиналом, поэтому у входа тот же хеш, что у выхода.
+                # Берём только такие входы — для отчёта нужен путь, иначе в
+                # основании стоит безадресное "apt download". На
+                # NPUR.69035-01 это /opt/astra-repo/dev/pool/main/...
+                for dp, dh in _iter_cmd_pairs(cmd.get('dependencies', {})):
+                    if dh and dh in target_hashes:
+                        deps.append((dp, dh))
+                        if len(deps) >= 4:
+                            break
+            else:
                 n = 0
                 for dp, dh in _iter_cmd_pairs(cmd.get('dependencies', {})):
                     if not dh:
@@ -3367,9 +3450,14 @@ def _trusted_container(trusted_path):
     return '/'.join(parts[start:-1]) if len(parts) > start + 1 else trusted_path
 
 
+_CONTAINER_PKG_EXTS = ('.deb', '.rpm', '.whl', '.egg', '.jar', '.apk',
+                       '.nupkg', '.crate', '.gem')
+
+
 def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     compiler_basenames=None, linker_basenames=None,
-                    max_rounds=_ORIGIN_MAX_ROUNDS):
+                    max_rounds=_ORIGIN_MAX_ROUNDS,
+                    bin_hash_to_path=None):
     """
     Для списка записей (dict с полями path/hash) устанавливает происхождение.
 
@@ -3565,6 +3653,119 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
         print(_ts() + "   Origin: без вердикта после обхода: {} ({})".format(
             n_rest, 'лимит раундов' if frontier else 'кандидаты исчерпаны'))
 
+    # --- Резерв: наследование происхождения от ближайшего пакета ------------
+    #
+    # Зачем это вообще нужно. Трасса не связывает архив с его содержимым НИ В
+    # ОДНУ сторону, и это не частный пробел, а свойство данных. Измерено на
+    # NPUR.69035-01:
+    #   dpkg --unpack --recursive <каталог>  — 1607 входов, из них .deb: 0
+    #   dpkg-deb --build debian/<пакет> ..   — входы: только libc, libz,
+    #       locale-archive и прочие библиотеки процесса; выход — временный
+    #       файл /tmp/dpkg-deb.XXXXXX, а не .deb (переименование трассой
+    #       не сохраняется)
+    #   xorriso -as mkisofs                  — входы: только библиотеки,
+    #       самого tgz среди них нет
+    # Поэтому у файла, извлечённого из пакета, производитель в трассе есть
+    # (сама распаковка), а входа у этой распаковки нет — цепочка обрывается
+    # на первом шаге, и никакая глубина обхода не поможет.
+    #
+    # Связь "файл внутри пакета <-> пакет" существует в НАШИХ данных:
+    # generate_json.sh считает parents_hash/parents_chain при распаковке
+    # своими руками. Для NPUR.69035-01 это закрыло все 103 неопознанных
+    # файла: 14 пакетов, все из apt-get download.
+    #
+    # Два ограничения обязательны:
+    #   1. Только БЛИЖАЙШИЙ пакет. Цепочка идёт от ближнего к дальнему:
+    #      [0] python3-cffi-backend_1.9.1-2_amd64.deb  (apt-get, touch)
+    #      [1] НПУР.69035-01_12_02.tgz                 (bash, cp, touch)
+    #      [2] NPUR.69035-01_12_02.iso                 (xorriso)
+    #      Подъём на уровень [2] свёл бы любой файл изделия к "образ собран
+    #      xorriso", то есть к бессмыслице.
+    #   2. Только как РЕЗЕРВ, после обхода. Своя цепочка файла всегда
+    #      главнее унаследованной.
+    inherited = {}   # id(entry) -> (origin, detail, container_name)
+    if bin_hash_to_path:
+        need = [e for e in entries
+                if verdict.get((e.get('hash') or '').strip(),
+                               (ORIGIN_UNRESOLVED, ''))[0] == ORIGIN_UNRESOLVED]
+        cand = {}    # entry -> (container_hash, container_name)
+        for e in need:
+            for ph in (e.get('parents') or []):
+                cpath = bin_hash_to_path.get(ph, '')
+                if cpath.lower().endswith(_CONTAINER_PKG_EXTS):
+                    cand[id(e)] = (ph, cpath.rsplit('/', 1)[-1])
+                    break
+        if cand:
+            cont_hashes = {ch for ch, _ in cand.values()}
+            print(_ts() + "   Origin: резерв по контейнеру — записей {}, "
+                          "контейнеров {}".format(len(cand), len(cont_hashes)))
+            # Хеш контейнера может сам лежать в src.json или на носителе —
+            # тогда производитель не нужен вовсе.
+            cont_prod = collect_producers(
+                buildography_files,
+                {ch for ch in cont_hashes
+                 if ch not in src_hashes and ch not in trusted},
+                compiler_basenames, linker_basenames, with_siblings=False)
+            for e in need:
+                got = cand.get(id(e))
+                if not got:
+                    continue
+                ch, cname = got
+                if ch in src_hashes:
+                    inherited[id(e)] = (
+                        ORIGIN_PRODUCT_SRC,
+                        'хеш пакета есть в src.json', cname)
+                    continue
+                if ch in trusted:
+                    label, kind, container = trusted[ch]
+                    inherited[id(e)] = (
+                        ORIGIN_APPROVED,
+                        '{}/{}: {}'.format(label, kind, container), cname)
+                    continue
+                plist = cont_prod.get(ch) or []
+                dl = next((pr for pr in plist
+                           if pr['operation'] == _OP_DOWNLOADED), None)
+                if dl is not None:
+                    # В detail у apt-get download стоит лишь имя операции.
+                    # Настоящий адрес источника лежит во входе той же команды
+                    # с тем же хешем: apt копирует пакет из репозитория, и
+                    # копия побайтно совпадает с оригиналом. Для отчёта нужен
+                    # именно путь — на NPUR.69035-01 это
+                    # /opt/astra-repo/dev/pool/main/..., то есть носитель,
+                    # который не согласован.
+                    src_addr = ''
+                    for dp, dh in (dl['deps'] or []):
+                        if dh == ch and dp:
+                            src_addr = dp
+                            break
+                    detail = dl['detail'] or 'сетевая загрузка'
+                    if src_addr:
+                        detail = '{}: {}'.format(detail, src_addr[:160])
+                    inherited[id(e)] = (ORIGIN_DOWNLOAD, detail, cname)
+                    continue
+                for pr in plist:
+                    hit = None
+                    for dp, dh in (pr['deps'] or []):
+                        if dh in trusted:
+                            hit = ('t', dp, dh); break
+                        if dh in src_hashes:
+                            hit = ('s', dp, dh); break
+                    if hit:
+                        if hit[0] == 't':
+                            label, kind, container = trusted[hit[2]]
+                            inherited[id(e)] = (
+                                ORIGIN_APPROVED,
+                                '{}/{}: {}'.format(label, kind, container),
+                                cname)
+                        else:
+                            inherited[id(e)] = (
+                                ORIGIN_PRODUCT_SRC,
+                                'вход сборки пакета есть в src.json: '
+                                '{}'.format(hit[1][:120]), cname)
+                        break
+            print(_ts() + "   Origin: резерв по контейнеру разрешил "
+                          "{} записей".format(len(inherited)))
+
     # --- Раскладываем записи и дописываем поля ------------------------------
     out = {ORIGIN_PRODUCT_SRC: [], ORIGIN_APPROVED: [],
            ORIGIN_DOWNLOAD: [], ORIGIN_UNRESOLVED: []}
@@ -3582,12 +3783,27 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                                        e.get('path', ''))
             e['operation']     = prod.get('operation', _OP_OTHER)
             e['operation_cmd'] = prod.get('argv', '')
-            e['origin']        = origin
-            e['origin_detail'] = detail
             ch = chains.get(h)
-            if ch:
-                e['origin_chain'] = ' <- '.join(ch[:6])
-            out[origin].append(e)
+            inh = inherited.get(id(e))
+            if inh is not None:
+                # Унаследованное подтверждение слабее прямого, и в отчёте это
+                # должно быть видно: подтверждён пакет, а не сам файл.
+                e_origin, e_detail, cname = inh
+                e['origin']           = e_origin
+                e['origin_detail']    = '{} (через контейнер {})'.format(
+                    e_detail, cname)
+                e['origin_container'] = cname
+                e['origin_inherited'] = True
+                steps = list(ch or [])
+                steps.append('contained in {}'.format(cname))
+                e['origin_chain'] = ' <- '.join(steps[:6])
+            else:
+                e['origin']        = origin
+                e['origin_detail'] = detail
+                if ch:
+                    e['origin_chain'] = ' <- '.join(ch[:6])
+                e_origin = origin
+            out[e_origin].append(e)
 
     print(_ts() + "   Origin: product_src={}, approved_source={}, "
                   "download={}, unresolved={}".format(
@@ -3927,7 +4143,9 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
         # Проверяем по имени контейнера в пути, не по хешу —
         # хеш содержимого не совпадает с хешем самого .deb архива.
         apt_container = _get_container(path)
-        if apt_container and apt_container in apt_deb_names:
+        if apt_container and (apt_container in apt_deb_names or
+                              _deb_name_variants(apt_container)
+                              & apt_deb_names):
             apt_package_content.append(_make_entry({
                 'package_type': 'deb',
                 'source':       'apt download',
@@ -4117,6 +4335,10 @@ def write_origin_txt(output_path, category_label, entries):
     """
     seen = set()
     rows = []
+    # Пакет-контейнер -> уникальные файлы в нём. Нужен для сводной шапки:
+    # 103 строки с .o и .a внутри gcc-дева читаются как 103 замечания, тогда
+    # как замечание одно на пакет, и разработчику нужен именно пакет.
+    by_container = {}
     for entry in entries:
         path = (entry.get('path') or '').strip()
         h    = (entry.get('hash') or '').strip()
@@ -4126,6 +4348,9 @@ def write_origin_txt(output_path, category_label, entries):
         if key in seen:
             continue
         seen.add(key)
+        cont = entry.get('origin_container', '')
+        if cont:
+            by_container.setdefault(cont, set()).add(h or path)
         rows.append((
             path, h,
             entry.get('pass4_category', ''),
@@ -4147,6 +4372,15 @@ def write_origin_txt(output_path, category_label, entries):
             len(rows), uniq_hashes))
         f.write("# Format: path<TAB>hash<TAB>pass4_category<TAB>operation"
                 "<TAB>origin_detail\n")
+        if by_container:
+            f.write("#\n")
+            f.write("# Происхождение унаследовано от пакета-контейнера.\n")
+            f.write("# Замечание — на пакет, а не на каждый файл внутри него.\n")
+            f.write("# Пакетов: {}\n".format(len(by_container)))
+            f.write("#\n")
+            for cname, fset in sorted(by_container.items(),
+                                      key=lambda kv: (-len(kv[1]), kv[0])):
+                f.write("#   {:<54} файлов: {}\n".format(cname, len(fset)))
         f.write("#\n")
         for r in rows:
             f.write("\t".join(r) + "\n")
@@ -4285,6 +4519,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     # binaries_in_bin.txt содержит пути ELF бинарей из дистрибутива
     # Хеши берём из bin.json по путям
     bin_entries = []  # инициализируем заранее на случай если файлы не найдены
+    bin_hash_to_path = {}  # хеш -> путь внутри дистрибутива (для контейнеров)
     pass4_ran   = False  # флаг успешного выполнения Pass 4
     total_bin_count = 0  # будем хранить количество бинарных файлов для статистики
     bin_json_path = os.path.join(RESULTS_DIR, project_name, "sources",
@@ -4306,6 +4541,15 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
             # Строим индекс по нормализованному пути
             path_to_hash = {}
+            # Родители файла — хеши вложенных архивов по пути, от ближнего
+            # к дальнему. Нужны для наследования происхождения от контейнера
+            # (см. _container_fallback в resolve_origins): трасса не связывает
+            # архив с его содержимым ни в одну сторону, поэтому единственная
+            # надёжная связь "файл внутри пакета <-> пакет" — эта, посчитанная
+            # нами при распаковке.
+            path_to_parents = {}
+            # hash -> путь, чтобы по хешу родителя узнать его имя и расширение
+            bin_hash_to_path = {}
             for item in raw_files:
                 p = item.get('path', '').strip()
                 h = item.get('hash', '').strip()
@@ -4314,8 +4558,21 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                     p_norm = p.lstrip('/')
                     path_to_hash[p_norm] = h
                     path_to_hash[p] = h  # также оригинальный путь
+                    bin_hash_to_path.setdefault(h, p_norm)
+                    par = []
+                    ph = (item.get('parents_hash') or '').strip()
+                    if ph:
+                        par.append(ph)
+                    for x in (item.get('parents_chain') or []):
+                        x = (x or '').strip()
+                        if x and x not in par:
+                            par.append(x)
+                    if par:
+                        path_to_parents[p_norm] = par
 
-            print(_ts() + "   bin.json loaded: {} entries".format(len(path_to_hash)))
+            print(_ts() + "   bin.json loaded: {} entries, "
+                  "с родителями: {}".format(
+                      len(path_to_hash), len(path_to_parents)))
 
             # Читаем binaries_in_bin.txt
             loaded = 0
@@ -4348,7 +4605,13 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                          path_to_hash.get(fpath) or
                          path_to_hash.get(fpath.lstrip('/')))
                     if h:
-                        bin_entries.append({'path': fpath_norm, 'hash': h})
+                        _e = {'path': fpath_norm, 'hash': h}
+                        _par = (path_to_parents.get(fpath_norm) or
+                                path_to_parents.get(fpath_with_prefix) or
+                                path_to_parents.get(fpath))
+                        if _par:
+                            _e['parents'] = _par
+                        bin_entries.append(_e)
                         loaded += 1
                     else:
                         skipped_hash += 1
@@ -4643,7 +4906,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                 _origin_input, src_hashes, trusted,
                 buildography_files,
                 compiler_basenames=compiler_basenames,
-                linker_basenames=linker_basenames)
+                linker_basenames=linker_basenames,
+                bin_hash_to_path=bin_hash_to_path)
         del _origin_input
 
         del src_hashes
