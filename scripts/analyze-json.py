@@ -1568,7 +1568,7 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
 
 
 def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds,
-                        all_good_cmds=None):
+                        all_good_cmds=None, seen_in_trace=None):
     """
     Классифицирует интерпретируемые файлы из signatures на четыре категории:
       - executed:   интерпретируемые файлы (любого языка), которые были входными
@@ -1577,10 +1577,32 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
       - compiled:   выходные файлы интерпретаторов + входные любых языков, чьи выходы попали в bin
                     (транзитивно — если выход команды транзитивно попадает в bin)
       - copied:     файлы, присутствующие в bin.json, но не вошедшие в executed/compiled
-      - izb:        остальные (избыточные)
+      - use_untraceable: хеш файла есть в трассе сборки, но ни один
+                    интерпретатор его не использовал. Файл при сборке
+                    присутствовал, однако доказать его использование нечем —
+                    и назвать избыточным тоже нельзя.
+      - izb:        остальные (избыточные): хеша нет в трассе вообще
     all_good_cmds — множество индексов команд транзитивно приводящих к bin (из pass2 BFS).
                     Если передано — используется вместо прямой проверки cmd_has_bin_output.
-    Возвращает кортеж (executed, compiled, copied, izb).
+    seen_in_trace — множество хешей интерпретируемых файлов, встречающихся в
+                    трассе у ЛЮБОЙ команды. Отделяет "не прослеживается" от
+                    "не используется"; если не передано, различие не делается
+                    и всё идёт в izb, как было раньше.
+
+    Зачем нужна use_untraceable. Измерено на NPUR.69035-01: 107 файлов .js/.ts
+    из состава miv-agent попадали в izb как избыточные. В действительности
+    приложение собирается в ОДИН самодостаточный файл на 36 МБ
+    (miv-agent-0.9.4.tgz содержит ровно одну запись ./miv-agent), который
+    подписывается bsign и уходит в дистрибутив. Исходные файлы вшиты внутрь,
+    поэтому по хешу не совпадают ни с чем в bin.json. При этом сборка бандла
+    в трассу не попала: у build_miv_agent.sh из содержательных входов только
+    собственный текст, а все 18 выходов — журнал Svace. Единственная команда,
+    читающая эти файлы, — md5sum из calc_md5. То есть "izb" утверждал
+    избыточность, имея на руках лишь отсутствие доказательств использования.
+    Это разные вещи, и в отчёте их смешивать нельзя: в списке на удаление
+    оказывались файлы, вшитые в поставляемый подписанный артефакт.
+    Возвращает кортеж (executed, compiled_used, compiled_unused, copied,
+                       use_untraceable, izb).
     """
     # Множества для быстрой проверки
     bin_hashes_set = set(bin_hashes)
@@ -1662,7 +1684,9 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
     compiled_used = []
     compiled_unused = []
     copied = []
+    use_untraceable = []
     izb = []
+    seen_in_trace = seen_in_trace or set()
     added_compiled_paths = set()
 
     # Цикл по интерпретируемым файлам
@@ -1720,7 +1744,15 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             executed.append({'path': path, 'hash': h, 'commands': commands})
             continue
 
-        # --- 5. Остальное — избыточное ---
+        # --- 4.5. Файл есть в трассе, но его не использовал ни один
+        #          интерпретатор. Присутствовал при сборке — значит
+        #          утверждать избыточность нельзя (см. комментарий к
+        #          use_untraceable в докстринге).
+        if h and h in seen_in_trace:
+            use_untraceable.append({'path': path, 'hash': h})
+            continue
+
+        # --- 5. Остальное — избыточное: хеша нет в трассе вообще ---
         izb.append({'path': path, 'hash': h})
 
     # Добавляем выходные файлы интерпретатора которых нет в signatures
@@ -1744,7 +1776,13 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             # else: артефакт не в дистрибутиве — НЕ пишем в compiled_unused,
             # так как это не исходный файл из src.json
 
-    return executed, compiled_used, compiled_unused, copied, izb
+    print(_ts() + "   Pass 3: executed={}, compiled_used={}, "
+                  "compiled_unused={}, copied={}, use_untraceable={}, "
+                  "not_used={}".format(
+                      len(executed), len(compiled_used), len(compiled_unused),
+                      len(copied), len(use_untraceable), len(izb)))
+    return (executed, compiled_used, compiled_unused, copied,
+            use_untraceable, izb)
 
 
 # =============================================================================
@@ -4655,6 +4693,23 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     print(_ts() + "   Starting pass 1 (hash analysis)...")
     direct, parent, redundant = analyze_pass1(signatures, buildography_hashes)
 
+    # Срез для Прохода 3: какие ИЗ ИНТЕРПРЕТИРУЕМЫХ файлов вообще
+    # встречаются в трассе сборки. Нужен, чтобы отличить "использование не
+    # прослеживается" от "не используется" (см. use_untraceable).
+    #
+    # Считаем именно пересечение, а не держим buildography_hashes до Прохода 3:
+    # на крупных изделиях это миллионы хешей, а здесь нужно не более числа
+    # интерпретируемых файлов — на NPUR.69035-01 около девяти тысяч.
+    interp_seen_in_trace = set()
+    for _e in signatures:
+        if not is_interpreted_extension(_e.get('path', '')):
+            continue
+        _h = (_e.get('hash') or '').strip()
+        if _h and _h in buildography_hashes:
+            interp_seen_in_trace.add(_h)
+    print(_ts() + "   Интерпретируемых файлов, встречающихся в трассе: "
+                  "{}".format(len(interp_seen_in_trace)))
+
     # buildography_hashes больше не нужен
     del buildography_hashes
     gc.collect()
@@ -4724,9 +4779,11 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         print(_ts() + "   Starting pass 3 (interpreted languages)...")
         input_files, output_files = build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames)
         print(_ts() + "   Interpreted input files: {}, output files: {}".format(len(input_files), len(output_files)))
-        executed, compiled_used, compiled_unused, copied, izb = analyze_interpreted(
+        (executed, compiled_used, compiled_unused, copied,
+         use_untraceable, izb) = analyze_interpreted(
             signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds,
-            all_good_cmds=all_good_cmds
+            all_good_cmds=all_good_cmds,
+            seen_in_trace=interp_seen_in_trace
         )
         del input_files, output_files
         gc.collect()
@@ -4734,6 +4791,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     else:
         print(_ts() + "   Pass 3 skipped (no interpreter list)")
         executed = compiled_used = compiled_unused = copied = izb = []
+        use_untraceable = []
 
     # --- Проход 4 (происхождение файлов дистрибутива) ---
     # Освобождаем raw_cmds ДО Pass 4 — Pass 4 перечитает файлы сам
@@ -4997,6 +5055,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     jt(pass3_dir, "compiled_unused", "interpreted_compiled_unused", compiled_unused,
        summary_src_files, "compiled_unused")
     jt(pass3_dir, "copied",          "interpreted_copied",          copied)
+    jt(pass3_dir, "use_untraceable", "interpreted_use_untraceable", use_untraceable,
+       summary_src_files, "use_untraceable")
     jt(pass3_dir, "not_used",        "interpreted_not_used",        izb,
        summary_src_files, "not_used")
 
@@ -5069,11 +5129,17 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     n_not_compiled = len(not_compiled)
 
     # Интерпретируемые файлы
-    total_interp   = len(executed) + len(compiled_used) + len(compiled_unused) + len(copied) + len(izb)
+    total_interp   = (len(executed) + len(compiled_used) + len(compiled_unused)
+                      + len(copied) + len(use_untraceable) + len(izb))
 
     # Итого
     total_all      = total_source + total_interp
     total_izb      = n_redundant + n_not_compiled + len(compiled_unused) + len(izb)
+    # use_untraceable в избыточные НЕ входит: это не вердикт, а отсутствие
+    # вердикта. Показываем третьей строкой, отдельно от используемых и от
+    # избыточных, иначе 107 файлов на NPUR.69035-01 молча попадут в одну из
+    # двух сторон и читатель об этом не узнает.
+    total_unk      = len(use_untraceable)
 
     sep = "  " + "-" * 48
 
@@ -5092,12 +5158,15 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     print("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(compiled_used),   pct(len(compiled_used),   total_interp)))
     print("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(compiled_unused), pct(len(compiled_unused), total_interp)))
     print("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(copied),          pct(len(copied),          total_interp)))
+    print("  Use untraceable (использование не прослеживается)  : {:>7}  ({:.1f}%)".format(len(use_untraceable), pct(len(use_untraceable), total_interp)))
     print("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(izb),             pct(len(izb),             total_interp)))
 
     print("\n  Итого ({} файлов)".format(total_all))
     print(sep)
-    print("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb, pct(total_all - total_izb, total_all)))
+    print("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb - total_unk, pct(total_all - total_izb - total_unk, total_all)))
     print("  Избыточные (not_compiled + compiled_unused + not_used): {:>7}  ({:.1f}%)".format(total_izb,             pct(total_izb,             total_all)))
+    if total_unk:
+        print("  Не прослеживается (требуется пояснение)            : {:>7}  ({:.1f}%)".format(total_unk, pct(total_unk, total_all)))
 
     if pass4_ran:
         total_bin = (len(p4_compiled_from_src) + len(p4_binaries_from_src) +
@@ -5196,13 +5265,16 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     _summary_lines.append("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(compiled_used),   pct(len(compiled_used),   total_interp)))
     _summary_lines.append("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(compiled_unused), pct(len(compiled_unused), total_interp)))
     _summary_lines.append("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(copied),          pct(len(copied),          total_interp)))
+    _summary_lines.append("  Use untraceable (использование не прослеживается)  : {:>7}  ({:.1f}%)".format(len(use_untraceable), pct(len(use_untraceable), total_interp)))
     _summary_lines.append("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(izb),             pct(len(izb),             total_interp)))
 
     _summary_lines.append("")
     _summary_lines.append("  Итого ({} файлов)".format(total_all))
     _summary_lines.append(_sep)
-    _summary_lines.append("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb, pct(total_all - total_izb, total_all)))
+    _summary_lines.append("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb - total_unk, pct(total_all - total_izb - total_unk, total_all)))
     _summary_lines.append("  Избыточные (not_compiled + compiled_unused + not_used): {:>7}  ({:.1f}%)".format(total_izb, pct(total_izb, total_all)))
+    if total_unk:
+        _summary_lines.append("  Не прослеживается (требуется пояснение)            : {:>7}  ({:.1f}%)".format(total_unk, pct(total_unk, total_all)))
 
     if pass4_ran:
         _summary_lines.append("")
@@ -5305,7 +5377,29 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "src/",
             "Интерпретируемые файлы нигде не используемые",
             "Файлы интерпретируемых языков которые не запускались, не\n"
-            "  компилировались и не скопированы в дистрибутив."
+            "  компилировались и не скопированы в дистрибутив. Их хеши не\n"
+            "  встречаются в трассе сборки ни у одной команды, то есть при\n"
+            "  сборке к этим файлам никто не обращался."
+        ),
+        "use_untraceable": (
+            "src/",
+            "Файлы, использование которых не прослеживается",
+            "Хеши этих файлов встречаются в трассе сборки, то есть при сборке\n"
+            "  файлы присутствовали и к ним обращались, но ни один\n"
+            "  интерпретатор их не использовал и в дистрибутив они не попали\n"
+            "  ни сами, ни как результат компиляции.\n"
+            "\n"
+            "  ЭТО НЕ СПИСОК НА УДАЛЕНИЕ. Отсутствие доказательств\n"
+            "  использования не равно доказательству неиспользования.\n"
+            "  Типичная причина — сборка в один самодостаточный файл: исходные\n"
+            "  тексты вшиваются внутрь бандла, поэтому по хешу не совпадают ни\n"
+            "  с чем в дистрибутиве, а сама упаковка в трассу не попадает\n"
+            "  (у упаковщиков и архиваторов входные данные не записываются).\n"
+            "\n"
+            "  Требуется пояснение разработчика по каждой группе файлов: куда\n"
+            "  они входят и каким инструментом собираются. После пояснения\n"
+            "  файл либо подтверждается как используемый, либо переходит в\n"
+            "  избыточные и подлежит удалению с носителя исходных текстов."
         ),
         # bin/
         "origin_download": (
@@ -5423,7 +5517,10 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     if src_entries:
         readme_lines.append("=" * 60)
-        readme_lines.append("src/  — избыточные исходные файлы")
+        # Не "избыточные": в секции теперь есть и use_untraceable, который
+        # избыточным не является — по нему вердикта нет.
+        readme_lines.append(
+            "src/  — исходные файлы, требующие решения")
         readme_lines.append("=" * 60)
         for short, (section, title, descr), fname in src_entries:
             readme_lines.extend(_readme_entry(fname, section, title, descr))
