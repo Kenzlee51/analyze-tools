@@ -4135,6 +4135,15 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
             e = {'path': path, 'hash': h_str}
             if container:
                 e['container'] = container
+            # Родителей обязательно переносим из исходной записи. Через
+            # _make_entry проходят ВСЕ категории Прохода 4, и запись здесь
+            # собирается заново — без этой строки parents из bin.json
+            # теряется, и резерв по контейнеру в resolve_origins остаётся
+            # без данных (на NPUR.69035-01 это оставляло 103 файла в
+            # "происхождение не подтверждено" при полностью рабочем резерве).
+            _par = entry.get('parents')
+            if _par:
+                e['parents'] = _par
             if extra:
                 e.update(extra)
             return e
@@ -4898,9 +4907,20 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                 _origin_input.append(_e)
 
         if _origin_input:
+            # Сколько записей дошло до разбора с родителями. Если ноль при
+            # непустом bin_hash_to_path — поле parents потерялось по дороге
+            # (запись где-то собрана заново), и резерв по контейнеру работает
+            # вхолостую. Именно так 103 файла на NPUR.69035-01 остались
+            # неопознанными при полностью исправном резерве.
+            _n_par = sum(1 for _e in _origin_input if _e.get('parents'))
             print(_ts() + "   Starting origin resolution for {} entries "
-                          "across all Pass 4 categories...".format(
-                              len(_origin_input)))
+                          "across all Pass 4 categories "
+                          "(с родителями: {})...".format(
+                              len(_origin_input), _n_par))
+            if bin_hash_to_path and not _n_par:
+                print(_ts() + "   [WARNING] ни одна запись не донесла parents "
+                              "из bin.json — резерв по контейнеру не "
+                              "сработает. Проверьте _make_entry.")
             (p4_origin_product, p4_origin_approved,
              p4_origin_download, p4_origin_unresolved) = resolve_origins(
                 _origin_input, src_hashes, trusted,
