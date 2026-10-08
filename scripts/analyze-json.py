@@ -1873,7 +1873,12 @@ def write_txt_result(output_path, category_label, entries):
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("# {}\n".format(category_label))
         f.write("# Generated: {}\n".format(datetime.now().isoformat()))
-        f.write("# Total: {}\n".format(len(rows)))
+        # Записей и уникальных файлов — разные числа, и разница бывает в разы:
+        # один файл дистрибутива попадает в отчёт столько раз, сколько путей
+        # у него внутри носителя. Без второй цифры "14 замечаний" читается
+        # как 14 файлов, хотя их семь.
+        f.write("# Total: {}, уникальных файлов: {}\n".format(
+            len(rows), len({r[1] for r in rows if r[1]})))
         f.write("# Format: path<TAB>hash\n")
         f.write("#\n")
         for path, hash_ in rows:
@@ -4097,6 +4102,59 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
 
 
+def write_origin_txt(output_path, category_label, entries):
+    """
+    Записывает отчёт origin_* в формате
+        путь<TAB>хеш<TAB>категория<TAB>операция<TAB>основание
+
+    Обычный формат "путь<TAB>хеш" для этих отчётов не годится. Срез по
+    происхождению собирает файлы из РАЗНЫХ категорий Pass 4, и без колонки
+    категории теряется то, ради чего категории существуют: читатель видит
+    файл в origin_unresolved, но не узнаёт, что тот пришёл готовым извне
+    (external_prebuilt) или был переупакован. Это два разных замечания.
+
+    Возвращает True, если записана хотя бы одна строка.
+    """
+    seen = set()
+    rows = []
+    for entry in entries:
+        path = (entry.get('path') or '').strip()
+        h    = (entry.get('hash') or '').strip()
+        if not path and not h:
+            continue
+        key = (path, h)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((
+            path, h,
+            entry.get('pass4_category', ''),
+            entry.get('operation', ''),
+            (entry.get('origin_detail') or '').replace('\t', ' '),
+        ))
+    rows.sort(key=lambda x: x[0])
+
+    versioned_path = get_versioned_filepath(output_path)
+    if versioned_path != output_path:
+        print(_ts() + "   File exists, writing to: {}".format(
+            os.path.basename(versioned_path)))
+
+    uniq_hashes = len({r[1] for r in rows if r[1]})
+    with open(versioned_path, 'w', encoding='utf-8') as f:
+        f.write("# {}\n".format(category_label))
+        f.write("# Generated: {}\n".format(datetime.now().isoformat()))
+        f.write("# Записей: {}, уникальных файлов: {}\n".format(
+            len(rows), uniq_hashes))
+        f.write("# Format: path<TAB>hash<TAB>pass4_category<TAB>operation"
+                "<TAB>origin_detail\n")
+        f.write("#\n")
+        for r in rows:
+            f.write("\t".join(r) + "\n")
+    print(_ts() + "   Written {} entries ({} уникальных) -> {}".format(
+        len(rows), uniq_hashes, os.path.basename(versioned_path)))
+    return bool(rows)
+
+
 def write_pass4_txt(output_path, category_label, entries):
     """Записывает текстовый файл Прохода 4 в формате path<TAB>hash."""
     seen = set()
@@ -4540,26 +4598,53 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             print(_ts() + "   Pass 4: Java heuristic: external_built is empty, skipping")
 
         # ------------------------------------------------------------------
-        # ПРОИСХОЖДЕНИЕ файлов, попавших в else-ветку Pass 4.
+        # ПРОИСХОЖДЕНИЕ бинарей дистрибутива.
         #
-        # Выполняется ПОСЛЕ java-эвристики, потому что она досыпает записи
-        # в compiled_from_src и они тоже должны получить разбор.
+        # Разбор применяется ко ВСЕМ категориям Pass 4, а не к одной
+        # else-ветке. У каждого файла два независимых признака:
         #
-        # Сама категория compiled_from_src не меняется: её состав и её
-        # единственный файл в summary остаются прежними. Разбор добавляется
-        # рядом, в try{N}, и текущих цифр не ломает.
+        #   СПОСОБ        — как файл появился: собран, пришёл готовым,
+        #                   переупакован, подписан. Это категории Pass 4.
+        #   ПРОИСХОЖДЕНИЕ — подтверждено ли оно переданными материалами.
+        #                   Это origin_*.
+        #
+        # Замечание может возникнуть по любой оси, и одна не заменяет
+        # другую: файл из external_prebuilt, подтверждённый согласованным
+        # носителем, всё равно НЕ СОБРАН, и это самостоятельный вопрос.
+        # Поэтому записи остаются в своих категориях, им лишь дописываются
+        # поля origin/origin_detail/origin_chain/pass4_category.
+        #
+        # Выполняется ПОСЛЕ java-эвристики и classify_external_package_content,
+        # потому что обе перекладывают записи между категориями.
         # ------------------------------------------------------------------
         p4_origin_product, p4_origin_approved = [], []
         p4_origin_download, p4_origin_unresolved = [], []
-        if p4_compiled_from_src:
-            print(_ts() + "   Starting origin resolution for {} entries...".format(
-                len(p4_compiled_from_src)))
+
+        _origin_input = []
+        for _cat_name, _cat_list in (
+                ("compiled_from_src",        p4_compiled_from_src),
+                ("binaries_from_src",        p4_binaries_from_src),
+                ("untraced_from_src",        p4_untraced_from_src),
+                ("external_built",           p4_external_built),
+                ("external_prebuilt",        p4_external_prebuilt),
+                ("untraced_external",        p4_untraced_external),
+                ("system_binaries",          p4_system_binaries),
+                ("external_package_content", p4_external_package_content)):
+            for _e in _cat_list:
+                _e['pass4_category'] = _cat_name
+                _origin_input.append(_e)
+
+        if _origin_input:
+            print(_ts() + "   Starting origin resolution for {} entries "
+                          "across all Pass 4 categories...".format(
+                              len(_origin_input)))
             (p4_origin_product, p4_origin_approved,
              p4_origin_download, p4_origin_unresolved) = resolve_origins(
-                p4_compiled_from_src, src_hashes, trusted,
+                _origin_input, src_hashes, trusted,
                 buildography_files,
                 compiler_basenames=compiler_basenames,
                 linker_basenames=linker_basenames)
+        del _origin_input
 
         del src_hashes
         gc.collect()
@@ -4634,38 +4719,58 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     # --- Pass 4 ---
     if pass4_ran:
         print(_ts() + "   Writing pass 4 results...")
-        # compiled_from_src в сводку НЕ идёт: сводка — это перечень того, что
-        # нужно убрать или объяснить, а эта категория содержит в том числе
-        # норму. В сводку уходит только её проблемная часть — origin_download
-        # и origin_unresolved. На NPUR.34018-01 это 52 файла из 346.
+        # ------------------------------------------------------------------
+        # Категории Pass 4 — отвечают на вопрос "КАК файл появился".
+        # Все остаются в try{N} полностью, ни одна не сокращается.
+        #
+        # В сводку из них идёт только binaries_from_src: готовый бинарь,
+        # лежащий в переданных исходных текстах, — это замечание о СПОСОБЕ,
+        # и оно не снимается подтверждением происхождения, потому что сам
+        # файл находится на проверяемом носителе.
+        #
+        # Остальные категории в сводку как целое не идут. Их проблемная
+        # часть попадает туда через origin_download / origin_unresolved,
+        # а подтверждённая не попадает никуда: материалы согласованного
+        # носителя в состав проверяемого диска не входят, их сборка
+        # проверяется отдельно.
+        # ------------------------------------------------------------------
         jt(pass4_dir, "compiled_from_src",  "compiled_from_src",  p4_compiled_from_src)
-        jt(pass4_dir, "origin_product_src",     "origin_product_src",     p4_origin_product)
-        jt(pass4_dir, "origin_approved_source", "origin_approved_source", p4_origin_approved)
-        jt(pass4_dir, "origin_download",        "origin_download",        p4_origin_download,
-           summary_bin_files, "origin_download")
-        jt(pass4_dir, "origin_unresolved",      "origin_unresolved",      p4_origin_unresolved,
-           summary_bin_files, "origin_unresolved")
         jt(pass4_dir, "binaries_from_src",  "binaries_from_src",  p4_binaries_from_src,
            summary_bin_files, "binaries_from_src")
         jt(pass4_dir, "untraced_from_src",  "untraced_from_src",  p4_untraced_from_src)
-        jt(pass4_dir, "external_built",     "external_built",     p4_external_built,
-           summary_bin_files, "external_built")
-        jt(pass4_dir, "external_prebuilt",  "external_prebuilt",  p4_external_prebuilt,
-           summary_bin_files, "external_prebuilt")
-        jt(pass4_dir, "untraced_external",  "untraced_external",  p4_untraced_external,
-           summary_bin_files, "untraced_external")
-        jt(pass4_dir, "system_binaries",    "system_binaries",    p4_system_binaries,
-           summary_bin_files, "system_binaries")
+        jt(pass4_dir, "external_built",     "external_built",     p4_external_built)
+        jt(pass4_dir, "external_prebuilt",  "external_prebuilt",  p4_external_prebuilt)
+        jt(pass4_dir, "untraced_external",  "untraced_external",  p4_untraced_external)
+        jt(pass4_dir, "system_binaries",    "system_binaries",    p4_system_binaries)
 
-        # external_package_content — специальный формат, отдельные функции записи
+        # ------------------------------------------------------------------
+        # Срез по ПРОИСХОЖДЕНИЮ — охватывает все категории разом.
+        # Свой формат txt с колонками: без указания категории Pass 4
+        # читатель не поймёт, пришёл ли файл готовым или был переупакован.
+        # ------------------------------------------------------------------
+        def ot(name, category, entries, to_summary=False):
+            base = os.path.join(pass4_dir, "{}_{}".format(project_name, name))
+            write_json_result(base + ".json", category, entries)
+            nonempty = write_origin_txt(base + ".txt", category, entries)
+            if to_summary and nonempty:
+                summary_bin_files[name] = base + ".txt"
+
+        ot("origin_product_src",     "origin_product_src",     p4_origin_product)
+        ot("origin_approved_source", "origin_approved_source", p4_origin_approved)
+        ot("origin_download",        "origin_download",        p4_origin_download,
+           to_summary=True)
+        ot("origin_unresolved",      "origin_unresolved",      p4_origin_unresolved,
+           to_summary=True)
+
+        # external_package_content — специальный формат, отдельные функции записи.
+        # В сводку не идёт: подтверждённое снимается, неподтверждённое придёт
+        # через origin_unresolved.
         base_epc = os.path.join(pass4_dir,
                                 "{}_external_package_content".format(project_name))
         write_external_package_content_json(base_epc + ".json",
                                             p4_external_package_content)
         write_external_package_content_txt(base_epc + ".txt",
                                            p4_external_package_content)
-        if p4_external_package_content:
-            summary_bin_files["external_package_content"] = base_epc + ".txt"
 
     # --- Статистика ---
     def pct(n, total):
@@ -4735,28 +4840,40 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             len(p4_external_package_content),
             pct(len(p4_external_package_content), total_bin)))
 
-        # Разбор первой строки по происхождению. В summary.txt не выносится
-        # (сущности не множим), но в консоли и в try{N} он нужен — именно он
-        # отвечает на вопрос, что в действительности означает первая цифра.
-        if p4_compiled_from_src:
-            n_cfs = len(p4_compiled_from_src)
-            print("\n  из них по происхождению:")
-            print("    Product src      (терминал в src.json изделия)   : {:>7}  ({:.1f}%)".format(
-                len(p4_origin_product),    pct(len(p4_origin_product),    n_cfs)))
-            print("    Approved source  (согласованный носитель)        : {:>7}  ({:.1f}%)".format(
-                len(p4_origin_approved),   pct(len(p4_origin_approved),   n_cfs)))
-            print("    Download         (получен по сети)               : {:>7}  ({:.1f}%)".format(
-                len(p4_origin_download),   pct(len(p4_origin_download),   n_cfs)))
-            print("    Unresolved       (происхождение не установлено)  : {:>7}  ({:.1f}%)".format(
-                len(p4_origin_unresolved), pct(len(p4_origin_unresolved), n_cfs)))
+        # Вторая ось: разбор ВСЕХ бинарей дистрибутива по происхождению.
+        # Таблица выше отвечает на вопрос "как файл появился", эта — на
+        # вопрос "подтверждено ли его происхождение переданными материалами".
+        _n_origin = (len(p4_origin_product) + len(p4_origin_approved) +
+                     len(p4_origin_download) + len(p4_origin_unresolved))
+        if _n_origin:
+            print("\n  Происхождение тех же файлов ({} записей)".format(_n_origin))
+            print(sep)
+            print("  Product src      (терминал в src.json изделия)    : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_product),    pct(len(p4_origin_product),    _n_origin)))
+            print("  Approved source  (согласованный носитель)         : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_approved),   pct(len(p4_origin_approved),   _n_origin)))
+            print("  Download         (источник вне комплекта)         : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_download),   pct(len(p4_origin_download),   _n_origin)))
+            print("  Unresolved       (происхождение не подтверждено)  : {:>7}  ({:.1f}%)".format(
+                len(p4_origin_unresolved), pct(len(p4_origin_unresolved), _n_origin)))
+
+            _all_origin = (p4_origin_product + p4_origin_approved +
+                           p4_origin_download + p4_origin_unresolved)
+            _uniq = len({(_e.get('hash') or '') for _e in _all_origin})
+            print("  уникальных файлов: {} (записей {})".format(_uniq, _n_origin))
+
             _ops = {}
-            for _e in p4_compiled_from_src:
-                _ops[_e.get('operation', 'other')] = \
-                    _ops.get(_e.get('operation', 'other'), 0) + 1
+            for _e in _all_origin:
+                _k = _e.get('operation', 'other')
+                _ops[_k] = _ops.get(_k, 0) + 1
             if _ops:
                 print("  по операциям: " + ", ".join(
                     "{}={}".format(k, v)
                     for k, v in sorted(_ops.items(), key=lambda x: -x[1])))
+
+            _problem = len(p4_origin_download) + len(p4_origin_unresolved)
+            if _problem:
+                print("  ТРЕБУЮТ ОБЪЯСНЕНИЯ: {} записей".format(_problem))
     else:
         total_bin = 0
 
@@ -4918,7 +5035,10 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "  проверяются РАНЬШЕ загрузки, поэтому сюда попадает только то, что\n"
             "  скачано И не найдено среди переданных материалов, то есть получено\n"
             "  из источника вне комплекта поставки.\n"
-            "  В поле origin_detail указан адрес источника из командной строки."
+            "  В поле origin_detail указан адрес источника из командной строки.\n"
+            "  Проверка выполняется для ВСЕХ бинарей дистрибутива, независимо от\n"
+            "  того, как они появились (компиляция, сборка пакета, переупаковка,\n"
+            "  подпись, копирование). Подтверждённые файлы в сводку не попадают."
         ),
         "origin_unresolved": (
             "bin/",
@@ -4930,7 +5050,11 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "  опознанный источник не найден; у производящей команды нет\n"
             "  прослеживаемых входов; обход упёрся в предел глубины.\n"
             "  В поле origin_chain — последовательность операций от файла назад,\n"
-            "  например: signed(bsign) <- compiled(ld) <- compiled(as)."
+            "  например: signed(bsign) <- compiled(ld) <- compiled(as).\n"
+            "  Проверка выполняется для ВСЕХ бинарей дистрибутива. Файлы, чьё\n"
+            "  происхождение подтверждено исходными текстами изделия или\n"
+            "  согласованным носителем, в сводку не попадают: они перечислены\n"
+            "  в try{N}/pass4/ и вопросов не вызывают."
         ),
         "external_built": (
             "bin/",
@@ -4958,9 +5082,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         ),
         "binaries_from_src": (
             "bin/",
-            "Бинари хранящиеся прямо в исходниках",
-            "Готовые ELF/PE бинари, которые хранятся прямо в исходниках\n"
-            "  (src.json) и скопированы в дистрибутив без сборки."
+            "Готовые бинари, лежащие прямо в исходных текстах",
+            "Готовые ELF/PE бинари, которые хранятся прямо в переданных исходных\n"
+            "  текстах (src.json) и скопированы в дистрибутив без сборки.\n"
+            "  Бинарь дистрибутива должен быть собран из исходных текстов, а не\n"
+            "  принесён в них готовым: по такому файлу нельзя проверить, из чего\n"
+            "  он сделан, даже если он найден в src.json. Требуется либо убрать\n"
+            "  файл и собирать его из исходных текстов, либо дать пояснение,\n"
+            "  почему он поставляется в готовом виде."
         ),
         "binaries_in_src": (
             "bin/",
@@ -4992,7 +5121,12 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     readme_lines.append("# Summary Report — {}".format(project_name))
     readme_lines.append("# Generated: {}".format(datetime.now().isoformat()))
     readme_lines.append("Краткая справка по отчётам в этой папке.")
-    readme_lines.append("Каждый отчёт содержит список файлов в формате: путь<TAB>хеш")
+    readme_lines.append("Отчёты — текстовые, колонки разделены табуляцией.")
+    readme_lines.append("  обычный отчёт : путь<TAB>хеш")
+    readme_lines.append("  origin_*      : путь<TAB>хеш<TAB>категория<TAB>операция<TAB>origin_detail")
+    readme_lines.append("В шапке каждого отчёта — число записей и число уникальных файлов:")
+    readme_lines.append("  это разные числа, один файл попадает в отчёт столько раз,")
+    readme_lines.append("  сколько у него путей внутри носителя.")
 
     # src/ секция
     src_entries = []
@@ -5029,7 +5163,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     if bin_entries_readme:
         readme_lines.append("=" * 60)
-        readme_lines.append("bin/  — бинари, не собранные из исходных текстов")
+        readme_lines.append(
+            "bin/  — бинари, происхождение которых не подтверждено")
         readme_lines.append("=" * 60)
         for short, (section, title, descr), fname in bin_entries_readme:
             readme_lines.extend(_readme_entry(fname, section, title, descr))
