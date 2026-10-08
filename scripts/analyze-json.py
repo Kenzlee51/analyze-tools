@@ -3077,14 +3077,28 @@ ORIGIN_UNRESOLVED  = 'unresolved'
 _ORIGIN_MAX_DEPS_PER_CMD = 3000
 # Максимум хешей во фронтире одного раунда
 _ORIGIN_MAX_FRONTIER = 20000
-# Сколько раз расширять поиск назад по цепочке.
-# Каждый раунд — один проход по buildography, поэтому значение не задирается.
-# Трёх хватает на цепочки вида бинарь <- .o <- .c и колесо <- каталог <- архив.
-# Переопределяется переменной окружения ORIGIN_ROUNDS для экспериментов.
+# Сколько производящих команд хранить на один хеш.
+# Больше одной нужно потому, что файл копируют, подписывают и переупаковывают,
+# а также из-за ошибочной привязки хеша к постороннему пути в трассе
+# (см. collect_producers). Восьми хватает с большим запасом: на NPUR.34018-01
+# максимум было четыре.
+_ORIGIN_MAX_PRODUCERS = 8
+# Предел числа раундов обратного обхода.
+#
+# Это ПРЕДОХРАНИТЕЛЬ, а не план: цикл останавливается сам, как только фронтир
+# пуст, и лишние раунды просто не выполняются. Поэтому высокое значение ничего
+# не стоит, а низкое молча портит результат.
+#
+# Измерено на NPUR.34018-01: при лимите 3 оставалось 88 неразрешённых, при
+# лимите 8 — 52, причём обход вставал сам на пятом раунде. То есть прежнее
+# значение 3 (взятое по аналогии с MAX_ITERATIONS в Pass 4, без измерения)
+# обрезало работающие цепочки.
+#
+# Переопределяется переменной окружения ORIGIN_ROUNDS.
 try:
-    _ORIGIN_MAX_ROUNDS = max(1, int(os.environ.get('ORIGIN_ROUNDS', '3')))
+    _ORIGIN_MAX_ROUNDS = max(1, int(os.environ.get('ORIGIN_ROUNDS', '20')))
 except ValueError:
-    _ORIGIN_MAX_ROUNDS = 3
+    _ORIGIN_MAX_ROUNDS = 20
 
 
 def _iter_cmd_pairs(section):
@@ -3105,11 +3119,31 @@ def _iter_cmd_pairs(section):
 
 def collect_producers(buildography_files, target_hashes,
                       compiler_basenames=None, linker_basenames=None,
-                      max_deps=_ORIGIN_MAX_DEPS_PER_CMD):
+                      max_deps=_ORIGIN_MAX_DEPS_PER_CMD,
+                      max_producers=_ORIGIN_MAX_PRODUCERS):
     """
-    Один проход по buildography. Для каждого хеша из target_hashes находит
-    первую команду, у которой этот хеш стоит в output, и запоминает:
-      operation, detail, id, argv (укороченный), deps [(путь, хеш)].
+    Один проход по buildography. Для каждого хеша из target_hashes собирает
+    ВСЕ команды, у которых этот хеш стоит в output. Возвращает
+      { hash: [ {operation, detail, cmd_id, argv, out_paths, deps}, ... ] }
+
+    Почему все, а не первая. Один и тот же хеш законно встречается в выходах
+    нескольких команд: файл копируют, подписывают, переупаковывают, и копия
+    сохраняет содержимое. Кроме того, в трассе встречается ОШИБОЧНАЯ привязка
+    хеша к постороннему пути — проверено на NPUR.34018-01, где хеш колеса
+    pykerberos приписан файлу документации Pillow:
+
+        hash f1e02420... ->
+            /tmp/ZM1202.BFB/pypi/.../pykerberos-1.2.1-...whl      (3 копии)
+            /tmp/build-via-sdist-o6ha__62/Pillow-7.2.0/docs/releasenotes/3.1.0.rst
+
+    Для ГОСТ-хеша совпадение содержимого .rst и .whl невозможно, то есть это
+    дефект трассы. Выбор ПЕРВОГО производителя приводил к тому, что обход
+    уходил по входам чужой команды (сборки Pillow) и терял настоящую цепочку
+    pykerberos, из-за чего 48 файлов оказывались в "происхождение не
+    установлено" без всяких оснований.
+
+    Храня всех производителей и проверяя входы каждого, мы перестаём зависеть
+    от того, какой из них попался первым.
 
     Системные зависимости отбрасываются сразу — они составляют подавляющую
     часть списка (libc, locale-archive, gconv-modules и прочие чтения
@@ -3119,21 +3153,20 @@ def collect_producers(buildography_files, target_hashes,
         return {}
 
     producers = {}
-    remaining = set(target_hashes)
+    targets = set(target_hashes)
 
     for file_path in buildography_files:
-        if not remaining:
-            break
         with open(file_path, 'rb') as f:
             data = _json_loads(f.read())
         for cmd in data.get('component_commands', []):
-            if not remaining:
-                break
-            hits = []
-            for _p, h in _iter_cmd_pairs(cmd.get('output', {})):
-                if h and h in remaining:
-                    hits.append(h)
+            hits = {}
+            for p, h in _iter_cmd_pairs(cmd.get('output', {})):
+                if h and h in targets:
+                    hits.setdefault(h, []).append(p)
             if not hits:
+                continue
+            # Пропускаем команду, если по всем её попаданиям уже набран лимит
+            if all(len(producers.get(h, ())) >= max_producers for h in hits):
                 continue
 
             argv = cmd.get('command') or []
@@ -3163,18 +3196,53 @@ def collect_producers(buildography_files, target_hashes,
                         break
 
             argv_short = ' '.join(t for t in argv if isinstance(t, str))[:300]
-            for h in hits:
-                producers[h] = {
+            for h, out_paths in hits.items():
+                lst = producers.setdefault(h, [])
+                if len(lst) >= max_producers:
+                    continue
+                lst.append({
                     'operation': operation,
                     'detail':    detail,
                     'cmd_id':    cmd.get('id'),
                     'argv':      argv_short,
+                    'out_paths': out_paths,
                     'deps':      deps,
-                }
-                remaining.discard(h)
+                })
         del data
 
     return producers
+
+
+def _pick_main_producer(plist, target_path):
+    """
+    Выбирает "главного" производителя из списка — того, чьё имя выходного
+    файла совпадает с именем искомого.
+
+    Нужен только для полей operation/operation_cmd в отчёте: происхождение
+    всё равно ищется по входам ВСЕХ производителей. Но подпись "чем сделан"
+    должна называть настоящую команду, а не ту, что попалась первой из-за
+    ошибочной привязки хеша.
+    """
+    if not plist:
+        return {}
+    want = os.path.basename(target_path or '')
+    if want:
+        for pr in plist:
+            for op in pr.get('out_paths', ()):
+                if os.path.basename(op) == want:
+                    return pr
+    return plist[0]
+
+
+# Расширения, по которым компонент пути опознаётся как архив/пакет.
+# Порядок важен только для составных: .tar.gz проверяется до .gz.
+_TRUSTED_ARCHIVE_EXTS = (
+    '.tar.gz', '.tar.bz2', '.tar.xz', '.tar.zst', '.tar.lz4', '.tar.lzma',
+    '.tgz', '.tbz2', '.txz',
+    '.iso', '.deb', '.rpm', '.whl', '.egg', '.jar', '.war', '.ear',
+    '.tar', '.zip', '.gz', '.xz', '.bz2', '.zst', '.7z', '.cab', '.apk',
+    '.nupkg', '.crate', '.gem',
+)
 
 
 def _trusted_container(trusted_path):
@@ -3182,25 +3250,44 @@ def _trusted_container(trusted_path):
     Из пути внутри согласованного носителя достаёт БЛИЖАЙШИЙ архив/пакет —
     то, что имеет смысл называть основанием доверия.
 
-      .../svvp.iso_dir/НПУР.../pypi-cache/distlib/distlib-0.3.4.zip_dir/distlib/t64-arm.exe
-        -> svvp.iso_dir/НПУР.../pypi-cache/distlib/distlib-0.3.4.zip
+      TRUSTED.GENERAL/src/svvp.iso/НПУР.../pypi-cache/distlib/distlib-0.3.4.zip/distlib/t64-arm.exe
+        -> svvp.iso/НПУР.../pypi-cache/distlib/distlib-0.3.4.zip
 
-    Берётся ПОСЛЕДНЕЕ вхождение "_dir/", а не первое. Вложенность на
-    реальном носителе глубокая: образ -> каталог изделия -> архив пакета
-    -> содержимое. По первому вхождению в основание всегда попадал бы
-    сам образ, что для атрибуции бесполезно — надо знать, какой именно
-    пакет внутри него.
+    Архив опознаётся ПО РАСШИРЕНИЮ компонента пути, а не по суффиксу
+    "_dir", которого в этих путях нет: generate_json.sh вырезает его при
+    записи json (get_virtual_path, подстановка "${virtual_path//_dir\\//\\/}").
+    Поиск по "_dir/" не находил ничего и возвращал путь целиком — уникальный
+    для каждого файла. На СВВП это давало 1 389 343 различных "контейнера"
+    при 1 389 341 хеше, то есть интернирование не работало вовсе и индекс
+    занимал 816 МБ вместо расчётных 370; вдобавок в отчёте дублировался
+    префикс носителя.
+
+    Берётся ПОСЛЕДНИЙ архивный компонент, а не первый. Вложенность на
+    реальном носителе глубокая (образ -> каталог изделия -> архив пакета
+    -> содержимое), и по первому в основание всегда попадал бы сам образ,
+    что для атрибуции бесполезно: надо знать, какой именно пакет внутри.
+
+    Если архива в пути нет, возвращается каталог файла — он всё равно
+    гораздо менее разнообразен, чем сами файлы, и интернирование работает.
     """
     if not trusted_path:
         return ''
-    marker = '_dir/'
-    idx = trusted_path.rfind(marker)
-    if idx < 0:
-        return trusted_path
-    head = trusted_path[:idx]
-    # Отрезаем префикс "<носитель>/<src|bin>/"
-    parts = head.split('/', 2)
-    return parts[2] if len(parts) == 3 else head
+
+    parts = trusted_path.split('/')
+    # Префикс "<носитель>/<src|bin>/" в основание не входит
+    start = 2 if len(parts) > 2 else 0
+
+    last = -1
+    for i in range(start, len(parts) - 1):      # последний компонент — файл
+        low = parts[i].lower()
+        for ext in _TRUSTED_ARCHIVE_EXTS:
+            if low.endswith(ext):
+                last = i
+                break
+
+    if last >= 0:
+        return '/'.join(parts[start:last + 1])
+    return '/'.join(parts[start:-1]) if len(parts) > start + 1 else trusted_path
 
 
 def resolve_origins(entries, src_hashes, trusted, buildography_files,
@@ -3233,6 +3320,12 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
 
     verdict = {}    # hash -> (origin, detail)
     chains  = {}    # hash -> [строки цепочки]
+    # hash -> характерный путь. Нужен, чтобы при нескольких производителях
+    # одного хеша выбрать того, чей выходной файл называется так же.
+    h_to_path = {}
+    for h, elist in by_hash.items():
+        if elist:
+            h_to_path[h] = elist[0].get('path', '')
 
     def _set(h, origin, detail):
         verdict[h] = (origin, detail)
@@ -3275,37 +3368,50 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             if not unresolved_roots:
                 continue
 
-            prod = producers.get(h)
-            if prod is None:
+            plist = producers.get(h)
+            if not plist:
                 for r in unresolved_roots:
                     if r == h:
                         _set(r, ORIGIN_UNRESOLVED,
                              'производящая команда в трассе не найдена')
                 continue
 
-            step = '{}({})'.format(prod['operation'], prod['detail'] or '?')
+            # Шаг цепочки подписываем главным производителем — тем, чьё имя
+            # выходного файла совпадает с искомым. Иначе в цепочке появится
+            # чужая команда, попавшая сюда по ошибочной привязке хеша.
+            main = _pick_main_producer(plist, h_to_path.get(h, ''))
+            step = '{}({})'.format(main['operation'], main['detail'] or '?')
             for r in unresolved_roots:
                 chains.setdefault(r, []).append(step)
 
-            # Операция сама является терминалом
-            if prod['operation'] == _OP_DOWNLOADED:
+            # Загрузка — терминал сама по себе. Достаточно, чтобы ЛЮБОЙ из
+            # производителей оказался загрузкой.
+            dl = next((pr for pr in plist
+                       if pr['operation'] == _OP_DOWNLOADED), None)
+            if dl is not None:
                 for r in unresolved_roots:
                     _set(r, ORIGIN_DOWNLOAD,
-                         prod['detail'] or 'сетевая загрузка')
+                         dl['detail'] or 'сетевая загрузка')
                 continue
 
-            # Ищем терминал среди зависимостей: сначала согласованный
-            # носитель, затем исходные тексты изделия.
+            # Ищем терминал среди входов ВСЕХ производителей: сначала
+            # согласованный носитель, затем исходные тексты изделия.
             hit_trusted = None
             hit_src     = None
-            for dp, dh in prod['deps']:
-                if hit_trusted is None and dh in trusted:
-                    hit_trusted = (dp, dh)
+            for pr in plist:
+                for dp, dh in pr['deps']:
+                    if dh in trusted:
+                        hit_trusted = (dp, dh)
+                        break
+                if hit_trusted is not None:
                     break
             if hit_trusted is None:
-                for dp, dh in prod['deps']:
-                    if dh in src_hashes:
-                        hit_src = (dp, dh)
+                for pr in plist:
+                    for dp, dh in pr['deps']:
+                        if dh in src_hashes:
+                            hit_src = (dp, dh)
+                            break
+                    if hit_src is not None:
                         break
 
             if hit_trusted is not None:
@@ -3321,44 +3427,59 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                              hit_src[0][:120]))
                 continue
 
-            # У команды нет неотфильтрованных входов — идти дальше некуда.
-            # Формулировка различается по тому, создаёт операция содержимое
-            # или только переносит его: во втором случае отсутствие входа —
-            # это пробел трассы, в первом может быть и нормой.
-            if not prod['deps']:
-                if prod['operation'] in DERIVING_OPERATIONS:
+            # Ни у одного производителя нет неотфильтрованных входов —
+            # идти дальше некуда. Формулировка различается по тому, создаёт
+            # операция содержимое или только переносит его: во втором случае
+            # отсутствие входа это пробел трассы, в первом может быть нормой.
+            all_deps = [d for pr in plist for d in pr['deps']]
+            if not all_deps:
+                if main['operation'] in DERIVING_OPERATIONS:
                     why = ('операция {} только переносит содержимое, но её '
-                           'вход в трассе отсутствует'.format(prod['operation']))
+                           'вход в трассе отсутствует'.format(main['operation']))
                 else:
                     why = ('у производящей команды ({}) нет неотфильтрованных '
-                           'входов'.format(prod['operation']))
+                           'входов'.format(main['operation']))
                 for r in unresolved_roots:
                     _set(r, ORIGIN_UNRESOLVED, why)
                 continue
 
-            # Терминал не найден — продолжаем обход назад по зависимостям
-            if rnd < max_rounds and len(next_frontier) < _ORIGIN_MAX_FRONTIER:
-                for dp, dh in prod['deps']:
+            # Терминал не найден — продолжаем обход назад по входам всех
+            # производителей.
+            if len(next_frontier) < _ORIGIN_MAX_FRONTIER:
+                for dp, dh in all_deps:
                     if dh in seen:
                         continue
                     next_frontier.add(dh)
                     seen.add(dh)
+                    h_to_path.setdefault(dh, dp)
                     dependents.setdefault(dh, set()).update(unresolved_roots)
                     if len(next_frontier) >= _ORIGIN_MAX_FRONTIER:
                         break
-            else:
-                for r in unresolved_roots:
-                    if r not in verdict:
-                        _set(r, ORIGIN_UNRESOLVED,
-                             'цепочка не дошла до опознанного источника '
-                             '(операция {})'.format(prod['operation']))
 
         frontier = next_frontier
 
-    # Всё, что осталось без вердикта после последнего раунда
+    # Всё, что осталось без вердикта после последнего раунда.
+    #
+    # Причину различаем честно. Раньше здесь безусловно писалось "обход
+    # прерван по глубине", и это вводило в заблуждение: на NPUR.34018-01
+    # обход вставал на пятом раунде при лимите восемь, то есть кандидаты
+    # кончились сами, а отчёт утверждал, что не хватило глубины. Это
+    # противоположные утверждения: в первом случае проверка отработала
+    # полностью и источник не нашла, во втором ей не дали доработать.
+    if frontier:
+        why_rest = ('обход прерван по глубине (израсходован лимит '
+                    '{} раундов)'.format(max_rounds))
+    else:
+        why_rest = ('цепочка прослежена до конца, '
+                    'опознанный источник не найден')
+    n_rest = 0
     for h in by_hash:
         if h not in verdict:
-            _set(h, ORIGIN_UNRESOLVED, 'обход прерван по глубине')
+            _set(h, ORIGIN_UNRESOLVED, why_rest)
+            n_rest += 1
+    if n_rest:
+        print(_ts() + "   Origin: без вердикта после обхода: {} ({})".format(
+            n_rest, 'лимит раундов' if frontier else 'кандидаты исчерпаны'))
 
     # --- Раскладываем записи и дописываем поля ------------------------------
     out = {ORIGIN_PRODUCT_SRC: [], ORIGIN_APPROVED: [],
@@ -3371,8 +3492,9 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
 
     for h, elist in by_hash.items():
         origin, detail = verdict.get(h, (ORIGIN_UNRESOLVED, ''))
-        prod = own_producers.get(h) or {}
         for e in elist:
+            prod = _pick_main_producer(own_producers.get(h) or [],
+                                       e.get('path', ''))
             e['operation']     = prod.get('operation', _OP_OTHER)
             e['operation_cmd'] = prod.get('argv', '')
             e['origin']        = origin
@@ -4432,15 +4554,17 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     # --- Pass 4 ---
     if pass4_ran:
         print(_ts() + "   Writing pass 4 results...")
-        # compiled_from_src — единый файл и в try{N}, и в summary.
-        # Разбор по происхождению лежит рядом отдельными отчётами и в
-        # summary не тянется (договорённость: сущности не множим).
-        jt(pass4_dir, "compiled_from_src",  "compiled_from_src",  p4_compiled_from_src,
-           summary_bin_files, "compiled_from_src")
+        # compiled_from_src в сводку НЕ идёт: сводка — это перечень того, что
+        # нужно убрать или объяснить, а эта категория содержит в том числе
+        # норму. В сводку уходит только её проблемная часть — origin_download
+        # и origin_unresolved. На NPUR.34018-01 это 52 файла из 346.
+        jt(pass4_dir, "compiled_from_src",  "compiled_from_src",  p4_compiled_from_src)
         jt(pass4_dir, "origin_product_src",     "origin_product_src",     p4_origin_product)
         jt(pass4_dir, "origin_approved_source", "origin_approved_source", p4_origin_approved)
-        jt(pass4_dir, "origin_download",        "origin_download",        p4_origin_download)
-        jt(pass4_dir, "origin_unresolved",      "origin_unresolved",      p4_origin_unresolved)
+        jt(pass4_dir, "origin_download",        "origin_download",        p4_origin_download,
+           summary_bin_files, "origin_download")
+        jt(pass4_dir, "origin_unresolved",      "origin_unresolved",      p4_origin_unresolved,
+           summary_bin_files, "origin_unresolved")
         jt(pass4_dir, "binaries_from_src",  "binaries_from_src",  p4_binaries_from_src,
            summary_bin_files, "binaries_from_src")
         jt(pass4_dir, "untraced_from_src",  "untraced_from_src",  p4_untraced_from_src)
@@ -4642,14 +4766,32 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         _shutil.copy2(src_path, dst)
         print(_ts() + "   Summary bin: {}".format(os.path.basename(dst)))
 
-    # binaries_in_src.txt из ext/
+    # binaries_in_src.txt из ext/ — только если в нём есть хоть одна запись.
+    #
+    # Файл всегда существует и всегда содержит двухстрочную шапку
+    # ("TYPE PATH" и черта), поэтому проверки os.path.isfile недостаточно:
+    # в сводку уезжал пустой файл на 38 байт. Считаем содержательные строки.
     binaries_in_src_path = os.path.join(
         RESULTS_DIR, project_name, "ext", "binaries_in_src.txt")
     if os.path.isfile(binaries_in_src_path):
-        dst = os.path.join(summary_bin_dir,
-                           "{}_binaries_in_src.txt".format(project_name))
-        _shutil.copy2(binaries_in_src_path, dst)
-        print(_ts() + "   Summary bin: {}".format(os.path.basename(dst)))
+        n_bins = 0
+        try:
+            with open(binaries_in_src_path, 'r', encoding='utf-8',
+                      errors='replace') as f:
+                for line in f:
+                    t = line.strip()
+                    if t and not t.startswith(('TYPE', '---', '#')):
+                        n_bins += 1
+        except OSError:
+            n_bins = 0
+        if n_bins:
+            dst = os.path.join(summary_bin_dir,
+                               "{}_binaries_in_src.txt".format(project_name))
+            _shutil.copy2(binaries_in_src_path, dst)
+            print(_ts() + "   Summary bin: {} ({} записей)".format(
+                os.path.basename(dst), n_bins))
+        else:
+            print(_ts() + "   binaries_in_src.txt пуст — в сводку не копируем")
 
     print(_ts() + "   Summary done: src={} files, bin={} files".format(
         len(summary_src_files), len(summary_bin_files)))
@@ -4685,17 +4827,30 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "  компилировались и не скопированы в дистрибутив."
         ),
         # bin/
-        "compiled_from_src": (
+        "origin_download": (
             "bin/",
-            "Файлы дистрибутива, появившиеся в ходе сборки",
-            "Файлы, чей хеш является выходом прослеженной команды, и при этом\n"
-            "  отсутствует в переданных исходных текстах (src.json).\n"
-            "  ВАЖНО: категория НЕ означает, что файл собран из исходных\n"
-            "  текстов изделия. Сюда попадает всё, что сборка так или иначе\n"
-            "  произвела, включая переупакованные и подписанные сторонние\n"
-            "  пакеты. Разбор по действительному происхождению лежит рядом,\n"
-            "  в try{N}/pass4/: origin_product_src, origin_approved_source,\n"
-            "  origin_download, origin_unresolved."
+            "Бинари, полученные по сети",
+            "Файлы дистрибутива, цепочка происхождения которых заканчивается сетевой\n"
+            "  загрузкой (pip download, wget, curl, apt download). При этом полученный\n"
+            "  файл не совпал по хешу ни с одним файлом согласованных носителей.\n"
+            "  Происхождение проверяется в следующем порядке: исходные тексты изделия,\n"
+            "  согласованный носитель, сетевая загрузка. Согласованные носители\n"
+            "  проверяются РАНЬШЕ загрузки, поэтому сюда попадает только то, что\n"
+            "  скачано И не найдено среди переданных материалов, то есть получено\n"
+            "  из источника вне комплекта поставки.\n"
+            "  В поле origin_detail указан адрес источника из командной строки."
+        ),
+        "origin_unresolved": (
+            "bin/",
+            "Бинари, происхождение которых установить не удалось",
+            "Файлы дистрибутива, для которых обратный обход по трассе сборки не привёл\n"
+            "  ни к исходным текстам изделия, ни к согласованным носителям, ни к\n"
+            "  сетевой загрузке.\n"
+            "  Причина указана в поле origin_detail: цепочка прослежена до конца и\n"
+            "  опознанный источник не найден; у производящей команды нет\n"
+            "  прослеживаемых входов; обход упёрся в предел глубины.\n"
+            "  В поле origin_chain — последовательность операций от файла назад,\n"
+            "  например: signed(bsign) <- compiled(ld) <- compiled(as)."
         ),
         "external_built": (
             "bin/",
@@ -4743,8 +4898,13 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     # Строим README только по файлам которые реально попали в summary
     def _readme_entry(fname, section, title, descr):
-        lines = ["  {}".format(fname), "  {}".format(title)]
+        # Пустая строка перед записью и черта под заголовком.
+        # Без них имя следующего файла идёт вплотную за текстом предыдущего
+        # описания с тем же отступом, и границы записей на глаз неразличимы —
+        # тем хуже, чем длиннее описания.
+        lines = ["", "  {}".format(fname), "  {}".format(title)]
         if descr:
+            lines.append("  " + "-" * 60)
             lines.append("  {}".format(descr))
         return lines
 
@@ -4789,10 +4949,24 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     if bin_entries_readme:
         readme_lines.append("=" * 60)
-        readme_lines.append("bin/  — происхождение бинарей дистрибутива")
+        readme_lines.append("bin/  — бинари, не собранные из исходных текстов")
         readme_lines.append("=" * 60)
         for short, (section, title, descr), fname in bin_entries_readme:
             readme_lines.extend(_readme_entry(fname, section, title, descr))
+
+    # Пустая сводка — это результат, а не сбой. Без явной строки папка с
+    # одним README читается как "что-то не отработало".
+    if not src_entries and not bin_entries_readme:
+        readme_lines.append("=" * 60)
+        readme_lines.append("Замечаний нет.")
+        readme_lines.append("=" * 60)
+        readme_lines.append("")
+        readme_lines.append("  Избыточных исходных файлов не обнаружено.")
+        readme_lines.append("  Все бинари дистрибутива прослежены до исходных")
+        readme_lines.append("  текстов изделия либо до согласованных носителей.")
+        readme_lines.append("")
+        readme_lines.append("  Полные результаты разбора — в соседней папке {}/".format(
+            os.path.basename(try_dir)))
 
     readme_path = os.path.join(summary_dir, "README.txt")
     with open(readme_path, 'w', encoding='utf-8') as f:
