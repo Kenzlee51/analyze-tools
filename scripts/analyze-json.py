@@ -3120,7 +3120,8 @@ def _iter_cmd_pairs(section):
 def collect_producers(buildography_files, target_hashes,
                       compiler_basenames=None, linker_basenames=None,
                       max_deps=_ORIGIN_MAX_DEPS_PER_CMD,
-                      max_producers=_ORIGIN_MAX_PRODUCERS):
+                      max_producers=_ORIGIN_MAX_PRODUCERS,
+                      with_siblings=True):
     """
     Один проход по buildography. Для каждого хеша из target_hashes собирает
     ВСЕ команды, у которых этот хеш стоит в output. Возвращает
@@ -3204,13 +3205,84 @@ def collect_producers(buildography_files, target_hashes,
                     'operation': operation,
                     'detail':    detail,
                     'cmd_id':    cmd.get('id'),
+                    'parent_id': cmd.get('parent_id'),
                     'argv':      argv_short,
                     'out_paths': out_paths,
                     'deps':      deps,
                 })
         del data
 
+    if with_siblings:
+        _fill_sibling_deps(buildography_files, producers, max_deps)
+
     return producers
+
+
+def _fill_sibling_deps(buildography_files, producers, max_deps):
+    """
+    Добирает входы у БРАТЬЕВ по parent_id тем производителям, у которых своих
+    содержательных входов нет.
+
+    Зачем. При компиляции с флагом -pipe вызов gcc раскладывается на два
+    процесса: cc1 читает исходный текст и пишет ассемблерный код в пайп, а as
+    читает его со стандартного ввода и создаёт объектный файл. Промежуточного
+    .s не существует. В итоге у cc1 нет выходов, а у as нет входов — он,
+    будучи производителем .o, не знает ни одного содержательного файла.
+    Обратный обход упирается в него и не доходит до исходника.
+
+    Проверено на NPUR.34018-01, модуль apache mod_lbmethod_bymaclabel:
+
+        id 34713  x86_64-linux-gnu-gcc -pipe -g -O2 ...
+          +- id 34714  cc1   : 209 входов, среди них mod_lbmethod_bymaclabel.c
+          +- id 34715  as    : 10 входов, все системные, ни одного .s
+
+    cc1 и as — братья под одним gcc, то есть одна компиляция, разложенная на
+    процессы. Поэтому при пустых входах берём входы братьев и родителя.
+
+    Правило общее, а не заплатка под -pipe: оно закрывает любой случай, когда
+    вызов компилятора разложен на несколько процессов и содержательные входы
+    оказались не у того из них, кто создал файл.
+    """
+    need = set()
+    for plist in producers.values():
+        for pr in plist:
+            if not pr['deps'] and pr.get('parent_id') is not None:
+                need.add(pr['parent_id'])
+    if not need:
+        return
+
+    sib = {}
+    for file_path in buildography_files:
+        with open(file_path, 'rb') as f:
+            data = _json_loads(f.read())
+        for cmd in data.get('component_commands', []):
+            pid = cmd.get('parent_id')
+            cid = cmd.get('id')
+            key = pid if pid in need else (cid if cid in need else None)
+            if key is None:
+                continue
+            bucket = sib.setdefault(key, [])
+            if len(bucket) >= max_deps:
+                continue
+            for dp, dh in _iter_cmd_pairs(cmd.get('dependencies', {})):
+                if not dh or _is_system_path(dp):
+                    continue
+                bucket.append((dp, dh))
+                if len(bucket) >= max_deps:
+                    break
+        del data
+
+    n = 0
+    for plist in producers.values():
+        for pr in plist:
+            if not pr['deps']:
+                got = sib.get(pr.get('parent_id'))
+                if got:
+                    pr['sibling_deps'] = got
+                    n += 1
+    if n:
+        print(_ts() + "   Origin: добрано входов у братьев для {} "
+                      "производителей".format(n))
 
 
 def _pick_main_producer(plist, target_path):
@@ -3309,6 +3381,13 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     Возвращает (product_src, approved, download, unresolved) — четыре списка
     тех же самых записей, разложенные по происхождению.
     """
+    def _deps_of(pr):
+        """
+        Входы производителя: свои, а при их отсутствии — добранные у братьев
+        по parent_id (см. _fill_sibling_deps, случай компиляции с -pipe).
+        """
+        return pr['deps'] or pr.get('sibling_deps') or []
+
     print(_ts() + "   Origin: входных записей {}".format(len(entries)))
 
     # Группируем записи по хешу — один хеш часто лежит по нескольким путям
@@ -3399,7 +3478,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             hit_trusted = None
             hit_src     = None
             for pr in plist:
-                for dp, dh in pr['deps']:
+                for dp, dh in _deps_of(pr):
                     if dh in trusted:
                         hit_trusted = (dp, dh)
                         break
@@ -3407,7 +3486,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     break
             if hit_trusted is None:
                 for pr in plist:
-                    for dp, dh in pr['deps']:
+                    for dp, dh in _deps_of(pr):
                         if dh in src_hashes:
                             hit_src = (dp, dh)
                             break
@@ -3431,7 +3510,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             # идти дальше некуда. Формулировка различается по тому, создаёт
             # операция содержимое или только переносит его: во втором случае
             # отсутствие входа это пробел трассы, в первом может быть нормой.
-            all_deps = [d for pr in plist for d in pr['deps']]
+            all_deps = [d for pr in plist for d in _deps_of(pr)]
             if not all_deps:
                 if main['operation'] in DERIVING_OPERATIONS:
                     why = ('операция {} только переносит содержимое, но её '
@@ -3488,7 +3567,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     # Операцию берём у производителя самого файла (первый шаг цепочки)
     own_producers = collect_producers(
         buildography_files, set(by_hash.keys()),
-        compiler_basenames, linker_basenames, max_deps=1)
+        compiler_basenames, linker_basenames, max_deps=1,
+        with_siblings=False)
 
     for h, elist in by_hash.items():
         origin, detail = verdict.get(h, (ORIGIN_UNRESOLVED, ''))
