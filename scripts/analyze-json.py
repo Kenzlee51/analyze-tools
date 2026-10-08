@@ -3828,8 +3828,10 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 # должно быть видно: подтверждён пакет, а не сам файл.
                 e_origin, e_detail, cname = inh
                 e['origin']           = e_origin
-                e['origin_detail']    = '{} (через контейнер {})'.format(
-                    e_detail, cname)
+                # Суффикс "(через контейнер X)" не пишем: имя контейнера
+                # лежит в origin_container и выносится в заголовок группы
+                # отчёта, а в строке он только съедал ширину.
+                e['origin_detail']    = e_detail
                 e['origin_container'] = cname
                 e['origin_inherited'] = True
                 steps = list(ch or [])
@@ -4367,25 +4369,59 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
 
 
+def _plural_ru(n, one, few, many):
+    """
+    Склонение существительного при числе: 1 пакет, 2 пакета, 5 пакетов.
+
+    Без этого в отчёте печаталось "входят 2 сторонних пакетов".
+    """
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def _common_dir_prefix(paths):
+    """Наибольший общий префикс путей, обрезанный по границе каталога."""
+    if not paths:
+        return ''
+    parts = [p.split('/') for p in paths]
+    common = []
+    for i in range(min(len(x) for x in parts)):
+        seg = parts[0][i]
+        if all(x[i] == seg for x in parts):
+            common.append(seg)
+        else:
+            break
+    return '/'.join(common) + '/' if common else ''
+
+
 def write_origin_txt(output_path, category_label, entries):
     """
-    Записывает отчёт origin_* в формате
-        путь<TAB>хеш<TAB>категория<TAB>операция<TAB>основание
+    Записывает отчёт origin_*.
 
-    Обычный формат "путь<TAB>хеш" для этих отчётов не годится. Срез по
-    происхождению собирает файлы из РАЗНЫХ категорий Pass 4, и без колонки
-    категории теряется то, ради чего категории существуют: читатель видит
-    файл в origin_unresolved, но не узнаёт, что тот пришёл готовым извне
-    (external_prebuilt) или был переупакован. Это два разных замечания.
+    Две формы вывода, по данным:
+
+    1. Если происхождение установлено через пакет-контейнер, отчёт
+       группируется по пакетам. Замечание относится к пакету целиком, а не к
+       каждому файлу внутри него: 103 строки с .o и .a из gcc-дева читаются
+       как 103 проблемы, тогда как проблем 14 — по числу пакетов. Общий
+       префикс пути (образ, tgz, каталог изделия) выносится в шапку один
+       раз: на NPUR.69035-01 это 90 символов, повторявшихся в каждой строке.
+
+    2. Иначе — плоский формат
+           путь<TAB>хеш<TAB>категория<TAB>операция<TAB>основание
+       Колонка категории нужна, потому что срез по происхождению собирает
+       файлы из РАЗНЫХ категорий Pass 4, и без неё читатель видит файл в
+       origin_unresolved, но не узнаёт, пришёл тот готовым извне или был
+       переупакован.
 
     Возвращает True, если записана хотя бы одна строка.
     """
     seen = set()
     rows = []
-    # Пакет-контейнер -> уникальные файлы в нём. Нужен для сводной шапки:
-    # 103 строки с .o и .a внутри gcc-дева читаются как 103 замечания, тогда
-    # как замечание одно на пакет, и разработчику нужен именно пакет.
-    by_container = {}
     for entry in entries:
         path = (entry.get('path') or '').strip()
         h    = (entry.get('hash') or '').strip()
@@ -4395,46 +4431,117 @@ def write_origin_txt(output_path, category_label, entries):
         if key in seen:
             continue
         seen.add(key)
-        cont = entry.get('origin_container', '')
-        if cont:
-            by_container.setdefault(cont, set()).add(h or path)
-        rows.append((
-            path, h,
-            entry.get('pass4_category', ''),
-            entry.get('operation', ''),
-            (entry.get('origin_detail') or '').replace('\t', ' '),
-        ))
-    rows.sort(key=lambda x: x[0])
+        rows.append({
+            'path':      path,
+            'hash':      h,
+            'cat':       entry.get('pass4_category', ''),
+            'op':        entry.get('operation', ''),
+            'detail':    (entry.get('origin_detail') or '').replace('\t', ' '),
+            'container': entry.get('origin_container', ''),
+        })
+    rows.sort(key=lambda r: r['path'])
 
     versioned_path = get_versioned_filepath(output_path)
     if versioned_path != output_path:
         print(_ts() + "   File exists, writing to: {}".format(
             os.path.basename(versioned_path)))
 
-    uniq_hashes = len({r[1] for r in rows if r[1]})
+    uniq_hashes = len({r['hash'] for r in rows if r['hash']})
+
+    # Разделяем на сгруппированные по пакету и остальные
+    grouped = {}
+    plain   = []
+    for r in rows:
+        c = r['container']
+        if c:
+            g = grouped.setdefault(c, {'detail': r['detail'], 'rows': []})
+            g['rows'].append(r)
+        else:
+            plain.append(r)
+    # Пакеты по убыванию числа файлов — крупное замечание первым
+    order = sorted(grouped.items(),
+                   key=lambda kv: (-len({x['hash'] for x in kv[1]['rows']}),
+                                   kv[0]))
+
     with open(versioned_path, 'w', encoding='utf-8') as f:
         f.write("# {}\n".format(category_label))
         f.write("# Generated: {}\n".format(datetime.now().isoformat()))
-        f.write("# Записей: {}, уникальных файлов: {}\n".format(
-            len(rows), uniq_hashes))
-        f.write("# Format: path<TAB>hash<TAB>pass4_category<TAB>operation"
-                "<TAB>origin_detail\n")
-        if by_container:
-            f.write("#\n")
-            f.write("# Происхождение унаследовано от пакета-контейнера.\n")
-            f.write("# Замечание — на пакет, а не на каждый файл внутри него.\n")
-            f.write("# Пакетов: {}\n".format(len(by_container)))
-            f.write("#\n")
-            for cname, fset in sorted(by_container.items(),
-                                      key=lambda kv: (-len(kv[1]), kv[0])):
-                f.write("#   {:<54} файлов: {}\n".format(cname, len(fset)))
-        f.write("#\n")
-        for r in rows:
-            f.write("\t".join(r) + "\n")
-    print(_ts() + "   Written {} entries ({} уникальных) -> {}".format(
-        len(rows), uniq_hashes, os.path.basename(versioned_path)))
-    return bool(rows)
+        f.write("# Записей: {}, уникальных файлов: {}{}\n".format(
+            len(rows), uniq_hashes,
+            ", пакетов: {}".format(len(grouped)) if grouped else ""))
 
+        prefix = ''
+        if order:
+            # Префикс считаем по части пути ДО имени пакета
+            heads = []
+            for cname, g in order:
+                for r in g['rows']:
+                    marker = '/' + cname + '/'
+                    i = r['path'].find(marker)
+                    # без завершающего слэша: его добавит _common_dir_prefix
+                    heads.append(r['path'][:i] if i >= 0 else r['path'])
+            prefix = _common_dir_prefix(heads)
+
+            f.write("#\n")
+            _n = len(grouped)
+            f.write("# В состав дистрибутива {} {} {} {}, полученных из\n".format(
+                _plural_ru(_n, 'входит', 'входят', 'входят'),
+                _n,
+                _plural_ru(_n, 'сторонний', 'сторонних', 'сторонних'),
+                _plural_ru(_n, 'пакет', 'пакета', 'пакетов')))
+            f.write("# источника вне комплекта поставки. Ниже перечислены "
+                    "обнаруженные в них\n")
+            f.write("# файлы ELF/PE, сгруппированные по пакету.\n")
+            f.write("# Устранять или пояснять нужно пакет целиком, а не "
+                    "отдельные файлы.\n")
+            if prefix:
+                f.write("#\n")
+                f.write("# Все пути ниже — относительно\n")
+                f.write("#   {}\n".format(prefix))
+            f.write("#\n")
+            f.write("# Формат строки данных: <TAB>путь-внутри-пакета"
+                    "<TAB>хеш\n")
+
+            for cname, g in order:
+                n_files = len({x['hash'] for x in g['rows']})
+                f.write("\n")
+                f.write("=" * 74 + "\n")
+                f.write("ПАКЕТ: {}\n".format(cname))
+                f.write("  файлов в дистрибутиве : {}\n".format(n_files))
+                d = g['detail']
+                if ': ' in d:
+                    how, where = d.split(': ', 1)
+                    f.write("  получен               : {}\n".format(how))
+                    f.write("  источник              : {}\n".format(where))
+                elif d:
+                    f.write("  основание             : {}\n".format(d))
+                f.write("-" * 74 + "\n")
+                for r in g['rows']:
+                    rel = r['path']
+                    marker = '/' + cname + '/'
+                    i = rel.find(marker)
+                    if i >= 0:
+                        rel = rel[i + len(marker):]
+                    f.write("\t{}\t{}\n".format(rel, r['hash']))
+
+        if plain:
+            if order:
+                f.write("\n")
+                f.write("=" * 74 + "\n")
+                f.write("ОСТАЛЬНЫЕ ЗАПИСИ ({})\n".format(len(plain)))
+                f.write("=" * 74 + "\n")
+            f.write("# Format: path<TAB>hash<TAB>pass4_category<TAB>operation"
+                    "<TAB>origin_detail\n")
+            f.write("#\n")
+            for r in plain:
+                f.write("\t".join((r['path'], r['hash'], r['cat'],
+                                   r['op'], r['detail'])) + "\n")
+
+    print(_ts() + "   Written {} entries ({} уникальных{}) -> {}".format(
+        len(rows), uniq_hashes,
+        ", {} пакетов".format(len(grouped)) if grouped else "",
+        os.path.basename(versioned_path)))
+    return bool(rows)
 
 def write_pass4_txt(output_path, category_label, entries):
     """Записывает текстовый файл Прохода 4 в формате path<TAB>hash."""
@@ -5385,21 +5492,9 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "src/",
             "Файлы, использование которых не прослеживается",
             "Хеши этих файлов встречаются в трассе сборки, то есть при сборке\n"
-            "  файлы присутствовали и к ним обращались, но ни один\n"
-            "  интерпретатор их не использовал и в дистрибутив они не попали\n"
-            "  ни сами, ни как результат компиляции.\n"
-            "\n"
-            "  ЭТО НЕ СПИСОК НА УДАЛЕНИЕ. Отсутствие доказательств\n"
-            "  использования не равно доказательству неиспользования.\n"
-            "  Типичная причина — сборка в один самодостаточный файл: исходные\n"
-            "  тексты вшиваются внутрь бандла, поэтому по хешу не совпадают ни\n"
-            "  с чем в дистрибутиве, а сама упаковка в трассу не попадает\n"
-            "  (у упаковщиков и архиваторов входные данные не записываются).\n"
-            "\n"
-            "  Требуется пояснение разработчика по каждой группе файлов: куда\n"
-            "  они входят и каким инструментом собираются. После пояснения\n"
-            "  файл либо подтверждается как используемый, либо переходит в\n"
-            "  избыточные и подлежит удалению с носителя исходных текстов."
+            "  файлы присутствовали и к ним обращались, но трассировщик не\n"
+            "  увидел, чтобы какой-либо интерпретатор их использовал, и в\n"
+            "  дистрибутив они не попали ни сами, ни как результат компиляции."
         ),
         # bin/
         "origin_download": (
