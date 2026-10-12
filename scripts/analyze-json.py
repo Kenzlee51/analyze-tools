@@ -3852,7 +3852,18 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     # быть случайным, и тогда подтверждение ложное, просто на RTPG у каждой
     # такой записи нашёлся ещё и настоящий путь.
     #
-    # Что делаем:
+    # Это КОНТРОЛЬ поверх прежнего обхода, а не замена ему: прежний обход
+    # (с досмотром) работает как раньше, а результат обхода до конца
+    # сводится с ним после (см. "Сведение с обходом до конца"):
+    #   - прежний не подтвердил, а этот подтвердил      -> подтверждение
+    #     добавляется;
+    #   - оба подтвердили одинаково                      -> вердикт прежний,
+    #     основание уточняется (свой пакет, нужная версия);
+    #   - прежний подтвердил, а этот нет или иначе       -> вердикт прежний,
+    #     запись получает пометку origin_check и попадает в отдельный
+    #     отчёт origin_check для ручной проверки.
+    #
+    # Как устроен обход до конца:
     #   1. Строим граф "файл <- входы его производителей" ДО КОНЦА: носитель
     #      и src.json ветку не обрывают.
     #   2. Копирование (cp, install, mv) содержимое не меняет, поэтому
@@ -3868,6 +3879,13 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     #      пакетах на одном расстоянии — пакет с большим числом файлов.
     #   5. Основание — архив выбранного пакета; версия берётся по версии
     #      пакета-контейнера, если она есть среди архивов.
+    d_verdict = {}   # hash -> (origin, detail) по обходу до конца
+    d_chain   = {}
+    d_label   = {}   # hash -> уточнённое основание для подтверждённых в раунде 0
+
+    def _dset(h, origin, detail):
+        d_verdict[h] = (origin, detail)
+
     if _ORIGIN_DEEP:
         d_roots = [h for h in by_hash if h and h not in verdict]
         print(_ts() + "   Origin: обход до конца — записей без вердикта "
@@ -4009,12 +4027,12 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
         # не меняется, меняется только выбор архива.
         for h, (o, _d) in list(verdict.items()):
             if o == ORIGIN_APPROVED and h in pkgs_of:
-                verdict[h] = (o, _relabel_approved(h, h, _root_want(h)))
+                d_label[h] = _relabel_approved(h, h, _root_want(h))
 
         for r in d_roots:
             want = _root_want(r)
             if r in g_dl:
-                _set(r, ORIGIN_DOWNLOAD, g_dl[r])
+                _dset(r, ORIGIN_DOWNLOAD, g_dl[r])
                 stats['загрузка'] += 1
                 continue
             prev = {r: None}
@@ -4090,25 +4108,25 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     why = ('цепочка прослежена до конца, '
                            'опознанный источник не найден')
                     stats['нет опоры'] += 1
-                _set(r, ORIGIN_UNRESOLVED, why)
+                _dset(r, ORIGIN_UNRESOLVED, why)
                 continue
 
             x, kind_, _pn = pick
             if kind_ == 'tr':
-                _set(r, ORIGIN_APPROVED, _relabel_approved(r, x, want))
+                _dset(r, ORIGIN_APPROVED, _relabel_approved(r, x, want))
             elif kind_ == 'src':
-                _set(r, ORIGIN_PRODUCT_SRC,
+                _dset(r, ORIGIN_PRODUCT_SRC,
                      'вход команды есть в src.json: {}'.format(
                          h_to_path.get(x, '')[:120]))
             else:
-                _set(r, ORIGIN_DOWNLOAD, g_dl[x])
+                _dset(r, ORIGIN_DOWNLOAD, g_dl[x])
             path = []
             y = prev[x]
             while y is not None:
                 path.append(y)
                 y = prev[y]
             path.reverse()
-            chains[r] = [g_step[y] for y in path if y in g_step]
+            d_chain[r] = [g_step[y] for y in path if y in g_step]
         print(_ts() + "   Origin: обход до конца — " + ', '.join(
             '{} {}'.format(k, v) for k, v in stats.most_common()))
 
@@ -4273,6 +4291,44 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     if joined:
         print(_ts() + "   Origin: досмотр по общему графу разрешил {} "
                       "уникальных хешей".format(len(joined)))
+
+    # --- Сведение с обходом до конца ---------------------------------------
+    # Прежний вердикт не отбрасывается: обход до конца может только ДОБАВИТЬ
+    # подтверждение, уточнить основание или поставить пометку для проверки.
+    check_note = {}
+    if _ORIGIN_DEEP:
+        n_add = n_lab = n_chk = 0
+        for h, new in d_verdict.items():
+            old = verdict.get(h, (ORIGIN_UNRESOLVED, ''))
+            if old[0] == ORIGIN_UNRESOLVED:
+                if new[0] != ORIGIN_UNRESOLVED:
+                    verdict[h] = new
+                    chains[h] = list(d_chain.get(h, [])) + [
+                        '[обход до конца]']
+                    n_add += 1
+                continue
+            if new[0] == old[0]:
+                if old[0] == ORIGIN_APPROVED and new[1] != old[1]:
+                    verdict[h] = (old[0], new[1])
+                    if h in d_chain:
+                        chains[h] = list(d_chain[h])
+                    n_lab += 1
+                continue
+            check_note[h] = ('обход до конца: {} — {}'.format(
+                {ORIGIN_UNRESOLVED: 'не подтверждено',
+                 ORIGIN_APPROVED: 'согласованный носитель',
+                 ORIGIN_PRODUCT_SRC: 'исходные тексты изделия',
+                 ORIGIN_DOWNLOAD: 'загрузка'}.get(new[0], new[0]),
+                new[1]))
+            n_chk += 1
+        for h, lab in d_label.items():
+            old = verdict.get(h)
+            if old and old[0] == ORIGIN_APPROVED and lab != old[1]:
+                verdict[h] = (old[0], lab)
+                n_lab += 1
+        print(_ts() + "   Origin: обход до конца — добавлено подтверждений {}, "
+                      "уточнено оснований {}, расхождений для проверки {}".format(
+                          n_add, n_lab, n_chk))
 
     # --- Резерв: наследование происхождения от ближайшего пакета ------------
     #
@@ -4453,6 +4509,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 if ch:
                     e['origin_chain'] = ' <- '.join(ch[:6])
                 e_origin = origin
+            if h in check_note:
+                e['origin_check'] = check_note[h]
             out[e_origin].append(e)
 
     print(_ts() + "   Origin: product_src={}, approved_source={}, "
@@ -5006,6 +5064,15 @@ _ORIGIN_REPORT_STYLE = {
                   'удалось.\nФайлы сгруппированы по пакету, внутри которого '
                   'находятся.'),
         'detail_label': 'не подтверждено',
+        'split_detail': False,
+    },
+    'origin_check': {
+        'intro': ('Расхождения между прежним обратным обходом и обходом до '
+                  'конца.\nПрежний обход засчитал происхождение, а обход до '
+                  'конца его не подтвердил\n(или пришёл к другому источнику). '
+                  'Вердикт в отчётах origin_* оставлен прежним;\nэти файлы '
+                  'нужно проверить вручную.'),
+        'detail_label': 'расхождение',
         'split_detail': False,
     },
     'origin_product_src': {
@@ -5737,6 +5804,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         # ------------------------------------------------------------------
         p4_origin_product, p4_origin_approved = [], []
         p4_origin_download, p4_origin_unresolved = [], []
+        p4_origin_check = []
 
         _origin_input = []
         for _cat_name, _cat_list in (
@@ -5775,6 +5843,12 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                 linker_basenames=linker_basenames,
                 bin_hash_to_path=bin_hash_to_path)
         del _origin_input
+        # Расхождения прежнего обхода с обходом до конца (контроль): вердикт
+        # остался прежним, но проверка его не подтвердила.
+        p4_origin_check = [
+            _e for _lst in (p4_origin_product, p4_origin_approved,
+                            p4_origin_download, p4_origin_unresolved)
+            for _e in _lst if _e.get('origin_check')]
 
         del src_hashes
         gc.collect()
@@ -5787,6 +5861,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         p4_external_package_content = []
         p4_origin_product = p4_origin_approved = []
         p4_origin_download = p4_origin_unresolved = []
+        p4_origin_check = []
         pass4_ran = False
         del src_hashes
         gc.collect()
@@ -5893,6 +5968,17 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
            to_summary=True)
         ot("origin_unresolved",      "origin_unresolved",      p4_origin_unresolved,
            to_summary=True)
+        # Контроль: в отчёте основание — то, что нашёл обход до конца, а
+        # прежний вердикт и основание остаются в .json (origin, origin_detail).
+        _chk = []
+        for _e in p4_origin_check:
+            _c = dict(_e)
+            _c['origin_detail'] = '{} (прежний вердикт: {}, {})'.format(
+                _e.get('origin_check', ''), _e.get('origin', ''),
+                _e.get('origin_detail', ''))
+            _chk.append(_c)
+        if _chk:
+            ot("origin_check", "origin_check", _chk, to_summary=True)
 
         # external_package_content — специальный формат, отдельные функции записи.
         # В сводку не идёт: подтверждённое снимается, неподтверждённое придёт
@@ -6209,6 +6295,18 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "  происхождение подтверждено исходными текстами изделия или\n"
             "  согласованным носителем, в сводку не попадают: они перечислены\n"
             "  в try{N}/pass4/ и вопросов не вызывают."
+        ),
+        "origin_check": (
+            "bin/",
+            "Подтверждения, не прошедшие контрольную проверку",
+            "Файлы дистрибутива, происхождение которых прежний обратный обход\n"
+            "  засчитал, а обход до конца по хешу не подтвердил или пришёл к\n"
+            "  другому источнику. Вердикт оставлен прежним; файлы нужно\n"
+            "  проверить вручную. Обход до конца засчитывает опорой только\n"
+            "  файл, который на носителе лежит в архивах одного пакета, и не\n"
+            "  учитывает посторонние входы копирующих команд (cp, install, mv).\n"
+            "  Пустые и типовые файлы, встречающиеся во многих пакетах,\n"
+            "  опорой не считаются."
         ),
         "external_built": (
             "bin/",
