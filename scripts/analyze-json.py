@@ -3491,6 +3491,126 @@ def _trusted_container(trusted_path):
     return '/'.join(parts[start:-1]) if len(parts) > start + 1 else trusted_path
 
 
+import re as _re_pk
+import collections as _collections
+
+# Обход до конца (см. resolve_origins, блок ORIGIN_DEEP). Выключается
+# переменной окружения ORIGIN_DEEP=0 — тогда работает прежний обход с
+# остановкой на первом входе из носителя (для сравнения прогонов).
+_ORIGIN_DEEP = os.environ.get('ORIGIN_DEEP', '1') != '0'
+# Предохранитель: максимум узлов графа обхода до конца
+try:
+    _ORIGIN_DEEP_MAX_NODES = max(1000, int(os.environ.get(
+        'ORIGIN_DEEP_MAX_NODES', '500000')))
+except ValueError:
+    _ORIGIN_DEEP_MAX_NODES = 500000
+# Предохранитель: максимум узлов, просматриваемых при поиске опоры для
+# одной записи
+_ORIGIN_DEEP_BFS_MAX = 300000
+
+_PKG_ARCHIVE_RX = _re_pk.compile(
+    r'^(.+?)-(\d[^/]*?)\.(tar\.gz|tgz|tar\.xz|tar\.bz2|tar\.zst|tar|zip|whl|'
+    r'egg|gem|crate|nupkg|jar)$', _re_pk.I)
+
+
+def _pkg_norm(s):
+    return _re_pk.sub(r'[-_.]', '', (s or '').lower())
+
+
+def _pkg_ident(container):
+    """
+    Из контейнера-основания (путь архива на носителе) — (имя, версия)
+    пакета. Имя нормализовано: без регистра, '-', '_', '.'.
+
+      .../pypi-cache/scipy/scipy-0.18.1.tar.gz   -> ('scipy', '0.18.1')
+      .../pypi-cache/zope.interface/zope.interface-5.5.2.tar.gz
+                                                  -> ('zopeinterface', '5.5.2')
+    Если версию выделить нельзя — (имя без расширения, '').
+    """
+    base = (container or '').rsplit('/', 1)[-1]
+    m = _PKG_ARCHIVE_RX.match(base)
+    if m:
+        return _pkg_norm(m.group(1)), m.group(2)
+    low = base.lower()
+    for ext in _TRUSTED_ARCHIVE_EXTS:
+        if low.endswith(ext):
+            base = base[:-len(ext)]
+            break
+    return _pkg_norm(base), ''
+
+
+def _deb_ident(deb_name):
+    """
+    Имя и upstream-версия собираемого пакета по имени .deb:
+      python3-numpy_1.18.5-1_amd64.deb          -> ('numpy', '1.18.5')
+      python3-gdal-dbgsym_2.1.2+dfsg-5_amd64.deb -> ('gdal', '2.1.2')
+      libapache2-mod-wsgi-py3_4.9.4-1_amd64.deb -> ('apache2modwsgi', '4.9.4')
+      redis-tools_3.2.6-1_amd64.deb             -> ('redis', '3.2.6')
+    Для прочих имён — None.
+    """
+    m = _re_pk.match(r'(.+?)(?:-dbgsym)?_(?:\d+:)?([^_-]+?)(?:\+[^_-]*)?'
+                 r'(?:-[^_]*)?_[^_]+\.(?:deb|udeb)$', deb_name or '')
+    if not m:
+        return None
+    name = _re_pk.sub(r'^(python3?-|lib)', '', m.group(1))
+    name = _re_pk.sub(r'(-py3|-server|-tools|-common|-dev)$', '', name)
+    return _pkg_norm(name), m.group(2)
+
+
+def _pkg_match(want_name, have_name):
+    """Совпадение имени пакета с именем архива (с учётом префиксов вида
+    mod-wsgi / apache2-mod-wsgi)."""
+    if not want_name or not have_name:
+        return False
+    if want_name == have_name:
+        return True
+    return ((len(have_name) > 3 and have_name in want_name) or
+            (len(want_name) > 3 and want_name in have_name))
+
+
+def _collect_trusted_containers(trusted, hashes, per_hash_max=200):
+    """
+    Для заданных хешей собирает ВСЕ их вхождения на согласованных
+    носителях: hash -> set((label, kind, container)).
+
+    Индекс носителя (TrustedIndex) хранит только ПЕРВОЕ вхождение хеша.
+    Для файла, который не менялся между версиями пакета или лежит во многих
+    пакетах, первое вхождение — случайный архив. Поэтому для хешей, которые
+    реально встретились в обходе (их тысячи, а не миллионы), носитель
+    дочитывается ещё раз и собираются все архивы.
+
+    Если файлы носителя недоступны (тесты, нестандартный индекс) — берётся
+    то единственное вхождение, что есть в индексе.
+    """
+    out = {}
+    hashes = set(hashes)
+    if not hashes:
+        return out
+    for label in list(getattr(trusted, 'labels', None) or []):
+        for kind in ('src', 'bin'):
+            jpath = os.path.join(RESULTS_DIR, label, 'sources',
+                                 '{}_{}.json'.format(label, kind))
+            if not os.path.exists(jpath):
+                continue
+            try:
+                for h, p in _stream_signatures(jpath):
+                    if h in hashes:
+                        s = out.setdefault(h, set())
+                        if len(s) < per_hash_max:
+                            s.add((label, kind, _trusted_container(p)))
+            except OSError as exc:
+                print(_ts() + "   [{}] ошибка чтения {}.json: {}".format(
+                    label, kind, exc))
+    for h in hashes:
+        if h not in out:
+            try:
+                label, kind, container = trusted[h]
+                out[h] = {(label, kind, container)}
+            except (KeyError, TypeError, ValueError):
+                pass
+    return out
+
+
 _CONTAINER_PKG_EXTS = ('.deb', '.rpm', '.whl', '.egg', '.jar', '.apk',
                        '.nupkg', '.crate', '.gem')
 
@@ -3714,6 +3834,283 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
 
             frontier = next_frontier
         return frontier
+
+    # --- Обход до конца (ORIGIN_DEEP) ---------------------------------------
+    #
+    # Зачем. Прежний обход останавливался на ПЕРВОМ входе, хеш которого есть
+    # на носителе, и основанием писал ПЕРВОЕ вхождение этого хеша в индексе.
+    # Проверено на RTPG.34379-01 полным обходом по хешу:
+    #   - все 512 подтверждённых записей действительно доходят до файла,
+    #     который лежит только в тарболе своего пакета нужной версии;
+    #   - но у 119 из них основанием стоял чужой архив (cffi, setuptools,
+    #     tensorflow, numpy-1.15.4 вместо 1.18.5): первым попадался
+    #     мусорный вход cp (3000 унаследованных входов, среди них
+    #     cffi/__init__.py), вездесущий файл (not-zip-safe — 1839 вхождений
+    #     на носителе, debian/compat — 19) или файл, не менявшийся между
+    #     версиями.
+    # Значит, первый попавшийся вход из носителя — плохая опора: он может
+    # быть случайным, и тогда подтверждение ложное, просто на RTPG у каждой
+    # такой записи нашёлся ещё и настоящий путь.
+    #
+    # Что делаем:
+    #   1. Строим граф "файл <- входы его производителей" ДО КОНЦА: носитель
+    #      и src.json ветку не обрывают.
+    #   2. Копирование (cp, install, mv) содержимое не меняет, поэтому
+    #      настоящий вход копии — файл с тем же хешем, то есть тот же узел.
+    #      Прочие входы копирующей команды опорой не считаются: на RTPG это
+    #      были входы, унаследованные от окружения процесса.
+    #   3. Опора — СПЕЦИФИЧНЫЙ файл: на носителе он лежит в архивах ОДНОГО
+    #      пакета (в любых его версиях). Файл, лежащий в архивах разных
+    #      пакетов (пустой, not-zip-safe, типовой LICENSE), ничего не
+    #      доказывает и опорой не считается.
+    #   4. Если запись лежит в пакете (.deb), ищется опора именно этого
+    #      пакета по всему графу; иначе — ближайшая, а при нескольких
+    #      пакетах на одном расстоянии — пакет с большим числом файлов.
+    #   5. Основание — архив выбранного пакета; версия берётся по версии
+    #      пакета-контейнера, если она есть среди архивов.
+    if _ORIGIN_DEEP:
+        d_roots = [h for h in by_hash if h and h not in verdict]
+        print(_ts() + "   Origin: обход до конца — записей без вердикта "
+                      "{}".format(len(d_roots)))
+
+        g_edges = {}   # узел -> кортеж входов
+        g_step  = {}   # узел -> подпись шага
+        g_dl    = {}   # узел -> подробность загрузки
+        g_dead  = {}   # узел -> почему у него нет входов
+        g_seen  = set(d_roots)
+        g_front = set(d_roots)
+        g_trunc = False
+        rnd = 0
+        while g_front and rnd < max_rounds:
+            rnd += 1
+            print(_ts() + "   Origin: раунд {}, во фронтире {} хешей, "
+                          "узлов графа {}".format(rnd, len(g_front),
+                                                  len(g_seen)))
+            producers = collect_producers(
+                buildography_files, g_front,
+                compiler_basenames, linker_basenames)
+            nxt = set()
+            for h in g_front:
+                plist = producers.get(h)
+                if not plist:
+                    g_dead[h] = 'производящая команда в трассе не найдена'
+                    continue
+                main = _pick_main_producer(plist, h_to_path.get(h, ''))
+                g_step[h] = '{}({})'.format(main['operation'],
+                                            main['detail'] or '?')
+                dl = next((pr for pr in plist
+                           if pr['operation'] == _OP_DOWNLOADED), None)
+                if dl is not None:
+                    g_dl[h] = dl['detail'] or 'сетевая загрузка'
+                    continue
+                kids = {}
+                for pr in plist:
+                    if pr['operation'] == _OP_COPIED:
+                        continue
+                    for dp, dh in _deps_of(pr):
+                        if dh and dh != h and dh not in kids:
+                            kids[dh] = dp
+                if not kids:
+                    if main['operation'] in DERIVING_OPERATIONS:
+                        g_dead[h] = ('операция {} только переносит '
+                                     'содержимое, но её вход в трассе '
+                                     'отсутствует'.format(main['operation']))
+                    else:
+                        g_dead[h] = ('у производящей команды ({}) нет '
+                                     'неотфильтрованных входов'.format(
+                                         main['operation']))
+                    continue
+                g_edges[h] = tuple(kids)
+                for dh, dp in kids.items():
+                    h_to_path.setdefault(dh, dp)
+                    if dh in g_seen:
+                        continue
+                    if len(g_seen) >= _ORIGIN_DEEP_MAX_NODES:
+                        g_trunc = True
+                        continue
+                    g_seen.add(dh)
+                    nxt.add(dh)
+            g_front = nxt
+        g_limited = bool(g_front) or g_trunc
+        print(_ts() + "   Origin: граф построен — раундов {}, узлов {}{}".format(
+            rnd, len(g_seen),
+            ' (ОСТАНОВЛЕН ПРЕДОХРАНИТЕЛЕМ)' if g_limited else ''))
+
+        # Все вхождения на носителе для встреченных файлов, а также для
+        # файлов, подтверждённых напрямую в раунде 0 (им тоже нужна верная
+        # подпись основания).
+        t_need = {x for x in g_seen if x in trusted}
+        t_need |= {h for h, (o, _d) in verdict.items()
+                   if o == ORIGIN_APPROVED}
+        conts = _collect_trusted_containers(trusted, t_need)
+        print(_ts() + "   Origin: файлов носителя в графе {}, вхождений "
+                      "собрано для {}".format(len(t_need), len(conts)))
+
+        pkgs_of = {}   # hash -> {имя пакета: [(label, kind, container, ver)]}
+        for x, cs in conts.items():
+            d = {}
+            for (label, kind, container) in cs:
+                n, v = _pkg_ident(container)
+                d.setdefault(n, []).append((label, kind, container, v))
+            pkgs_of[x] = d
+
+        def _specific(x):
+            d = pkgs_of.get(x)
+            return bool(d) and len(d) == 1
+
+        def _root_want(h):
+            """(имя, версия) пакета-контейнера записи, если он известен."""
+            for e in by_hash.get(h, ()):
+                name = e.get('origin_container')
+                if not name and bin_hash_to_path:
+                    for ph in (e.get('parents') or []):
+                        cp = bin_hash_to_path.get(ph, '')
+                        if cp.lower().endswith(_CONTAINER_PKG_EXTS):
+                            name = cp.rsplit('/', 1)[-1]
+                            break
+                got = _deb_ident(name) if name else None
+                if got:
+                    return got
+            return None
+
+        def _pick_container(x, pname, want_ver):
+            items = pkgs_of[x][pname]
+            if want_ver:
+                for it in items:
+                    if it[3] == want_ver:
+                        return it, 0
+            vers = sorted({it[3] for it in items})
+            it = sorted(items, key=lambda t: (t[3], t[2]))[-1] \
+                if len(vers) > 1 else items[0]
+            return it, len(vers) - 1
+
+        stats = _collections.Counter()
+
+        def _relabel_approved(h, x, want):
+            """Подпись основания для подтверждения файлом x носителя."""
+            d = pkgs_of.get(x)
+            if not d:
+                label, kind, container = trusted[x]
+                return '{}/{}: {}'.format(label, kind, container)
+            pname = None
+            if want:
+                pname = next((n for n in d if _pkg_match(want[0], n)), None)
+            if pname is None:
+                pname = sorted(d, key=lambda n: (-len(d[n]), n))[0]
+            it, more = _pick_container(x, pname,
+                                       want[1] if want else '')
+            detail = '{}/{}: {}'.format(it[0], it[1], it[2])
+            if more:
+                detail += ' (файл есть и ещё в {} верси{} пакета)'.format(
+                    more, 'и' if more == 1 else 'ях')
+            return detail
+
+        # Подпись основания у подтверждённых напрямую (раунд 0): вердикт
+        # не меняется, меняется только выбор архива.
+        for h, (o, _d) in list(verdict.items()):
+            if o == ORIGIN_APPROVED and h in pkgs_of:
+                verdict[h] = (o, _relabel_approved(h, h, _root_want(h)))
+
+        for r in d_roots:
+            want = _root_want(r)
+            if r in g_dl:
+                _set(r, ORIGIN_DOWNLOAD, g_dl[r])
+                stats['загрузка'] += 1
+                continue
+            prev = {r: None}
+            layer = [r]
+            first = None      # [(узел, вид, пакет)] ближайшего слоя опор
+            own = None
+            saw_typical = False
+            visited = 1
+            while layer and visited < _ORIGIN_DEEP_BFS_MAX:
+                terms = []
+                for x in layer:
+                    if x == r:
+                        continue
+                    if x in g_dl:
+                        terms.append((x, 'dl', None))
+                        continue
+                    in_t = x in trusted
+                    if in_t and _specific(x):
+                        pname = next(iter(pkgs_of[x]))
+                        terms.append((x, 'tr', pname))
+                        if want and own is None and _pkg_match(want[0], pname):
+                            own = x
+                    elif x in src_hashes and not in_t:
+                        terms.append((x, 'src', None))
+                    elif x in src_hashes or in_t:
+                        saw_typical = True
+                if terms and first is None:
+                    first = terms
+                if own is not None or (first is not None and not want):
+                    break
+                nxt = []
+                for x in layer:
+                    for c in g_edges.get(x, ()):
+                        if c not in prev:
+                            prev[c] = x
+                            nxt.append(c)
+                visited += len(nxt)
+                layer = nxt
+
+            pick = None
+            if own is not None:
+                pick = (own, 'tr', next(iter(pkgs_of[own])))
+                stats['свой пакет'] += 1
+            elif first:
+                src_t = [t for t in first if t[1] == 'src']
+                tr_t  = [t for t in first if t[1] == 'tr']
+                if src_t:
+                    pick = src_t[0]
+                    stats['src изделия'] += 1
+                elif tr_t:
+                    votes = _collections.Counter(t[2] for t in tr_t)
+                    best = sorted(votes, key=lambda n: (-votes[n], n))[0]
+                    pick = next(t for t in tr_t if t[2] == best)
+                    stats['носитель (ближайший пакет)'] += 1
+                else:
+                    pick = first[0]
+                    stats['загрузка'] += 1
+
+            if pick is None:
+                if saw_typical:
+                    why = ('достижимы только типовые файлы, встречающиеся '
+                           'на носителе в разных пакетах')
+                    stats['только типовые'] += 1
+                elif r in g_dead:
+                    why = g_dead[r]
+                    stats['нет опоры'] += 1
+                elif g_limited:
+                    why = ('обход остановлен предохранителем (граф больше '
+                           '{} узлов или {} раундов)'.format(
+                               _ORIGIN_DEEP_MAX_NODES, max_rounds))
+                    stats['нет опоры'] += 1
+                else:
+                    why = ('цепочка прослежена до конца, '
+                           'опознанный источник не найден')
+                    stats['нет опоры'] += 1
+                _set(r, ORIGIN_UNRESOLVED, why)
+                continue
+
+            x, kind_, _pn = pick
+            if kind_ == 'tr':
+                _set(r, ORIGIN_APPROVED, _relabel_approved(r, x, want))
+            elif kind_ == 'src':
+                _set(r, ORIGIN_PRODUCT_SRC,
+                     'вход команды есть в src.json: {}'.format(
+                         h_to_path.get(x, '')[:120]))
+            else:
+                _set(r, ORIGIN_DOWNLOAD, g_dl[x])
+            path = []
+            y = prev[x]
+            while y is not None:
+                path.append(y)
+                y = prev[y]
+            path.reverse()
+            chains[r] = [g_step[y] for y in path if y in g_step]
+        print(_ts() + "   Origin: обход до конца — " + ', '.join(
+            '{} {}'.format(k, v) for k, v in stats.most_common()))
 
     # dependents[x] — множество исходных хешей, судьба которых зависит от x
     dependents = {}
@@ -3988,6 +4385,11 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     inherited[id(e)] = (ORIGIN_DOWNLOAD, detail, cname)
                     continue
                 for pr in plist:
+                    # Копия: настоящий вход — файл с тем же хешем, то есть
+                    # сам контейнер; прочие входы копирующей команды —
+                    # унаследованный мусор (см. обход до конца).
+                    if pr['operation'] == _OP_COPIED:
+                        continue
                     hit = None
                     for dp, dh in (pr['deps'] or []):
                         if dh in trusted:
