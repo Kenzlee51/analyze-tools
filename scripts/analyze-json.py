@@ -3722,17 +3722,37 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     #   2. Только как РЕЗЕРВ, после обхода. Своя цепочка файла всегда
     #      главнее унаследованной.
     inherited = {}   # id(entry) -> (origin, detail, container_name)
+
+    # Ближайший пакет-контейнер проставляем ВСЕМ записям, независимо от
+    # вердикта. Он нужен для двух разных задач:
+    #   - резерв ниже использует его, чтобы унаследовать происхождение;
+    #   - отчёт группирует по нему строки (write_origin_txt).
+    # Группировка нужна и там, где наследование не сработало: на RTPG.34379
+    # все 292 неподтверждённых файла лежат внутри 14 пакетов, и без
+    # группировки отчёт повторяет 52 символа общего префикса и три
+    # одинаковые колонки 292 раза.
+    def _nearest_pkg(e):
+        for ph in (e.get('parents') or []):
+            cpath = (bin_hash_to_path or {}).get(ph, '')
+            if cpath.lower().endswith(_CONTAINER_PKG_EXTS):
+                return ph, cpath.rsplit('/', 1)[-1]
+        return None
+
+    if bin_hash_to_path:
+        for e in entries:
+            got = _nearest_pkg(e)
+            if got:
+                e['origin_container'] = got[1]
+
     if bin_hash_to_path:
         need = [e for e in entries
                 if verdict.get((e.get('hash') or '').strip(),
                                (ORIGIN_UNRESOLVED, ''))[0] == ORIGIN_UNRESOLVED]
         cand = {}    # entry -> (container_hash, container_name)
         for e in need:
-            for ph in (e.get('parents') or []):
-                cpath = bin_hash_to_path.get(ph, '')
-                if cpath.lower().endswith(_CONTAINER_PKG_EXTS):
-                    cand[id(e)] = (ph, cpath.rsplit('/', 1)[-1])
-                    break
+            got = _nearest_pkg(e)
+            if got:
+                cand[id(e)] = got
         if cand:
             cont_hashes = {ch for ch, _ in cand.values()}
             print(_ts() + "   Origin: резерв по контейнеру — записей {}, "
@@ -3833,6 +3853,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 # отчёта, а в строке он только съедал ширину.
                 e['origin_detail']    = e_detail
                 e['origin_container'] = cname
+                # Признак именно НАСЛЕДОВАНИЯ — этот флаг, а не наличие
+                # origin_container: контейнер теперь проставлен всем.
                 e['origin_inherited'] = True
                 steps = list(ch or [])
                 steps.append('contained in {}'.format(cname))
@@ -4369,6 +4391,54 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
 
 
 
+# Как оформляется шапка отчёта origin_* и заголовок группы. Третья строка
+# блока — это origin_detail, и смысл у неё в каждом отчёте свой: у загрузки
+# это адрес источника, у неподтверждённых — причина. Поэтому метка берётся
+# отсюда, а не придумывается на месте.
+#
+# Внутренние термины (pass4_category, operation) в блок НЕ выносятся. Проверено
+# на RTPG.34379: строка "compiled_from_src / extracted" для содержимого
+# распакованного пакета читается как "файл появился в ходе сборки", что
+# неверно — в дистрибутиве он лежит внутри пакета, а распаковка была на
+# сборочной машине и объясняет лишь то, откуда трассе известен его хеш.
+# Оба поля остаются в .json.
+_ORIGIN_REPORT_STYLE = {
+    'origin_download': {
+        'intro': ('В состав дистрибутива {v} {n} {adj} {pkg}, {got} из\n'
+                  'источника вне комплекта поставки. Ниже перечислены '
+                  'обнаруженные в них\nфайлы ELF/PE, сгруппированные по '
+                  'пакету.\nУстранять или пояснять нужно пакет целиком, а не '
+                  'отдельные файлы.'),
+        'detail_label': 'получен',
+        'split_detail': True,      # "apt download: /path" -> две строки
+        'where_label':  'источник',
+    },
+    'origin_unresolved': {
+        'intro': ('Происхождение этих файлов дистрибутива подтвердить не '
+                  'удалось.\nФайлы сгруппированы по пакету, внутри которого '
+                  'находятся.'),
+        'detail_label': 'не подтверждено',
+        'split_detail': False,
+    },
+    'origin_product_src': {
+        'intro': ('Происхождение подтверждено исходными текстами изделия.\n'
+                  'Замечаний нет, отчёт справочный.'),
+        'detail_label': 'основание',
+        'split_detail': False,
+    },
+    'origin_approved_source': {
+        'intro': ('Происхождение подтверждено согласованным носителем.\n'
+                  'Замечаний нет, отчёт справочный.'),
+        'detail_label': 'носитель',
+        'split_detail': True,
+        'where_label':  'путь',
+    },
+}
+_ORIGIN_STYLE_DEFAULT = {
+    'intro': '', 'detail_label': 'основание', 'split_detail': False,
+}
+
+
 def _plural_ru(n, one, few, many):
     """
     Склонение существительного при числе: 1 пакет, 2 пакета, 5 пакетов.
@@ -4470,6 +4540,7 @@ def write_origin_txt(output_path, category_label, entries):
             len(rows), uniq_hashes,
             ", пакетов: {}".format(len(grouped)) if grouped else ""))
 
+        style = _ORIGIN_REPORT_STYLE.get(category_label, _ORIGIN_STYLE_DEFAULT)
         prefix = ''
         if order:
             # Префикс считаем по части пути ДО имени пакета
@@ -4484,16 +4555,15 @@ def write_origin_txt(output_path, category_label, entries):
 
             f.write("#\n")
             _n = len(grouped)
-            f.write("# В состав дистрибутива {} {} {} {}, полученных из\n".format(
-                _plural_ru(_n, 'входит', 'входят', 'входят'),
-                _n,
-                _plural_ru(_n, 'сторонний', 'сторонних', 'сторонних'),
-                _plural_ru(_n, 'пакет', 'пакета', 'пакетов')))
-            f.write("# источника вне комплекта поставки. Ниже перечислены "
-                    "обнаруженные в них\n")
-            f.write("# файлы ELF/PE, сгруппированные по пакету.\n")
-            f.write("# Устранять или пояснять нужно пакет целиком, а не "
-                    "отдельные файлы.\n")
+            _intro = (style.get('intro') or '').format(
+                n=_n,
+                v=_plural_ru(_n,   'входит',     'входят',    'входят'),
+                adj=_plural_ru(_n, 'сторонний',  'сторонних', 'сторонних'),
+                pkg=_plural_ru(_n, 'пакет',      'пакета',    'пакетов'),
+                got=_plural_ru(_n, 'полученный', 'полученных', 'полученных'))
+            for _line in _intro.split('\n'):
+                if _line:
+                    f.write("# {}\n".format(_line))
             if prefix:
                 f.write("#\n")
                 f.write("# Все пути ниже — относительно\n")
@@ -4502,19 +4572,42 @@ def write_origin_txt(output_path, category_label, entries):
             f.write("# Формат строки данных: <TAB>путь-внутри-пакета"
                     "<TAB>хеш\n")
 
+            W = 22   # ширина метки, одинаковая во всех отчётах
             for cname, g in order:
                 n_files = len({x['hash'] for x in g['rows']})
                 f.write("\n")
                 f.write("=" * 74 + "\n")
                 f.write("ПАКЕТ: {}\n".format(cname))
-                f.write("  файлов в дистрибутиве : {}\n".format(n_files))
+                f.write("  {} : {}\n".format('файлов'.ljust(W), n_files))
                 d = g['detail']
-                if ': ' in d:
+                if d and style.get('split_detail') and ': ' in d:
                     how, where = d.split(': ', 1)
-                    f.write("  получен               : {}\n".format(how))
-                    f.write("  источник              : {}\n".format(where))
+                    f.write("  {} : {}\n".format(
+                        style['detail_label'].ljust(W), how))
+                    f.write("  {} : {}\n".format(
+                        style.get('where_label', 'путь').ljust(W), where))
                 elif d:
-                    f.write("  основание             : {}\n".format(d))
+                    # Длинное основание переносим с отступом под значение,
+                    # иначе строка уходит за 100 символов.
+                    label = style['detail_label'].ljust(W)
+                    words = d.split()
+                    chunks = []
+                    line = ''
+                    for w in words:
+                        if line and len(line) + 1 + len(w) > 48:
+                            chunks.append(line)
+                            line = w
+                        else:
+                            line = (line + ' ' + w) if line else w
+                    if line:
+                        chunks.append(line)
+                    for i, chunk in enumerate(chunks):
+                        if i == 0:
+                            f.write("  {} : {}\n".format(label, chunk))
+                        else:
+                            # продолжение — без повторного двоеточия,
+                            # иначе читается как ещё одно поле
+                            f.write("  {}   {}\n".format(' ' * W, chunk))
                 f.write("-" * 74 + "\n")
                 for r in g['rows']:
                     rel = r['path']
