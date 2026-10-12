@@ -3196,6 +3196,9 @@ _ORIGIN_MAX_FRONTIER = 20000
 # (см. collect_producers). Восьми хватает с большим запасом: на NPUR.34018-01
 # максимум было четыре.
 _ORIGIN_MAX_PRODUCERS = 8
+# Сколько раз досмотр по общему графу может дочитать неразобранные узлы
+# (см. resolve_origins). Каждый раз — отдельный короткий обход трассы.
+_ORIGIN_JOIN_PASSES = 3
 # Предел числа раундов обратного обхода.
 #
 # Это ПРЕДОХРАНИТЕЛЬ, а не план: цикл останавливается сам, как только фронтир
@@ -3553,120 +3556,176 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                  '{}/{}: {}'.format(label, kind, container))
 
     # --- Раунды 1..N: обратный обход ---------------------------------------
+    #
+    # Помимо вердиктов записей обход ведёт сведения на уровне УЗЛОВ (хешей),
+    # которые нужны досмотру после обхода (см. ниже):
+    #   node_state[x] — чем закончился разбор узла: term / expanded / dead /
+    #                   noprod / skipped
+    #   node_term[x]  — (origin, detail), если у узла найдена опора
+    #   node_step[x]  — подпись шага цепочки для узла
+    #   children[x]   — ВСЕ входы узла, включая уже посещённые
+    # На вердикты записей эти сведения в основном обходе не влияют.
+    node_state = {}
+    node_term  = {}
+    node_step  = {}
+    children   = {}
+
+    for h, (o, d) in verdict.items():
+        if o != ORIGIN_UNRESOLVED:
+            node_term[h] = (o, d)
+            node_state[h] = 'term'
+
+    def _walk(frontier, dependents, seen, vd, chains_out, max_rnd, tag=''):
+        """
+        Обратный обход. vd — словарь вердиктов КОРНЕЙ этого обхода
+        (hash -> (origin, detail)), chains_out — их цепочки.
+        Возвращает фронтир на момент остановки (пустой — кандидаты кончились).
+        """
+        rnd = 0
+        while frontier and rnd < max_rnd:
+            rnd += 1
+            print(_ts() + "   Origin:{} раунд {}, во фронтире {} хешей".format(
+                tag, rnd, len(frontier)))
+            producers = collect_producers(
+                buildography_files, frontier,
+                compiler_basenames, linker_basenames)
+            print(_ts() + "   Origin:{} раунд {}, найдено производителей {}".format(
+                tag, rnd, len(producers)))
+
+            next_frontier = set()
+            for h in frontier:
+                roots = dependents.get(h, set())
+                unresolved_roots = [r for r in roots if r not in vd]
+                if not unresolved_roots:
+                    # Узел не разобран: все его корни уже решены другим путём.
+                    # Досмотр может вернуться к нему, если узел окажется на
+                    # пути у другой записи.
+                    node_state.setdefault(h, 'skipped')
+                    continue
+
+                plist = producers.get(h)
+                if not plist:
+                    node_state[h] = 'noprod'
+                    for r in unresolved_roots:
+                        if r == h:
+                            vd[r] = (ORIGIN_UNRESOLVED,
+                                     'производящая команда в трассе не найдена')
+                    continue
+
+                # Шаг цепочки подписываем главным производителем — тем, чьё имя
+                # выходного файла совпадает с искомым. Иначе в цепочке появится
+                # чужая команда, попавшая сюда по ошибочной привязке хеша.
+                main = _pick_main_producer(plist, h_to_path.get(h, ''))
+                step = '{}({})'.format(main['operation'], main['detail'] or '?')
+                node_step[h] = step
+                for r in unresolved_roots:
+                    chains_out.setdefault(r, []).append(step)
+
+                # Загрузка — терминал сама по себе. Достаточно, чтобы ЛЮБОЙ из
+                # производителей оказался загрузкой.
+                dl = next((pr for pr in plist
+                           if pr['operation'] == _OP_DOWNLOADED), None)
+                if dl is not None:
+                    t = (ORIGIN_DOWNLOAD, dl['detail'] or 'сетевая загрузка')
+                    node_term[h] = t
+                    node_state[h] = 'term'
+                    for r in unresolved_roots:
+                        vd[r] = t
+                    continue
+
+                # Ищем терминал среди входов ВСЕХ производителей: сначала
+                # согласованный носитель, затем исходные тексты изделия.
+                hit_trusted = None
+                hit_src     = None
+                for pr in plist:
+                    for dp, dh in _deps_of(pr):
+                        if dh in trusted:
+                            hit_trusted = (dp, dh)
+                            break
+                    if hit_trusted is not None:
+                        break
+                if hit_trusted is None:
+                    for pr in plist:
+                        for dp, dh in _deps_of(pr):
+                            if dh in src_hashes:
+                                hit_src = (dp, dh)
+                                break
+                        if hit_src is not None:
+                            break
+
+                if hit_trusted is not None:
+                    label, kind, container = trusted[hit_trusted[1]]
+                    t = (ORIGIN_APPROVED,
+                         '{}/{}: {}'.format(label, kind, container))
+                    node_term[h] = t
+                    node_state[h] = 'term'
+                    for r in unresolved_roots:
+                        vd[r] = t
+                    continue
+                if hit_src is not None:
+                    t = (ORIGIN_PRODUCT_SRC,
+                         'вход команды есть в src.json: {}'.format(
+                             hit_src[0][:120]))
+                    node_term[h] = t
+                    node_state[h] = 'term'
+                    for r in unresolved_roots:
+                        vd[r] = t
+                    continue
+
+                # Ни у одного производителя нет неотфильтрованных входов —
+                # идти дальше некуда. Формулировка различается по тому, создаёт
+                # операция содержимое или только переносит его: во втором случае
+                # отсутствие входа это пробел трассы, в первом может быть нормой.
+                all_deps = [d for pr in plist for d in _deps_of(pr)]
+                if not all_deps:
+                    node_state[h] = 'dead'
+                    if main['operation'] in DERIVING_OPERATIONS:
+                        why = ('операция {} только переносит содержимое, но её '
+                               'вход в трассе отсутствует'.format(main['operation']))
+                    else:
+                        why = ('у производящей команды ({}) нет неотфильтрованных '
+                               'входов'.format(main['operation']))
+                    for r in unresolved_roots:
+                        vd[r] = (ORIGIN_UNRESOLVED, why)
+                    continue
+
+                # Связи узла запоминаются ПОЛНОСТЬЮ, включая уже посещённые
+                # входы: именно их терял обход ниже (см. досмотр).
+                node_state[h] = 'expanded'
+                kids = []
+                for dp, dh in all_deps:
+                    if dh != h:
+                        kids.append(dh)
+                        h_to_path.setdefault(dh, dp)
+                children[h] = tuple(set(kids))
+
+                # Терминал не найден — продолжаем обход назад по входам всех
+                # производителей.
+                if len(next_frontier) < _ORIGIN_MAX_FRONTIER:
+                    for dp, dh in all_deps:
+                        if dh in seen:
+                            continue
+                        next_frontier.add(dh)
+                        seen.add(dh)
+                        h_to_path.setdefault(dh, dp)
+                        dependents.setdefault(dh, set()).update(unresolved_roots)
+                        if len(next_frontier) >= _ORIGIN_MAX_FRONTIER:
+                            break
+
+            frontier = next_frontier
+        return frontier
+
     # dependents[x] — множество исходных хешей, судьба которых зависит от x
     dependents = {}
     frontier = set(h for h in by_hash if h not in verdict)
     for h in frontier:
         dependents[h] = {h}
     seen = set(frontier)
-
-    rnd = 0
-    while frontier and rnd < max_rounds:
-        rnd += 1
-        print(_ts() + "   Origin: раунд {}, во фронтире {} хешей".format(
-            rnd, len(frontier)))
-        producers = collect_producers(
-            buildography_files, frontier,
-            compiler_basenames, linker_basenames)
-        print(_ts() + "   Origin: раунд {}, найдено производителей {}".format(
-            rnd, len(producers)))
-
-        next_frontier = set()
-        for h in frontier:
-            roots = dependents.get(h, set())
-            unresolved_roots = [r for r in roots if r not in verdict]
-            if not unresolved_roots:
-                continue
-
-            plist = producers.get(h)
-            if not plist:
-                for r in unresolved_roots:
-                    if r == h:
-                        _set(r, ORIGIN_UNRESOLVED,
-                             'производящая команда в трассе не найдена')
-                continue
-
-            # Шаг цепочки подписываем главным производителем — тем, чьё имя
-            # выходного файла совпадает с искомым. Иначе в цепочке появится
-            # чужая команда, попавшая сюда по ошибочной привязке хеша.
-            main = _pick_main_producer(plist, h_to_path.get(h, ''))
-            step = '{}({})'.format(main['operation'], main['detail'] or '?')
-            for r in unresolved_roots:
-                chains.setdefault(r, []).append(step)
-
-            # Загрузка — терминал сама по себе. Достаточно, чтобы ЛЮБОЙ из
-            # производителей оказался загрузкой.
-            dl = next((pr for pr in plist
-                       if pr['operation'] == _OP_DOWNLOADED), None)
-            if dl is not None:
-                for r in unresolved_roots:
-                    _set(r, ORIGIN_DOWNLOAD,
-                         dl['detail'] or 'сетевая загрузка')
-                continue
-
-            # Ищем терминал среди входов ВСЕХ производителей: сначала
-            # согласованный носитель, затем исходные тексты изделия.
-            hit_trusted = None
-            hit_src     = None
-            for pr in plist:
-                for dp, dh in _deps_of(pr):
-                    if dh in trusted:
-                        hit_trusted = (dp, dh)
-                        break
-                if hit_trusted is not None:
-                    break
-            if hit_trusted is None:
-                for pr in plist:
-                    for dp, dh in _deps_of(pr):
-                        if dh in src_hashes:
-                            hit_src = (dp, dh)
-                            break
-                    if hit_src is not None:
-                        break
-
-            if hit_trusted is not None:
-                label, kind, container = trusted[hit_trusted[1]]
-                detail = '{}/{}: {}'.format(label, kind, container)
-                for r in unresolved_roots:
-                    _set(r, ORIGIN_APPROVED, detail)
-                continue
-            if hit_src is not None:
-                for r in unresolved_roots:
-                    _set(r, ORIGIN_PRODUCT_SRC,
-                         'вход команды есть в src.json: {}'.format(
-                             hit_src[0][:120]))
-                continue
-
-            # Ни у одного производителя нет неотфильтрованных входов —
-            # идти дальше некуда. Формулировка различается по тому, создаёт
-            # операция содержимое или только переносит его: во втором случае
-            # отсутствие входа это пробел трассы, в первом может быть нормой.
-            all_deps = [d for pr in plist for d in _deps_of(pr)]
-            if not all_deps:
-                if main['operation'] in DERIVING_OPERATIONS:
-                    why = ('операция {} только переносит содержимое, но её '
-                           'вход в трассе отсутствует'.format(main['operation']))
-                else:
-                    why = ('у производящей команды ({}) нет неотфильтрованных '
-                           'входов'.format(main['operation']))
-                for r in unresolved_roots:
-                    _set(r, ORIGIN_UNRESOLVED, why)
-                continue
-
-            # Терминал не найден — продолжаем обход назад по входам всех
-            # производителей.
-            if len(next_frontier) < _ORIGIN_MAX_FRONTIER:
-                for dp, dh in all_deps:
-                    if dh in seen:
-                        continue
-                    next_frontier.add(dh)
-                    seen.add(dh)
-                    h_to_path.setdefault(dh, dp)
-                    dependents.setdefault(dh, set()).update(unresolved_roots)
-                    if len(next_frontier) >= _ORIGIN_MAX_FRONTIER:
-                        break
-
-        frontier = next_frontier
+    walk_vd = {}
+    frontier = _walk(frontier, dependents, seen, walk_vd, chains, max_rounds)
+    for h, v in walk_vd.items():
+        if h not in verdict:
+            _set(h, v[0], v[1])
 
     # Всё, что осталось без вердикта после последнего раунда.
     #
@@ -3690,6 +3749,133 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     if n_rest:
         print(_ts() + "   Origin: без вердикта после обхода: {} ({})".format(
             n_rest, 'лимит раундов' if frontier else 'кандидаты исчерпаны'))
+
+    # --- Досмотр по общему графу --------------------------------------------
+    #
+    # Зачем. Обход выше ведёт ОДНО множество seen на все записи сразу. Когда
+    # две записи доходят до общего промежуточного входа, вход достаётся
+    # первой; вторая видит "уже посещено", пропускает его, и связь
+    # "запись зависит от этого входа" не записывается. Если другого пути у
+    # второй записи нет, она уходит в unresolved с причиной "цепочка
+    # прослежена до конца" — что неправда.
+    #
+    # Измерено на RTPG.34379-01. Пакеты Python там собираются одной командой
+    # setup.py install на пакет, и все его файлы (.py и .so) делят её входы:
+    #   файл cresultproxy.so в одиночку       -> СВВП, 4 раунда
+    #   290 unresolved отдельным прогоном     -> СВВП 244, unresolved 46
+    #   те же 290 в полном прогоне            -> СВВП 0,   unresolved 290
+    # То есть одни и те же записи подтверждались, пока их мало, и все
+    # терялись среди тысяч соседей.
+    #
+    # Что делаем. Основной обход не трогаем: всё, что он решил, остаётся
+    # как есть. Для записей БЕЗ подтверждённого вердикта ищем в ширину по
+    # сохранённым связям (children) ближайший узел, у которого обход нашёл
+    # опору (node_term). Новых видов связей досмотр не вводит — он идёт
+    # только по тем, что основной обход уже прошёл.
+    #
+    # Узлы на пути, которые обход не разобрал (skipped — их корни были
+    # решены другим путём; или не попавшие во фронтир из-за лимита),
+    # разбираются отдельным обходом и досмотр повторяется.
+    _TERM_PRIO = {ORIGIN_DOWNLOAD: 0, ORIGIN_APPROVED: 1, ORIGIN_PRODUCT_SRC: 2}
+
+    def _nearest_terms():
+        """
+        Для каждого узла графа — ближайшая опора: (расстояние, приоритет,
+        узел-опора, следующий шаг к ней). Один обход в ширину от всех опор
+        сразу по обратным связям, а не по обходу на каждую запись: записей
+        бывают тысячи, узлов — десятки тысяч.
+        """
+        rev = {}
+        for x, ks in children.items():
+            for c in ks:
+                rev.setdefault(c, []).append(x)
+        best = {}
+        layer = []
+        for t, (o, _d) in node_term.items():
+            if o in _TERM_PRIO:
+                best[t] = (0, _TERM_PRIO[o], t, None)
+                layer.append(t)
+        dist = 0
+        while layer:
+            dist += 1
+            cand = {}
+            for c in layer:
+                _dc, pc, tc, _nx = best[c]
+                for p in rev.get(c, ()):
+                    if p in best or node_state.get(p) != 'expanded':
+                        continue
+                    k = (dist, pc, tc, c)
+                    if p not in cand or k[:3] < cand[p][:3]:
+                        cand[p] = k
+            best.update(cand)
+            layer = list(cand)
+        return best
+
+    def _gaps_from(roots):
+        """Неразобранные узлы, достижимые из roots по сохранённым связям."""
+        gaps, stack, vis = set(), list(roots), set(roots)
+        while stack:
+            x = stack.pop()
+            st = node_state.get(x)
+            if x not in roots and st in (None, 'skipped'):
+                gaps.add(x)
+                continue
+            for c in children.get(x, ()):
+                if c not in vis:
+                    vis.add(c)
+                    stack.append(c)
+        return gaps
+
+    pending = [h for h in by_hash
+               if h and verdict.get(h, (ORIGIN_UNRESOLVED,))[0] == ORIGIN_UNRESOLVED]
+    joined = set()
+    tried_gaps = set()
+    for attempt in range(_ORIGIN_JOIN_PASSES + 1):
+        if not pending:
+            break
+        best = _nearest_terms()
+        still = []
+        for r in pending:
+            b = best.get(r)
+            if b is None or b[0] == 0:
+                still.append(r)
+                continue
+            term = b[2]
+            o, d = node_term[term]
+            _set(r, o, d)
+            joined.add(r)
+            path, x = [], r
+            while x is not None:
+                path.append(x)
+                x = best[x][3]
+            steps = [node_step[x] for x in path if x in node_step]
+            via = os.path.basename(h_to_path.get(path[1], '') or path[1][:16])
+            steps.append('[досмотр: через общий вход {}]'.format(via))
+            chains[r] = steps
+        pending = still
+        if not pending or attempt == _ORIGIN_JOIN_PASSES:
+            break
+        new_gaps = _gaps_from(set(pending)) - tried_gaps
+        if not new_gaps:
+            break
+        tried_gaps |= new_gaps
+        print(_ts() + "   Origin: досмотр — неразобранных узлов на путях "
+                      "{}, разбираем".format(len(new_gaps)))
+        g_dep = {g: {g} for g in new_gaps}
+        # Уже разобранные узлы кладём в seen: их связи и опоры известны,
+        # повторно читать трассу ради них не нужно.
+        g_seen = set(new_gaps) | {x for x, st in node_state.items()
+                                  if st != 'skipped'}
+        g_vd = {}
+        _walk(set(new_gaps), g_dep, g_seen, g_vd, {}, max_rounds,
+              tag=' [досмотр]')
+        for g, (o, d) in g_vd.items():
+            if o != ORIGIN_UNRESOLVED and g not in node_term:
+                node_term[g] = (o, d)
+                node_state[g] = 'term'
+    if joined:
+        print(_ts() + "   Origin: досмотр по общему графу разрешил {} "
+                      "уникальных хешей".format(len(joined)))
 
     # --- Резерв: наследование происхождения от ближайшего пакета ------------
     #
