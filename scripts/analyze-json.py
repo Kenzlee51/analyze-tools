@@ -279,6 +279,7 @@ except (ImportError, Exception) as _e:
     print("[INFO] JSON backend: stdlib json (orjson unavailable: {})".format(_orjson_reason), flush=True)
 
 import json  # оставляем для совместимости с остальным кодом
+import re
 import argparse
 import glob
 import time
@@ -953,6 +954,7 @@ def load_buildography_data(paths):
         print(_ts() + "   Loading buildography: {}".format(os.path.basename(path)))
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             data = json.load(f, strict=False)
+        _scrub_zero_hashes(data)
         before = len(hashes)
         component_commands = data.get('component_commands', [])
         raw_cmds.extend(component_commands)
@@ -1598,7 +1600,7 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
 
 
 def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds,
-                        all_good_cmds=None, seen_in_trace=None):
+                        all_good_cmds=None, seen_in_trace=None, parent_seen=None):
     """
     Классифицирует интерпретируемые файлы из signatures на четыре категории:
       - executed:   интерпретируемые файлы (любого языка), которые были входными
@@ -1718,6 +1720,7 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
     use_untraceable = []
     izb = []
     seen_in_trace = seen_in_trace or set()
+    parent_seen = parent_seen or set()
     added_compiled_paths = set()
 
     # Цикл по интерпретируемым файлам
@@ -1789,6 +1792,13 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
         #          use_untraceable в докстринге).
         if h and h in seen_in_trace:
             use_untraceable.append({'path': path, 'hash': h})
+            continue
+        # Собственного хеша в трассе нет, но архив-родитель распаковывался:
+        # файл при сборке присутствовал, использование не доказано — та же
+        # категория, а не "не используется нигде".
+        if path in parent_seen:
+            use_untraceable.append({'path': path, 'hash': h,
+                                    'presence': 'archive_in_trace'})
             continue
 
         # --- 5. Остальное — избыточное: хеша нет в трассе вообще ---
@@ -2245,9 +2255,17 @@ def _so_base_name(filename):
     return base
 
 
+# Журнал и установка Svace: libsvace.so предзагружен в сборку, и его
+# .svace-dir/bitcode/event.log записывается выходом почти каждой команды
+# (NPUR.69035-01: все 18 выходов build_miv_agent.sh). Это инструментарий
+# хоста, не содержимое изделия.
+_SVACE_PATH_RX = __import__('re').compile(r'/(\.svace-dir|svace-\d[^/]*)/')
+
+
 def _is_system_path(path):
     """Возвращает True если путь относится к системным файлам хоста сборки."""
-    return any(path.startswith(pfx) for pfx in SYSTEM_PATH_PREFIXES)
+    return (any(path.startswith(pfx) for pfx in SYSTEM_PATH_PREFIXES)
+            or bool(_SVACE_PATH_RX.search(path)))
 
 
 # Каталоги исполняемых файлов хоста — для отдельного reason в filtered_deps
@@ -2332,6 +2350,7 @@ def _collect_output_hashes(buildography_files):
     for file_path in buildography_files:
         with open(file_path, 'rb') as f:
             data = _json_loads(f.read())
+            _scrub_zero_hashes(data)
         for cmd in data.get('component_commands', []):
             outputs = cmd.get('output', {})
             if isinstance(outputs, dict):
@@ -2402,6 +2421,7 @@ def _scan_pass(buildography_files, target_hashes, total_cmds, label,
         with open(file_path, 'rb') as f:
             raw = f.read()
         data = _json_loads(raw)
+        _scrub_zero_hashes(data)
         cmds = data.get('component_commands', [])
 
         for cmd in cmds:
@@ -2916,6 +2936,7 @@ def build_external_package_index(buildography_files):
         try:
             with open(file_path, 'rb') as f:
                 data = _json_loads(f.read())
+                _scrub_zero_hashes(data)
         except Exception:
             continue
 
@@ -3135,6 +3156,7 @@ def build_apt_download_hashes(buildography_files):
         try:
             with open(file_path, 'rb') as f:
                 data = _json_loads(f.read())
+                _scrub_zero_hashes(data)
         except Exception as e:
             print(_ts() + "   build_apt_download_hashes: skip {}: {}".format(
                 os.path.basename(file_path), e))
@@ -3256,6 +3278,36 @@ except ValueError:
     _ORIGIN_MAX_ROUNDS = 20
 
 
+# Нулевой хеш — заглушка трассировщика, а не содержимое. На RTPG.34379-01 он
+# записан у 75 218 выходов (в основном tar и node) и у 48 входов, у файлов с
+# заведомо разным содержимым. Если его не убрать, вход с нулевым хешем
+# "производится" десятками тысяч посторонних команд, и обход связывает файл
+# с первыми попавшимися из них. Поэтому сразу после чтения трассы нулевой
+# хеш заменяется пустым — так же, как отсутствующий.
+_ZERO_HASH = '0' * 64
+
+
+def _scrub_zero_hashes(data):
+    """Заменяет нулевые хеши в dependencies/output команд трассы на ''."""
+    if not isinstance(data, dict):
+        return data
+    for cmd in data.get('component_commands', ()) or ():
+        if not isinstance(cmd, dict):
+            continue
+        for key in ('dependencies', 'output'):
+            sec = cmd.get(key)
+            if isinstance(sec, dict):
+                if _ZERO_HASH in sec.values():
+                    for k, v in sec.items():
+                        if v == _ZERO_HASH:
+                            sec[k] = ''
+            elif isinstance(sec, list):
+                for it in sec:
+                    if isinstance(it, dict) and it.get('hash') == _ZERO_HASH:
+                        it['hash'] = ''
+    return data
+
+
 def _iter_cmd_pairs(section):
     """
     Обходит dependencies/output команды, которые в buildography встречаются
@@ -3314,6 +3366,7 @@ def collect_producers(buildography_files, target_hashes,
     for file_path in buildography_files:
         with open(file_path, 'rb') as f:
             data = _json_loads(f.read())
+            _scrub_zero_hashes(data)
         for cmd in data.get('component_commands', []):
             hits = {}
             for p, h in _iter_cmd_pairs(cmd.get('output', {})):
@@ -3411,10 +3464,20 @@ def _fill_sibling_deps(buildography_files, producers, max_deps):
     вызов компилятора разложен на несколько процессов и содержательные входы
     оказались не у того из них, кто создал файл.
     """
+    # Только для КОМПИЛЯЦИИ (случай -pipe: cc1 читает, as пишет .o). Раньше
+    # правило срабатывало для любой команды без входов и на RTPG.34379-01
+    # добирало входы тысячам производителей (раунд за раундом: 2211, 6363,
+    # 5812...), раздувая граф обхода с 558 до 25 тысяч узлов посторонними
+    # связями: братья по parent_id у распаковки или копирования — это просто
+    # соседние шаги сценария, а не части одной команды.
+    def _eligible(pr):
+        return (not pr['deps'] and pr.get('parent_id') is not None
+                and pr.get('operation') == _OP_COMPILED)
+
     need = set()
     for plist in producers.values():
         for pr in plist:
-            if not pr['deps'] and pr.get('parent_id') is not None:
+            if _eligible(pr):
                 need.add(pr['parent_id'])
     if not need:
         return
@@ -3423,6 +3486,7 @@ def _fill_sibling_deps(buildography_files, producers, max_deps):
     for file_path in buildography_files:
         with open(file_path, 'rb') as f:
             data = _json_loads(f.read())
+            _scrub_zero_hashes(data)
         for cmd in data.get('component_commands', []):
             pid = cmd.get('parent_id')
             cid = cmd.get('id')
@@ -3443,7 +3507,7 @@ def _fill_sibling_deps(buildography_files, producers, max_deps):
     n = 0
     for plist in producers.values():
         for pr in plist:
-            if not pr['deps']:
+            if _eligible(pr):
                 got = sib.get(pr.get('parent_id'))
                 if got:
                     pr['sibling_deps'] = got
@@ -5295,6 +5359,7 @@ def analyze_pass4(bin_entries, src_hashes, buildography_files, script_dir,
         for file_path in buildography_files:
             with open(file_path, 'rb') as f:
                 data = _json_loads(f.read())
+                _scrub_zero_hashes(data)
             for cmd in data.get('component_commands', []):
                 # Проверяем выходы команды
                 outputs = cmd.get('output', {})
@@ -5921,6 +5986,20 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             interp_seen_in_trace.add(_h)
     print(_ts() + "   Интерпретируемых файлов, встречающихся в трассе: "
                   "{}".format(len(interp_seen_in_trace)))
+    # Интерпретируемые файлы, архив-родитель которых встречается в трассе:
+    # файл присутствовал при сборке (архив распаковывали), даже если его
+    # собственный хеш в трассе не записан. На RTPG.34379-01 так было с 7
+    # файлами: tar распаковал их, но трассировщик записал для выходов
+    # нулевой хеш (у 75 218 выходов трассы), и сверка по хешу не прошла.
+    interp_parent_seen = set()
+    for _e in signatures:
+        if not is_interpreted_extension(_e.get('path', '')):
+            continue
+        if any((_ph or '').strip() in buildography_hashes
+               for _ph in (_e.get('parents_chain') or [])):
+            interp_parent_seen.add(_e.get('path', ''))
+    print(_ts() + "   Интерпретируемых файлов, чей архив-родитель в трассе: "
+                  "{}".format(len(interp_parent_seen)))
 
     # buildography_hashes больше не нужен
     del buildography_hashes
@@ -6004,7 +6083,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
          use_untraceable, izb) = analyze_interpreted(
             signatures, input_files, output_files, bin_hashes, bin_paths, raw_cmds,
             all_good_cmds=all_good_cmds,
-            seen_in_trace=interp_seen_in_trace
+            seen_in_trace=interp_seen_in_trace,
+            parent_seen=interp_parent_seen
         )
         del input_files, output_files
         gc.collect()
@@ -6342,26 +6422,47 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     def pct(n, total):
         return (n / total * 100) if total else 0
 
-    # Компилируемые исходники
-    # redundant и not_compiled теперь непересекающиеся категории:
-    #   redundant     — файлов НЕТ в buildography (истинно избыточные по хешу)
-    #   not_compiled  — файлы БЫЛИ в buildography, но результат не в дистрибутиве
-    total_source   = len(direct) + len(parent) + len(redundant) + len(not_compiled)
-    n_redundant    = len(redundant)
-    n_not_compiled = len(not_compiled)
+    # Статистика считается по УНИКАЛЬНЫМ файлам src.json, у каждого — один
+    # итоговый статус. Раньше один и тот же файл считался дважды: Проход 1
+    # обрабатывает ВСЕ исходники (включая .py), и раздел "Компилируемые"
+    # содержал интерпретируемые файлы, которые снова считались в разделе
+    # "Интерпретируемые"; а в Compiled used вдобавок лежат артефакты сборки,
+    # которых в src.json нет. На RTPG.34379-01 "Итого 5439 файлов" при 2241
+    # файле в src.json.
+    #   - компилируемые и прочие (не интерпретируемые) — по Проходам 1–2;
+    #   - интерпретируемые — по Проходу 3 (присутствие хеша в трассе для них
+    #     не доказывает использования, это решает Проход 3);
+    #   - артефакты сборки — отдельной строкой, в итог не входят.
+    _src_paths = {e.get('path', '') for e in signatures}
+    def _C(lst):
+        return [e for e in lst if not is_interpreted_extension(e.get('path', ''))]
+    def _I(lst):
+        return [e for e in lst if is_interpreted_extension(e.get('path', ''))
+                and e.get('path', '') in _src_paths]
+    c_direct, c_parent = _C(direct), _C(parent)
+    c_redundant, c_not_compiled = _C(redundant), _C(not_compiled)
+    c_untraced_distrib = _C(untraced_in_distrib)
+    i_exec, i_cu, i_cun = _I(executed), _I(compiled_used), _I(compiled_unused)
+    i_cop, i_unt, i_izb = _I(copied), _I(use_untraceable), _I(izb)
+    n_artifacts = len(compiled_used) - len(i_cu)
+
+    total_source   = (len(c_direct) + len(c_parent) + len(c_redundant)
+                      + len(c_not_compiled) + len(c_untraced_distrib))
+    n_redundant    = len(c_redundant)
+    n_not_compiled = len(c_not_compiled)
 
     # Интерпретируемые файлы
-    total_interp   = (len(executed) + len(compiled_used) + len(compiled_unused)
-                      + len(copied) + len(use_untraceable) + len(izb))
+    total_interp   = (len(i_exec) + len(i_cu) + len(i_cun)
+                      + len(i_cop) + len(i_unt) + len(i_izb))
 
     # Итого
     total_all      = total_source + total_interp
-    total_izb      = n_redundant + n_not_compiled + len(compiled_unused) + len(izb)
+    total_izb      = n_redundant + n_not_compiled + len(i_cun) + len(i_izb)
     # use_untraceable в избыточные НЕ входит: это не вердикт, а отсутствие
     # вердикта. Показываем третьей строкой, отдельно от используемых и от
     # избыточных, иначе 107 файлов на NPUR.69035-01 молча попадут в одну из
     # двух сторон и читатель об этом не узнает.
-    total_unk      = len(use_untraceable)
+    total_unk      = len(i_unt)
 
     sep = "  " + "-" * 48
 
@@ -6369,24 +6470,27 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
 
     print("\n  Компилируемые исходники ({} файлов)".format(total_source))
     print(sep)
-    print("  Direct (используются напрямую)                     : {:>7}  ({:.1f}%)".format(len(direct),       pct(len(direct),       total_source)))
-    print("  Parent (через архив)                               : {:>7}  ({:.1f}%)".format(len(parent),       pct(len(parent),       total_source)))
+    print("  Direct (используются напрямую)                     : {:>7}  ({:.1f}%)".format(len(c_direct),       pct(len(c_direct),       total_source)))
+    print("  Parent (через архив)                               : {:>7}  ({:.1f}%)".format(len(c_parent),       pct(len(c_parent),       total_source)))
     print("  Redundant-by-hash (нет в buildography)             : {:>7}  ({:.1f}%)".format(n_redundant,       pct(n_redundant,       total_source)))
     print("  Compiled not copied (в buildography, не в bin)     : {:>7}  ({:.1f}%)".format(n_not_compiled,    pct(n_not_compiled,    total_source)))
+    print("  Untraced in distrib (нет в трассе, есть в bin)     : {:>7}  ({:.1f}%)".format(len(c_untraced_distrib), pct(len(c_untraced_distrib), total_source)))
 
     print("\n  Интерпретируемые файлы ({} файлов)".format(total_interp))
     print(sep)
-    print("  Executed (запускаются)                             : {:>7}  ({:.1f}%)".format(len(executed),        pct(len(executed),        total_interp)))
-    print("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(compiled_used),   pct(len(compiled_used),   total_interp)))
-    print("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(compiled_unused), pct(len(compiled_unused), total_interp)))
-    print("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(copied),          pct(len(copied),          total_interp)))
-    print("  Use untraceable (использование не прослеживается)  : {:>7}  ({:.1f}%)".format(len(use_untraceable), pct(len(use_untraceable), total_interp)))
-    print("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(izb),             pct(len(izb),             total_interp)))
+    print("  Executed (запускаются)                             : {:>7}  ({:.1f}%)".format(len(i_exec),        pct(len(i_exec),        total_interp)))
+    print("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(i_cu),   pct(len(i_cu),   total_interp)))
+    print("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(i_cun), pct(len(i_cun), total_interp)))
+    print("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(i_cop),          pct(len(i_cop),          total_interp)))
+    print("  Use untraceable (использование не прослеживается)  : {:>7}  ({:.1f}%)".format(len(i_unt), pct(len(i_unt), total_interp)))
+    print("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(i_izb),             pct(len(i_izb),             total_interp)))
+    if n_artifacts:
+        print("  (+ артефакты сборки в дистрибутиве, не из src.json: {} — в итог не входят)".format(n_artifacts))
 
     print("\n  Итого ({} файлов)".format(total_all))
     print(sep)
     print("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb - total_unk, pct(total_all - total_izb - total_unk, total_all)))
-    print("  Избыточные (not_compiled + compiled_unused + not_used): {:>7}  ({:.1f}%)".format(total_izb,             pct(total_izb,             total_all)))
+    print("  Избыточные (redundant+not_compiled+unused+not_used): {:>7}  ({:.1f}%)".format(total_izb,             pct(total_izb,             total_all)))
     if total_unk:
         print("  Не прослеживается (требуется пояснение)            : {:>7}  ({:.1f}%)".format(total_unk, pct(total_unk, total_all)))
 
@@ -6411,9 +6515,12 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             len(p4_untraced_external),  pct(len(p4_untraced_external),  total_bin)))
         print("  System binaries    (системные пути в дистрибутиве) : {:>7}  ({:.1f}%)".format(
             len(p4_system_binaries),    pct(len(p4_system_binaries),    total_bin)))
-        print("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(
+        print("  Ext pkg content    (содержимое пакетов, по пути)   : {:>7}  ({:.1f}%)".format(
             len(p4_external_package_content),
             pct(len(p4_external_package_content), total_bin)))
+        if p4_external_package_content:
+            print("                     из них источник пакета в трассе : {:>7}".format(
+                sum(1 for _e in p4_external_package_content if _e.get('source'))))
 
         # Вторая ось: разбор ВСЕХ бинарей дистрибутива по происхождению.
         # Таблица выше отвечает на вопрос "как файл появился", эта — на
@@ -6475,26 +6582,29 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     _summary_lines.append("")
     _summary_lines.append("  Компилируемые исходники ({} файлов)".format(total_source))
     _summary_lines.append(_sep)
-    _summary_lines.append("  Direct (используются напрямую)                     : {:>7}  ({:.1f}%)".format(len(direct),   pct(len(direct),   total_source)))
-    _summary_lines.append("  Parent (через архив)                               : {:>7}  ({:.1f}%)".format(len(parent),   pct(len(parent),   total_source)))
+    _summary_lines.append("  Direct (используются напрямую)                     : {:>7}  ({:.1f}%)".format(len(c_direct),   pct(len(c_direct),   total_source)))
+    _summary_lines.append("  Parent (через архив)                               : {:>7}  ({:.1f}%)".format(len(c_parent),   pct(len(c_parent),   total_source)))
     _summary_lines.append("  Redundant-by-hash (нет в buildography)             : {:>7}  ({:.1f}%)".format(n_redundant,   pct(n_redundant,   total_source)))
     _summary_lines.append("  Compiled not copied (в buildography, не в bin)     : {:>7}  ({:.1f}%)".format(n_not_compiled, pct(n_not_compiled, total_source)))
+    _summary_lines.append("  Untraced in distrib (нет в трассе, есть в bin)     : {:>7}  ({:.1f}%)".format(len(c_untraced_distrib), pct(len(c_untraced_distrib), total_source)))
 
     _summary_lines.append("")
     _summary_lines.append("  Интерпретируемые файлы ({} файлов)".format(total_interp))
     _summary_lines.append(_sep)
-    _summary_lines.append("  Executed (запускаются)                             : {:>7}  ({:.1f}%)".format(len(executed),        pct(len(executed),        total_interp)))
-    _summary_lines.append("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(compiled_used),   pct(len(compiled_used),   total_interp)))
-    _summary_lines.append("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(compiled_unused), pct(len(compiled_unused), total_interp)))
-    _summary_lines.append("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(copied),          pct(len(copied),          total_interp)))
-    _summary_lines.append("  Use untraceable (использование не прослеживается)  : {:>7}  ({:.1f}%)".format(len(use_untraceable), pct(len(use_untraceable), total_interp)))
-    _summary_lines.append("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(izb),             pct(len(izb),             total_interp)))
+    _summary_lines.append("  Executed (запускаются)                             : {:>7}  ({:.1f}%)".format(len(i_exec),        pct(len(i_exec),        total_interp)))
+    _summary_lines.append("  Compiled used (скомпилированы, результат в bin)    : {:>7}  ({:.1f}%)".format(len(i_cu),   pct(len(i_cu),   total_interp)))
+    _summary_lines.append("  Compiled unused (скомпилированы, результат не в bin): {:>7}  ({:.1f}%)".format(len(i_cun), pct(len(i_cun), total_interp)))
+    _summary_lines.append("  Copied (есть в дистрибутиве)                       : {:>7}  ({:.1f}%)".format(len(i_cop),          pct(len(i_cop),          total_interp)))
+    _summary_lines.append("  Use untraceable (использование не прослеживается)  : {:>7}  ({:.1f}%)".format(len(i_unt), pct(len(i_unt), total_interp)))
+    _summary_lines.append("  Not used (не используются нигде)                   : {:>7}  ({:.1f}%)".format(len(i_izb),             pct(len(i_izb),             total_interp)))
+    if n_artifacts:
+        _summary_lines.append("  (+ артефакты сборки в дистрибутиве, не из src.json: {} — в итог не входят)".format(n_artifacts))
 
     _summary_lines.append("")
     _summary_lines.append("  Итого ({} файлов)".format(total_all))
     _summary_lines.append(_sep)
     _summary_lines.append("  Используются                                       : {:>7}  ({:.1f}%)".format(total_all - total_izb - total_unk, pct(total_all - total_izb - total_unk, total_all)))
-    _summary_lines.append("  Избыточные (not_compiled + compiled_unused + not_used): {:>7}  ({:.1f}%)".format(total_izb, pct(total_izb, total_all)))
+    _summary_lines.append("  Избыточные (redundant+not_compiled+unused+not_used): {:>7}  ({:.1f}%)".format(total_izb, pct(total_izb, total_all)))
     if total_unk:
         _summary_lines.append("  Не прослеживается (требуется пояснение)            : {:>7}  ({:.1f}%)".format(total_unk, pct(total_unk, total_all)))
 
@@ -6509,7 +6619,9 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         _summary_lines.append("  External prebuilt  (готовый извне, трасс. видит)   : {:>7}  ({:.1f}%)".format(len(p4_external_prebuilt),        pct(len(p4_external_prebuilt),       total_bin)))
         _summary_lines.append("  Untraced external  (не в src, трасс. не видит)     : {:>7}  ({:.1f}%)".format(len(p4_untraced_external),        pct(len(p4_untraced_external),       total_bin)))
         _summary_lines.append("  System binaries    (системные пути в дистрибутиве) : {:>7}  ({:.1f}%)".format(len(p4_system_binaries),          pct(len(p4_system_binaries),         total_bin)))
-        _summary_lines.append("  Ext pkg content    (содержимое внешних пакетов)    : {:>7}  ({:.1f}%)".format(len(p4_external_package_content), pct(len(p4_external_package_content),total_bin)))
+        _summary_lines.append("  Ext pkg content    (содержимое пакетов, по пути)   : {:>7}  ({:.1f}%)".format(len(p4_external_package_content), pct(len(p4_external_package_content),total_bin)))
+        if p4_external_package_content:
+            _summary_lines.append("                     из них источник пакета в трассе : {:>7}".format(sum(1 for _e in p4_external_package_content if _e.get('source'))))
 
     _summary_lines.append("=" * 54)
 
@@ -6527,6 +6639,12 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     summary_dir  = os.path.join(os.path.dirname(try_dir), summary_name)
     summary_src_dir = os.path.join(summary_dir, "src")
     summary_bin_dir = os.path.join(summary_dir, "bin")
+    # Каталог сводки пересоздаётся: иначе в нём остаются отчёты прошлого
+    # прогона, которых в этом прогоне уже нет (NPUR.34018-01: устаревший
+    # external_package_content.txt в summary1 выглядел как замечание).
+    if os.path.isdir(summary_dir):
+        import shutil as _sh
+        _sh.rmtree(summary_dir, ignore_errors=True)
     os.makedirs(summary_src_dir, exist_ok=True)
     os.makedirs(summary_bin_dir, exist_ok=True)
     print(_ts() + "   Summary directory: {}".format(summary_dir))
@@ -6606,10 +6724,11 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
         "use_untraceable": (
             "src/",
             "Файлы, использование которых не прослеживается",
-            "Хеши этих файлов встречаются в трассе сборки, то есть при сборке\n"
-            "  файлы присутствовали и к ним обращались, но трассировщик не\n"
-            "  увидел, чтобы какой-либо интерпретатор их использовал, и в\n"
-            "  дистрибутив они не попали ни сами, ни как результат компиляции."
+            "Эти файлы присутствовали при сборке: их хеши встречаются в трассе,\n"
+            "  либо в трассе распаковывался архив, в котором они лежат. Но\n"
+            "  трассировщик не увидел, чтобы какой-либо интерпретатор их\n"
+            "  использовал, и в дистрибутив они не попали ни сами, ни как\n"
+            "  результат компиляции."
         ),
         # bin/
         "origin_download": (
