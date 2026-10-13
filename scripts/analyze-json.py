@@ -1423,9 +1423,10 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys,
     остаётся используемым, если он
       - был входом компилятора в цепочке к дистрибутиву (как раньше), ИЛИ
       - сам лежит в дистрибутиве (bin_hashes), ИЛИ
-      - был входом команды, которая САМА выдала файл дистрибутива
-        (good_any_input_hashes; один шаг, без транзитивной достижимости —
-        через команды-концентраторы она доходит почти до всего).
+      - (good_any_input_hashes — оставлено для совместимости, вызывающий код
+        его НЕ передаёт: вход команды, ведущей в дистрибутив, — ненадёжное
+        оправдание; на ACIE.01145-01 один `conan install` с 45015 входами
+        "оправдал" бы 9087 файлов).
     На RTPG.15003-01 все 8 записей compiled_not_copied лежали в дистрибутиве
     как есть (tcploop.c из документации haproxy, cffi/_cffi_include.h)."""
     direct_out = []
@@ -5975,27 +5976,18 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                     if path: good_compiler_input_keys.add(os.path.normpath(path))
 
         print(_ts() + "   Good compiler input keys: {}".format(len(good_compiler_input_keys)))
-        # Входы команд, которые САМИ выдали файл дистрибутива (один шаг, без
-        # транзитивности) — последний рубеж перед compiled_not_copied.
+        # Последний рубеж перед compiled_not_copied — только надёжное
+        # оправдание: сам файл лежит в дистрибутиве.
         #
-        # Транзитивная достижимость (all_good_cmds) для этого не годится:
-        # через команды-концентраторы (python3, conan, cmake, b2 читают тысячи
-        # файлов) она доходит почти до всего. На ACIE.01145-01 8516 файлов
-        # читали только такие команды — с транзитивным критерием все они
-        # молча ушли бы в "используемые".
-        direct_bin_input_hashes = set()
-        for _c in raw_cmds:
-            if any(_h in bin_hashes_set
-                   for _p, _h in _iter_cmd_pairs(_c.get('output', {}))):
-                for _p, _h in _iter_cmd_pairs(_c.get('dependencies', {})):
-                    if _h:
-                        direct_bin_input_hashes.add(_h)
+        # Оправдание "файл читала команда, ведущая в дистрибутив" сюда НЕ
+        # добавляется ни в транзитивном виде, ни в "один шаг": на
+        # ACIE.01145-01 одна команда `conan install` (45015 входов, на выходе
+        # итоговые библиотеки) "оправдала" бы 9087 файлов, которые компилятор
+        # не читал. Через процесс-концентратор и один шаг — вся сборка.
         direct, parent, redundant, not_compiled = analyze_pass2(
             direct, parent, redundant, good_compiler_input_keys,
-            bin_hashes=bin_hashes_set,
-            good_any_input_hashes=direct_bin_input_hashes
+            bin_hashes=bin_hashes_set
         )
-        del direct_bin_input_hashes
         del good_compiler_input_keys
         gc.collect()
         print(_ts() + "   Pass 2 done. Memory freed: good_compiler_input_keys")
