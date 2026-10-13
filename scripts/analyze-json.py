@@ -4032,6 +4032,48 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             if o == ORIGIN_APPROVED and h in pkgs_of:
                 d_label[h] = _relabel_approved(h, h, _root_want(h))
 
+        # Какие виды опор достижимы из каждого узла графа. Считается ОДИН раз
+        # обратным проходом от опор, а не поиском по каждой записи: поиск по
+        # всему графу для каждой из ~8000 записей RTPG.15003-01 работал
+        # минутами. Заодно — ближайший специфичный файл носителя для узла
+        # (нужен для подписи основания, когда прежний вердикт подтверждён).
+        g_rev = {}
+        for x, ks in g_edges.items():
+            for c in ks:
+                g_rev.setdefault(c, []).append(x)
+        g_reach = {}
+        g_near_tr = {}
+        for kind_, seeds in (
+                ('tr',  [x for x in g_seen if x in trusted and _specific(x)]),
+                ('src', [x for x in g_seen
+                         if x in src_hashes and x not in trusted]),
+                ('dl',  list(g_dl))):
+            reach = set(seeds)
+            near = {x: x for x in seeds} if kind_ == 'tr' else None
+            layer_ = list(seeds)
+            while layer_:
+                nxt_ = []
+                for c in layer_:
+                    for p_ in g_rev.get(c, ()):
+                        if p_ not in reach:
+                            reach.add(p_)
+                            if near is not None:
+                                near[p_] = near[c]
+                            nxt_.append(p_)
+                layer_ = nxt_
+            g_reach[kind_] = reach
+            if near is not None:
+                g_near_tr = near
+        for r in d_roots:
+            # Корень сам по себе опорой не считается (раунд 0 его уже
+            # проверил), поэтому смотрим, достижима ли опора из его входов.
+            d_support[r] = {k for k, s in g_reach.items()
+                            if any(c in s for c in g_edges.get(r, ()))}
+            if r in g_dl:
+                d_support[r].add('dl')
+            if g_near_tr.get(r) == r:
+                g_near_tr.pop(r, None)
+
         for r in d_roots:
             want = _root_want(r)
             if r in g_dl:
@@ -4042,9 +4084,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             layer = [r]
             first = None      # [(узел, вид, пакет)] ближайшего слоя опор
             own = None
-            near_tr = None    # ближайший специфичный файл носителя
             saw_typical = False
-            support = set()   # виды опор, достижимые в графе: tr / src / dl
             visited = 1
             while layer and visited < _ORIGIN_DEEP_BFS_MAX:
                 terms = []
@@ -4053,26 +4093,21 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                         continue
                     if x in g_dl:
                         terms.append((x, 'dl', None))
-                        support.add('dl')
                         continue
                     in_t = x in trusted
                     if in_t and _specific(x):
                         pname = next(iter(pkgs_of[x]))
                         terms.append((x, 'tr', pname))
-                        support.add('tr')
-                        if near_tr is None:
-                            near_tr = x
                         if want and own is None and _pkg_match(want[0], pname):
                             own = x
                     elif x in src_hashes and not in_t:
                         terms.append((x, 'src', None))
-                        support.add('src')
                     elif x in src_hashes or in_t:
                         saw_typical = True
                 if terms and first is None:
                     first = terms
-                # Обход не прерывается на первой опоре: проверке прежнего
-                # вердикта нужно знать ВСЕ виды опор, достижимые в графе.
+                if own is not None or (first is not None and not want):
+                    break
                 nxt = []
                 for x in layer:
                     for c in g_edges.get(x, ()):
@@ -4082,9 +4117,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 visited += len(nxt)
                 layer = nxt
 
-            d_support[r] = support
-            if (own or near_tr) is not None:
-                d_tr_label[r] = _relabel_approved(r, own or near_tr, want)
+            if (own or g_near_tr.get(r)) is not None:
+                d_tr_label[r] = _relabel_approved(r, own or g_near_tr[r], want)
             pick = None
             if own is not None:
                 pick = (own, 'tr', next(iter(pkgs_of[own])))
