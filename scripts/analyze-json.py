@@ -3618,7 +3618,7 @@ _CONTAINER_PKG_EXTS = ('.deb', '.rpm', '.whl', '.egg', '.jar', '.apk',
 def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     compiler_basenames=None, linker_basenames=None,
                     max_rounds=_ORIGIN_MAX_ROUNDS,
-                    bin_hash_to_path=None):
+                    bin_hash_to_path=None, bin_path_to_hash=None):
     """
     Для списка записей (dict с полями path/hash) устанавливает происхождение.
 
@@ -4468,6 +4468,142 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             print(_ts() + "   Origin: резерв по контейнеру разрешил "
                           "{} записей".format(len(inherited)))
 
+    # --- Резерв: байт-код наследует происхождение своего исходника --------
+    #
+    # Зачем. На RTPG.15003-01 7952 записи (.pyc из venv изделия) остались
+    # без производителя: venv собирается в прослеженной сборке
+    # (python3 -m venv, ensurepip, pip install --no-index), но установщики
+    # Python не записали в выходы ничего из site-packages, а следующие
+    # команды (pip, tar czf venv.tgz) уже читают эти файлы. Сама трасса
+    # происхождение .pyc не даёт.
+    #
+    # .pyc — это байт-код, скомпилированный из .py того же каталога:
+    #   pkg/__pycache__/name.cpython-35.pyc  <-  pkg/name.py
+    #   pkg/name.pyc                         <-  pkg/name.py
+    # .py лежит в том же дистрибутиве, и его хеш сверяется как обычно:
+    # исходники изделия, носитель, трасса. Замерено на RTPG.15003-01:
+    #   .py на носителе 6924, в исходниках изделия 1022, создан в трассе 4,
+    #   то есть 7950 из 7952.
+    #
+    # Граница метода: связь .pyc <-> .py установлена по соглашению Python
+    # о путях, а не прослежена (компиляции в трассе не видно, и самих
+    # файлов у нас нет — только хеши). Поэтому такие записи помечаются
+    # флагом origin_via_source и шагом "bytecode of <путь .py>" в цепочке.
+    #
+    # Только резерв: работает для записей, оставшихся без подтверждения
+    # после обхода и резерва по контейнеру.
+    via_source = set()
+    if bin_path_to_hash:
+        def _py_of(p):
+            d, b = os.path.split(p)
+            m = _re_pk.match(r'(.+?)\.(?:cpython|pypy)[^.]*\.pyc$', b)
+            if os.path.basename(d) == '__pycache__' and m:
+                return os.path.join(os.path.dirname(d), m.group(1) + '.py')
+            if b.endswith('.pyc') and os.path.basename(d) != '__pycache__':
+                return p[:-1]
+            return None
+
+        bc_need = {}    # hash .pyc -> (путь .py, хеш .py)
+        for h, elist in by_hash.items():
+            if not h or verdict.get(h, (ORIGIN_UNRESOLVED,))[0] != ORIGIN_UNRESOLVED:
+                continue
+            if all(id(e) in inherited for e in elist):
+                continue
+            for e in elist:
+                q = _py_of(e.get('path', ''))
+                hq = bin_path_to_hash.get(q) if q else None
+                if hq:
+                    bc_need[h] = (q, hq)
+                    break
+
+        if bc_need:
+            print(_ts() + "   Origin: байт-код по исходнику — .pyc без "
+                          "подтверждения, у которых .py найден: {}".format(
+                              len(bc_need)))
+            # Версии пакетов venv по каталогам *.dist-info / *.egg-info:
+            # (каталог site-packages, имя) -> версия. Нужны, чтобы основанием
+            # стоял архив нужной версии, а не первый попавшийся.
+            site_ver = {}
+            for p in bin_path_to_hash:
+                m = _re_pk.search(r'^(.*/site-packages)/([^/]+?)-(\d[^/-]*?)'
+                                  r'(?:-py[^/]*)?\.(?:dist|egg)-info/', p)
+                if m:
+                    site_ver.setdefault((m.group(1), _pkg_norm(m.group(2))),
+                                        m.group(3))
+
+            t_hashes = {hq for (_q, hq) in bc_need.values()
+                        if hq not in src_hashes and hq in trusted}
+            t_conts = _collect_trusted_containers(trusted, t_hashes)
+
+            def _label_py(q, hq):
+                cs = t_conts.get(hq)
+                if not cs:
+                    label, kind, container = trusted[hq]
+                    return '{}/{}: {}'.format(label, kind, container)
+                by_pkg = {}
+                for (label, kind, container) in cs:
+                    n, v = _pkg_ident(container)
+                    by_pkg.setdefault(n, []).append((label, kind, container, v))
+                m = _re_pk.search(r'^(.*/site-packages)/([^/]+)/', q)
+                want_n = _pkg_norm(m.group(2)) if m else ''
+                want_v = site_ver.get((m.group(1), want_n), '') if m else ''
+                pname = next((n for n in by_pkg if _pkg_match(want_n, n)), None)
+                if pname is None:
+                    pname = sorted(by_pkg, key=lambda n: (-len(by_pkg[n]), n))[0]
+                items = by_pkg[pname]
+                it = next((x for x in items if want_v and x[3] == want_v), None)
+                more = 0
+                if it is None:
+                    vers = sorted({x[3] for x in items})
+                    it = sorted(items, key=lambda x: (x[3], x[2]))[-1]
+                    more = len(vers) - 1
+                detail = '{}/{}: {}'.format(it[0], it[1], it[2])
+                if more:
+                    detail += ' (файл есть и ещё в {} верси{} пакета)'.format(
+                        more, 'и' if more == 1 else 'ях')
+                return detail
+
+            # .py, которых нет ни в исходниках, ни на носителе, прогоняются
+            # обычным разбором происхождения (как бинари).
+            rest = [{'path': q, 'hash': hq} for (q, hq) in bc_need.values()
+                    if hq not in src_hashes and hq not in trusted]
+            py_res = {}
+            if rest:
+                uniq = {}
+                for r_ in rest:
+                    uniq.setdefault(r_['hash'], r_)
+                sub = resolve_origins(list(uniq.values()), src_hashes, trusted,
+                                      buildography_files,
+                                      compiler_basenames=compiler_basenames,
+                                      linker_basenames=linker_basenames,
+                                      max_rounds=max_rounds)
+                for lst in sub:
+                    for r_ in lst:
+                        py_res[r_['hash']] = (r_['origin'], r_.get('origin_detail', ''),
+                                              r_.get('origin_chain', ''))
+
+            n_bc = {}
+            for h, (q, hq) in bc_need.items():
+                step = 'bytecode of {}'.format(q[-120:])
+                if hq in src_hashes:
+                    _set(h, ORIGIN_PRODUCT_SRC,
+                         'исходник байт-кода есть в src.json: {}'.format(q[-120:]))
+                    chains[h] = [step]
+                elif hq in trusted:
+                    _set(h, ORIGIN_APPROVED, _label_py(q, hq))
+                    chains[h] = [step]
+                elif hq in py_res and py_res[hq][0] != ORIGIN_UNRESOLVED:
+                    o, d, ch = py_res[hq]
+                    _set(h, o, d)
+                    chains[h] = [step] + ([ch] if ch else [])
+                else:
+                    continue
+                via_source.add(h)
+                n_bc[verdict[h][0]] = n_bc.get(verdict[h][0], 0) + 1
+            print(_ts() + "   Origin: байт-код по исходнику разрешил {} хешей: {}".format(
+                len(via_source), ', '.join('{} {}'.format(k, v)
+                                           for k, v in sorted(n_bc.items()))))
+
     # --- Раскладываем записи и дописываем поля ------------------------------
     out = {ORIGIN_PRODUCT_SRC: [], ORIGIN_APPROVED: [],
            ORIGIN_DOWNLOAD: [], ORIGIN_UNRESOLVED: []}
@@ -4511,6 +4647,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 e_origin = origin
             if h in check_note:
                 e['origin_check'] = check_note[h]
+            if h in via_source and inh is None:
+                e['origin_via_source'] = True
             out[e_origin].append(e)
 
     print(_ts() + "   Origin: product_src={}, approved_source={}, "
@@ -5422,6 +5560,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
     # Хеши берём из bin.json по путям
     bin_entries = []  # инициализируем заранее на случай если файлы не найдены
     bin_hash_to_path = {}  # хеш -> путь внутри дистрибутива (для контейнеров)
+    bin_path_to_hash = {}  # путь -> хеш (для резерва "байт-код по исходнику")
     pass4_ran   = False  # флаг успешного выполнения Pass 4
     total_bin_count = 0  # будем хранить количество бинарных файлов для статистики
     bin_json_path = os.path.join(RESULTS_DIR, project_name, "sources",
@@ -5472,6 +5611,7 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                     if par:
                         path_to_parents[p_norm] = par
 
+            bin_path_to_hash = path_to_hash
             print(_ts() + "   bin.json loaded: {} entries, "
                   "с родителями: {}".format(
                       len(path_to_hash), len(path_to_parents)))
@@ -5841,7 +5981,8 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                 buildography_files,
                 compiler_basenames=compiler_basenames,
                 linker_basenames=linker_basenames,
-                bin_hash_to_path=bin_hash_to_path)
+                bin_hash_to_path=bin_hash_to_path,
+                bin_path_to_hash=bin_path_to_hash)
         del _origin_input
         # Расхождения прежнего обхода с обходом до конца (контроль): вердикт
         # остался прежним, но проверка его не подтвердила.
