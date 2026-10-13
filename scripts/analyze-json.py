@@ -1414,13 +1414,27 @@ def build_good_compiler_inputs(raw_cmds, compiler_basenames, bin_hashes, bin_pat
 # =============================================================================
 # ФУНКЦИИ ДЛЯ ПРОХОДА 2 – ОРИГИНАЛЬНЫЙ АНАЛИЗ (оставляем без изменений)
 # =============================================================================
-def analyze_pass2(direct, parent, redundant, good_compiler_input_keys):
+def analyze_pass2(direct, parent, redundant, good_compiler_input_keys,
+                  bin_hashes=None, good_any_input_hashes=None):
     """Второй проход: оставляет в direct/parent только те компилируемые файлы,
-    которые были входами команд с выходами в bin. Остальные перемещает в redundant."""
+    которые были входами команд с выходами в bin. Остальные перемещает в redundant.
+
+    Последний рубеж перед compiled_not_copied (ревизия 2026-10-13): файл
+    остаётся используемым, если он
+      - был входом компилятора в цепочке к дистрибутиву (как раньше), ИЛИ
+      - сам лежит в дистрибутиве (bin_hashes), ИЛИ
+      - был входом ЛЮБОЙ команды, ведущей в дистрибутив
+        (good_any_input_hashes) — то же оправдание, что Проход 3 даёт
+        интерпретируемым файлам.
+    На RTPG.15003-01 все 8 записей compiled_not_copied лежали в дистрибутиве
+    как есть (tcploop.c из документации haproxy, cffi/_cffi_include.h)."""
     direct_out = []
     parent_out = []
     not_compiled = []
     moved_count = 0
+    bin_hashes = bin_hashes or set()
+    good_any_input_hashes = good_any_input_hashes or set()
+    kept_other = [0]
 
     def was_compiled(entry):
         h = entry.get('hash', '')
@@ -1430,6 +1444,9 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys):
             return True
         # Проверка по нормализованному пути (уже нормализован)
         if p and p in good_compiler_input_keys:
+            return True
+        if h and (h in bin_hashes or h in good_any_input_hashes):
+            kept_other[0] += 1
             return True
         return False
 
@@ -1465,7 +1482,9 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys):
                 continue
         parent_out.append(entry)
 
-    print(_ts() + "   Pass 2 done: moved to not_compiled={}".format(moved_count))
+    print(_ts() + "   Pass 2 done: moved to not_compiled={} (оправдано не "
+                  "компиляцией, а дистрибутивом/входом команды: {})".format(
+                      moved_count, kept_other[0]))
     return direct_out, parent_out, redundant, not_compiled
 
 
@@ -1479,7 +1498,7 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
     """
     input_files = []
     output_files = []
-    seen_input = set()
+    seen_input = {}   # ключ -> запись (с номерами всех читавших команд)
     seen_output = set()
 
     total_cmds = len(raw_cmds)
@@ -1500,13 +1519,18 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
                     norm_path = os.path.normpath(path)
                     key = h if h else norm_path
                     if key not in seen_input:
-                        seen_input.add(key)
-                        input_files.append({
+                        seen_input[key] = {
                             'path': path,
                             'path_norm': norm_path,
                             'hash': h,
                             'cmd_index': cmd_idx
-                        })
+                        }
+                        input_files.append(seen_input[key])
+                    elif seen_input[key]['cmd_index'] != cmd_idx:
+                        # Файл читают несколько команд — помним ВСЕ, а не
+                        # первую: иначе "ведёт в дистрибутив" проверялось
+                        # только у первой читавшей команды.
+                        seen_input[key].setdefault('more_cmds', set()).add(cmd_idx)
         elif isinstance(deps, list):
             for dep in deps:
                 if isinstance(dep, dict):
@@ -1519,13 +1543,18 @@ def build_interpreted_files_with_cmds(raw_cmds, interpreter_basenames):
                     norm_path = os.path.normpath(path)
                     key = h if h else norm_path
                     if key not in seen_input:
-                        seen_input.add(key)
-                        input_files.append({
+                        seen_input[key] = {
                             'path': path,
                             'path_norm': norm_path,
                             'hash': h,
                             'cmd_index': cmd_idx
-                        })
+                        }
+                        input_files.append(seen_input[key])
+                    elif seen_input[key]['cmd_index'] != cmd_idx:
+                        # Файл читают несколько команд — помним ВСЕ, а не
+                        # первую: иначе "ведёт в дистрибутив" проверялось
+                        # только у первой читавшей команды.
+                        seen_input[key].setdefault('more_cmds', set()).add(cmd_idx)
 
         # Выходные файлы
         outputs = cmd.get('output', {})
@@ -1618,12 +1647,13 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
     input_by_hash = {}
     input_by_path = {}
     for inp in input_files:
+        idxs = {inp['cmd_index']} | set(inp.get('more_cmds') or ())
         h = inp.get('hash')
         if h:
-            input_by_hash.setdefault(h, set()).add(inp['cmd_index'])
+            input_by_hash.setdefault(h, set()).update(idxs)
         p = inp.get('path_norm')
         if p:
-            input_by_path.setdefault(p, set()).add(inp['cmd_index'])
+            input_by_path.setdefault(p, set()).update(idxs)
 
     output_by_hash = {}
     output_by_path = {}
@@ -1704,14 +1734,6 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
             copied.append({'path': path, 'hash': h})
             continue
 
-        # --- 2. Проверка на выходной файл интерпретатора ---
-        is_output = (h and h in output_hashes) or (p_norm and p_norm in output_paths_norm)
-        if is_output:
-            # Файл сгенерирован интерпретатором, но самого файла нет в bin (уже проверили)
-            compiled_unused.append({'path': path, 'hash': h})
-            added_compiled_paths.add(p_norm)
-            continue
-
         # --- 3. Проверка на leads_to_bin (входной файл, чей выход попал в bin) ---
         leads_to_bin = False
         cmd_indices = set()
@@ -1742,6 +1764,22 @@ def analyze_interpreted(signatures, input_files, output_files, bin_hashes, bin_p
                 if cmd_str and cmd_str not in commands:
                     commands.append(cmd_str)
             executed.append({'path': path, 'hash': h, 'commands': commands})
+            continue
+
+        # --- 4.2. Выходной файл интерпретатора, НЕ ведущий в дистрибутив ---
+        # Проблемная категория ставится ПОСЛЕ всех оправданий (дистрибутив,
+        # вход команды, ведущей в дистрибутив, исполнение). Раньше эта
+        # проверка шла второй и обрывала разбор: на RTPG.15003-01 все 64
+        # записи compiled_unused были setup.py пакетов изделия — они
+        # исполнялись python3, команды вели в дистрибутив, но тот же хеш
+        # встречался в выходах (копия при setup.py sdist/build), и файл
+        # объявлялся избыточным, не дойдя до шагов 3 и 4.
+        is_output = (h and h in output_hashes) or (p_norm and p_norm in output_paths_norm)
+        if is_output:
+            # Файл сгенерирован интерпретатором, но самого файла нет в bin
+            # (уже проверили), и использования, ведущего в bin, нет
+            compiled_unused.append({'path': path, 'hash': h})
+            added_compiled_paths.add(p_norm)
             continue
 
         # --- 4.5. Файл есть в трассе, но его не использовал ни один
@@ -4493,9 +4531,14 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 e['origin_container'] = got[1]
 
     if bin_hash_to_path:
+        # Резерв запускается и для "загрузки": загрузка — самое слабое из
+        # оправданий, и подтверждение исходниками или носителем через пакет
+        # сильнее её. Раньше загрузка блокировала резерв (ревизия
+        # 2026-10-13: "файл в проблемные — только если оправданий нет").
         need = [e for e in entries
                 if verdict.get((e.get('hash') or '').strip(),
-                               (ORIGIN_UNRESOLVED, ''))[0] == ORIGIN_UNRESOLVED]
+                               (ORIGIN_UNRESOLVED, ''))[0]
+                in (ORIGIN_UNRESOLVED, ORIGIN_DOWNLOAD)]
         cand = {}    # entry -> (container_hash, container_name)
         for e in need:
             got = _nearest_pkg(e)
@@ -4574,6 +4617,15 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                                 'вход сборки пакета есть в src.json: '
                                 '{}'.format(hit[1][:120]), cname)
                         break
+            # Запись, у которой уже был вердикт "загрузка", резерв может
+            # только усилить (исходники / носитель); унаследованная загрузка
+            # для неё ничего не добавляет.
+            for e in need:
+                inh_ = inherited.get(id(e))
+                if inh_ and inh_[0] == ORIGIN_DOWNLOAD and verdict.get(
+                        (e.get('hash') or '').strip(),
+                        (ORIGIN_UNRESOLVED,))[0] == ORIGIN_DOWNLOAD:
+                    del inherited[id(e)]
             print(_ts() + "   Origin: резерв по контейнеру разрешил "
                           "{} записей".format(len(inherited)))
 
@@ -4614,7 +4666,11 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
 
         bc_need = {}    # hash .pyc -> (путь .py, хеш .py)
         for h, elist in by_hash.items():
-            if not h or verdict.get(h, (ORIGIN_UNRESOLVED,))[0] != ORIGIN_UNRESOLVED:
+            # Как и резерв по контейнеру, работает и для "загрузки": .py,
+            # найденный в исходниках или на носителе, — более сильное
+            # оправдание. Загрузку на загрузку не меняем (см. ниже).
+            if not h or verdict.get(h, (ORIGIN_UNRESOLVED,))[0] not in (
+                    ORIGIN_UNRESOLVED, ORIGIN_DOWNLOAD):
                 continue
             if all(id(e) in inherited for e in elist):
                 continue
@@ -4708,7 +4764,9 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     _set(h, ORIGIN_PRODUCT_SRC,
                          'исходник байт-кода есть в src.json: {}'.format(q[-120:]))
                     chains[h] = [step]
-                elif hq in py_res and py_res[hq][0] != ORIGIN_UNRESOLVED:
+                elif hq in py_res and py_res[hq][0] != ORIGIN_UNRESOLVED and not (
+                        py_res[hq][0] == ORIGIN_DOWNLOAD and
+                        verdict.get(h, (ORIGIN_UNRESOLVED,))[0] == ORIGIN_DOWNLOAD):
                     o, d, ch = py_res[hq]
                     _set(h, o, d)
                     chains[h] = [step] + ([ch] if ch else [])
@@ -5917,9 +5975,19 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                     if path: good_compiler_input_keys.add(os.path.normpath(path))
 
         print(_ts() + "   Good compiler input keys: {}".format(len(good_compiler_input_keys)))
+        # Входы ЛЮБЫХ команд, ведущих в дистрибутив (не только компиляторов) —
+        # последний рубеж перед compiled_not_copied.
+        good_any_input_hashes = set()
+        for idx in all_good_cmds:
+            for _p, _h in _iter_cmd_pairs(raw_cmds[idx].get('dependencies', {})):
+                if _h:
+                    good_any_input_hashes.add(_h)
         direct, parent, redundant, not_compiled = analyze_pass2(
-            direct, parent, redundant, good_compiler_input_keys
+            direct, parent, redundant, good_compiler_input_keys,
+            bin_hashes=bin_hashes_set,
+            good_any_input_hashes=good_any_input_hashes
         )
+        del good_any_input_hashes
         del good_compiler_input_keys
         gc.collect()
         print(_ts() + "   Pass 2 done. Memory freed: good_compiler_input_keys")
