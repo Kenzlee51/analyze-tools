@@ -3695,7 +3695,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             node_term[h] = (o, d)
             node_state[h] = 'term'
 
-    def _walk(frontier, dependents, seen, vd, chains_out, max_rnd, tag=''):
+    def _walk(frontier, dependents, seen, vd, chains_out, max_rnd, tag='',
+              dl_out=None):
         """
         Обратный обход. vd — словарь вердиктов КОРНЕЙ этого обхода
         (hash -> (origin, detail)), chains_out — их цепочки.
@@ -3741,17 +3742,21 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 for r in unresolved_roots:
                     chains_out.setdefault(r, []).append(step)
 
-                # Загрузка — терминал сама по себе. Достаточно, чтобы ЛЮБОЙ из
-                # производителей оказался загрузкой.
+                # Загрузка — ЗАПАСНОЙ терминал. Порядок происхождения: исходники
+                # изделия, носитель, загрузка. Раньше загрузка проверялась
+                # первой и обрывала обход, и на RTPG.15003-01 это дало ложный
+                # вердикт: у libbastion.so два производителя — ld (из
+                # исходников bastion-reader, они в src.json) и pip3 download,
+                # которому трасса ошибочно приписала тот же хеш (путь
+                # .../amqp/five.py). Теперь загрузка запоминается, обход идёт
+                # по остальным производителям, и загрузка становится вердиктом,
+                # только если исходники и носитель не найдены.
                 dl = next((pr for pr in plist
                            if pr['operation'] == _OP_DOWNLOADED), None)
-                if dl is not None:
-                    t = (ORIGIN_DOWNLOAD, dl['detail'] or 'сетевая загрузка')
-                    node_term[h] = t
-                    node_state[h] = 'term'
+                if dl is not None and dl_out is not None:
                     for r in unresolved_roots:
-                        vd[r] = t
-                    continue
+                        dl_out.setdefault(
+                            r, dl['detail'] or 'сетевая загрузка')
 
                 # Ищем терминал среди входов ВСЕХ производителей: сначала
                 # согласованный носитель, затем исходные тексты изделия.
@@ -3796,7 +3801,17 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 # идти дальше некуда. Формулировка различается по тому, создаёт
                 # операция содержимое или только переносит его: во втором случае
                 # отсутствие входа это пробел трассы, в первом может быть нормой.
-                all_deps = [d for pr in plist for d in _deps_of(pr)]
+                all_deps = [d for pr in plist
+                            if pr['operation'] != _OP_DOWNLOADED
+                            for d in _deps_of(pr)]
+                if not all_deps and dl is not None:
+                    # кроме загрузки идти некуда — она и есть вердикт
+                    t = (ORIGIN_DOWNLOAD, dl['detail'] or 'сетевая загрузка')
+                    node_term[h] = t
+                    node_state[h] = 'term'
+                    for r in unresolved_roots:
+                        vd[r] = t
+                    continue
                 if not all_deps:
                     node_state[h] = 'dead'
                     if main['operation'] in DERIVING_OPERATIONS:
@@ -3922,15 +3937,17 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 dl = next((pr for pr in plist
                            if pr['operation'] == _OP_DOWNLOADED), None)
                 if dl is not None:
+                    # запасная опора: обход по другим производителям идёт
                     g_dl[h] = dl['detail'] or 'сетевая загрузка'
-                    continue
                 kids = {}
                 for pr in plist:
-                    if pr['operation'] == _OP_COPIED:
+                    if pr['operation'] in (_OP_COPIED, _OP_DOWNLOADED):
                         continue
                     for dp, dh in _deps_of(pr):
                         if dh and dh != h and dh not in kids:
                             kids[dh] = dp
+                if not kids and h in g_dl:
+                    continue
                 if not kids:
                     if main['operation'] in DERIVING_OPERATIONS:
                         g_dead[h] = ('операция {} только переносит '
@@ -4076,10 +4093,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
 
         for r in d_roots:
             want = _root_want(r)
-            if r in g_dl:
-                _dset(r, ORIGIN_DOWNLOAD, g_dl[r])
-                stats['загрузка'] += 1
-                continue
+            first_dl = r if r in g_dl else None   # загрузка — запасная опора
             prev = {r: None}
             layer = [r]
             first = None      # [(узел, вид, пакет)] ближайшего слоя опор
@@ -4091,9 +4105,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 for x in layer:
                     if x == r:
                         continue
-                    if x in g_dl:
-                        terms.append((x, 'dl', None))
-                        continue
+                    if x in g_dl and first_dl is None:
+                        first_dl = x
                     in_t = x in trusted
                     if in_t and _specific(x):
                         pname = next(iter(pkgs_of[x]))
@@ -4134,9 +4147,9 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     best = sorted(votes, key=lambda n: (-votes[n], n))[0]
                     pick = next(t for t in tr_t if t[2] == best)
                     stats['носитель (ближайший пакет)'] += 1
-                else:
-                    pick = first[0]
-                    stats['загрузка'] += 1
+            if pick is None and first_dl is not None:
+                pick = (first_dl, 'dl', None)
+                stats['загрузка'] += 1
 
             if pick is None:
                 if saw_typical:
@@ -4184,10 +4197,17 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
         dependents[h] = {h}
     seen = set(frontier)
     walk_vd = {}
-    frontier = _walk(frontier, dependents, seen, walk_vd, chains, max_rounds)
+    walk_dl = {}     # корень -> подробность загрузки (запасной вердикт)
+    frontier = _walk(frontier, dependents, seen, walk_vd, chains, max_rounds,
+                     dl_out=walk_dl)
     for h, v in walk_vd.items():
         if h not in verdict:
             _set(h, v[0], v[1])
+    # Загрузка — вердикт для тех, у кого исходники и носитель не нашлись
+    # (в том числе тех, чья ветка дальше упёрлась в "нет входов").
+    for h, d in walk_dl.items():
+        if verdict.get(h, (ORIGIN_UNRESOLVED,))[0] == ORIGIN_UNRESOLVED:
+            _set(h, ORIGIN_DOWNLOAD, d)
 
     # Всё, что осталось без вердикта после последнего раунда.
     #
