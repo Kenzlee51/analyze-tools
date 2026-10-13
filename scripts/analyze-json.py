@@ -5269,14 +5269,17 @@ _ORIGIN_REPORT_STYLE = {
                   'обнаруженные в них\nфайлы ELF/PE, сгруппированные по '
                   'пакету.\nУстранять или пояснять нужно пакет целиком, а не '
                   'отдельные файлы.'),
+        'intro_plain': ('Файлы дистрибутива, полученные из источника вне '
+                        'комплекта поставки.\nФайлы сгруппированы по архиву '
+                        'или каталогу, в котором находятся.'),
         'detail_label': 'получен',
         'split_detail': True,      # "apt download: /path" -> две строки
         'where_label':  'источник',
     },
     'origin_unresolved': {
         'intro': ('Происхождение этих файлов дистрибутива подтвердить не '
-                  'удалось.\nФайлы сгруппированы по пакету, внутри которого '
-                  'находятся.'),
+                  'удалось.\nФайлы сгруппированы по пакету, архиву или '
+                  'каталогу, в котором находятся.'),
         'detail_label': 'не подтверждено',
         'split_detail': False,
     },
@@ -5328,25 +5331,44 @@ def _common_dir_prefix(paths):
     return '/'.join(common) + '/' if common else ''
 
 
+def _nearest_archive(path):
+    """
+    Ближайший архив в пути файла: (путь до архива включительно, путь
+    внутри архива) или None. Архив опознаётся по расширению компонента.
+    """
+    parts = path.split('/')
+    for i in range(len(parts) - 2, -1, -1):
+        low = parts[i].lower()
+        if any(low.endswith(x) for x in _TRUSTED_ARCHIVE_EXTS):
+            return '/'.join(parts[:i + 1]), '/'.join(parts[i + 1:])
+    return None
+
+
 def write_origin_txt(output_path, category_label, entries):
     """
     Записывает отчёт origin_*.
 
-    Две формы вывода, по данным:
+    Все записи выводятся блоками "заголовок группы + строки файлов".
+    Группа — то, внутри чего файл лежит, в порядке предпочтения:
 
-    1. Если происхождение установлено через пакет-контейнер, отчёт
-       группируется по пакетам. Замечание относится к пакету целиком, а не к
-       каждому файлу внутри него: 103 строки с .o и .a из gcc-дева читаются
-       как 103 проблемы, тогда как проблем 14 — по числу пакетов. Общий
-       префикс пути (образ, tgz, каталог изделия) выносится в шапку один
-       раз: на NPUR.69035-01 это 90 символов, повторявшихся в каждой строке.
+    1. ПАКЕТ — ближайший пакет-контейнер (origin_container: .deb, .whl...).
+       Замечание относится к пакету целиком, а не к каждому файлу внутри
+       него: 103 строки с .o и .a из gcc-дева читаются как 103 проблемы,
+       тогда как проблем 14 — по числу пакетов. Общий префикс пути (образ,
+       tgz, каталог изделия) выносится в шапку один раз: на NPUR.69035-01
+       это 90 символов, повторявшихся в каждой строке.
 
-    2. Иначе — плоский формат
-           путь<TAB>хеш<TAB>категория<TAB>операция<TAB>основание
-       Колонка категории нужна, потому что срез по происхождению собирает
-       файлы из РАЗНЫХ категорий Pass 4, и без неё читатель видит файл в
-       origin_unresolved, но не узнаёт, пришёл тот готовым извне или был
-       переупакован.
+    2. АРХИВ — ближайший архив в пути, если пакета нет (venv.tgz на
+       RTPG.15003-01). Одноимённые архивы в разных местах дистрибутива
+       идут одной группой, поэтому в строке — путь до архива и путь внутри.
+
+    3. КАТАЛОГ — каталог файла, если нет ни пакета, ни архива
+       (libbastion.so на RTPG.15003-01).
+
+    Раньше записи без пакета выводились плоско с колонками категории и
+    операции Pass 4. Эти колонки из текста убраны (остаются в .json):
+    строка "compiled_from_src / extracted" читалась как "файл появился в
+    ходе сборки", что для содержимого пакета неверно.
 
     Возвращает True, если записана хотя бы одна строка.
     """
@@ -5364,8 +5386,6 @@ def write_origin_txt(output_path, category_label, entries):
         rows.append({
             'path':      path,
             'hash':      h,
-            'cat':       entry.get('pass4_category', ''),
-            'op':        entry.get('operation', ''),
             'detail':    (entry.get('origin_detail') or '').replace('\t', ' '),
             'container': entry.get('origin_container', ''),
         })
@@ -5378,30 +5398,108 @@ def write_origin_txt(output_path, category_label, entries):
 
     uniq_hashes = len({r['hash'] for r in rows if r['hash']})
 
-    # Разделяем на сгруппированные по пакету и остальные
-    grouped = {}
-    plain   = []
+    # Группы: пакеты отдельно (для них считается общий префикс), архивы и
+    # каталоги — с полными путями. Причина входит в ключ группы, чтобы
+    # блок не приписывал одну причину файлам с разными.
+    grouped = {}      # имя пакета -> {'detail', 'rows'}
+    other   = {}      # (вид, имя, причина) -> [(строка, хеш)]
     for r in rows:
         c = r['container']
         if c:
             g = grouped.setdefault(c, {'detail': r['detail'], 'rows': []})
             g['rows'].append(r)
+            continue
+        arc = _nearest_archive(r['path'])
+        if arc:
+            a_path, inner = arc
+            key = ('АРХИВ', a_path.rsplit('/', 1)[-1], r['detail'])
+            line = '{} \u2192 {}'.format(a_path, inner)
         else:
-            plain.append(r)
-    # Пакеты по убыванию числа файлов — крупное замечание первым
+            d, b = os.path.split(r['path'])
+            key = ('КАТАЛОГ', d, r['detail'])
+            line = b
+        other.setdefault(key, []).append((line, r['hash']))
+    # Крупные группы первыми
     order = sorted(grouped.items(),
                    key=lambda kv: (-len({x['hash'] for x in kv[1]['rows']}),
                                    kv[0]))
+    order_other = sorted(other.items(),
+                         key=lambda kv: (-len({h for _l, h in kv[1]}), kv[0]))
+
+    style = _ORIGIN_REPORT_STYLE.get(category_label, _ORIGIN_STYLE_DEFAULT)
+    W = 22   # ширина метки, одинаковая во всех отчётах
+
+    def _write_block(f, kind, title, n_files, d, n_rows=None):
+        f.write("\n")
+        f.write("=" * 74 + "\n")
+        f.write("{}: {}\n".format(kind, title))
+        # Одинаковый файл в нескольких местах дистрибутива — одна строка на
+        # место, но файл один: показываем оба числа, чтобы "файлов : 1"
+        # над двумя строками не выглядело ошибкой.
+        cnt = str(n_files)
+        if n_rows and n_rows != n_files:
+            cnt += ' (мест в дистрибутиве: {})'.format(n_rows)
+        f.write("  {} : {}\n".format('файлов'.ljust(W), cnt))
+        if d and style.get('split_detail') and ': ' in d:
+            how, where = d.split(': ', 1)
+            f.write("  {} : {}\n".format(
+                style['detail_label'].ljust(W), how))
+            f.write("  {} : {}\n".format(
+                style.get('where_label', 'путь').ljust(W), where))
+        elif d:
+            # Длинное основание переносим с отступом под значение,
+            # иначе строка уходит за 100 символов.
+            label = style['detail_label'].ljust(W)
+            chunks = []
+            line = ''
+            for w in d.split():
+                if line and len(line) + 1 + len(w) > 48:
+                    chunks.append(line)
+                    line = w
+                else:
+                    line = (line + ' ' + w) if line else w
+            if line:
+                chunks.append(line)
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    f.write("  {} : {}\n".format(label, chunk))
+                else:
+                    # продолжение — без повторного двоеточия,
+                    # иначе читается как ещё одно поле
+                    f.write("  {}   {}\n".format(' ' * W, chunk))
+        f.write("-" * 74 + "\n")
 
     with open(versioned_path, 'w', encoding='utf-8') as f:
         f.write("# {}\n".format(category_label))
         f.write("# Generated: {}\n".format(datetime.now().isoformat()))
+        tail = ''
+        if grouped:
+            tail += ", пакетов: {}".format(len(grouped))
+        if other:
+            tail += ", прочих групп: {}".format(len(other))
         f.write("# Записей: {}, уникальных файлов: {}{}\n".format(
-            len(rows), uniq_hashes,
-            ", пакетов: {}".format(len(grouped)) if grouped else ""))
+            len(rows), uniq_hashes, tail))
 
-        style = _ORIGIN_REPORT_STYLE.get(category_label, _ORIGIN_STYLE_DEFAULT)
         prefix = ''
+        if rows:
+            f.write("#\n")
+            if grouped:
+                _n = len(grouped)
+                _intro = (style.get('intro') or '').format(
+                    n=_n,
+                    v=_plural_ru(_n,   'входит',     'входят',    'входят'),
+                    adj=_plural_ru(_n, 'сторонний',  'сторонних', 'сторонних'),
+                    pkg=_plural_ru(_n, 'пакет',      'пакета',    'пакетов'),
+                    got=_plural_ru(_n, 'полученный', 'полученных', 'полученных'))
+            else:
+                _intro = style.get('intro_plain') or style.get('intro') or ''
+            for _line in _intro.split('\n'):
+                if _line:
+                    f.write("# {}\n".format(_line))
+            if grouped and other:
+                f.write("# Файлы вне пакетов сгруппированы по архиву или "
+                        "каталогу, в котором находятся.\n")
+
         if order:
             # Префикс считаем по части пути ДО имени пакета
             heads = []
@@ -5412,83 +5510,33 @@ def write_origin_txt(output_path, category_label, entries):
                     # без завершающего слэша: его добавит _common_dir_prefix
                     heads.append(r['path'][:i] if i >= 0 else r['path'])
             prefix = _common_dir_prefix(heads)
-
-            f.write("#\n")
-            _n = len(grouped)
-            _intro = (style.get('intro') or '').format(
-                n=_n,
-                v=_plural_ru(_n,   'входит',     'входят',    'входят'),
-                adj=_plural_ru(_n, 'сторонний',  'сторонних', 'сторонних'),
-                pkg=_plural_ru(_n, 'пакет',      'пакета',    'пакетов'),
-                got=_plural_ru(_n, 'полученный', 'полученных', 'полученных'))
-            for _line in _intro.split('\n'):
-                if _line:
-                    f.write("# {}\n".format(_line))
             if prefix:
                 f.write("#\n")
-                f.write("# Все пути ниже — относительно\n")
+                f.write("# Пути пакетов ниже — относительно\n" if other else
+                        "# Все пути ниже — относительно\n")
                 f.write("#   {}\n".format(prefix))
+        if rows:
             f.write("#\n")
-            f.write("# Формат строки данных: <TAB>путь-внутри-пакета"
+            f.write("# Формат строки данных: <TAB>путь-внутри-группы"
                     "<TAB>хеш\n")
 
-            W = 22   # ширина метки, одинаковая во всех отчётах
-            for cname, g in order:
-                n_files = len({x['hash'] for x in g['rows']})
-                f.write("\n")
-                f.write("=" * 74 + "\n")
-                f.write("ПАКЕТ: {}\n".format(cname))
-                f.write("  {} : {}\n".format('файлов'.ljust(W), n_files))
-                d = g['detail']
-                if d and style.get('split_detail') and ': ' in d:
-                    how, where = d.split(': ', 1)
-                    f.write("  {} : {}\n".format(
-                        style['detail_label'].ljust(W), how))
-                    f.write("  {} : {}\n".format(
-                        style.get('where_label', 'путь').ljust(W), where))
-                elif d:
-                    # Длинное основание переносим с отступом под значение,
-                    # иначе строка уходит за 100 символов.
-                    label = style['detail_label'].ljust(W)
-                    words = d.split()
-                    chunks = []
-                    line = ''
-                    for w in words:
-                        if line and len(line) + 1 + len(w) > 48:
-                            chunks.append(line)
-                            line = w
-                        else:
-                            line = (line + ' ' + w) if line else w
-                    if line:
-                        chunks.append(line)
-                    for i, chunk in enumerate(chunks):
-                        if i == 0:
-                            f.write("  {} : {}\n".format(label, chunk))
-                        else:
-                            # продолжение — без повторного двоеточия,
-                            # иначе читается как ещё одно поле
-                            f.write("  {}   {}\n".format(' ' * W, chunk))
-                f.write("-" * 74 + "\n")
-                for r in g['rows']:
-                    rel = r['path']
-                    marker = '/' + cname + '/'
-                    i = rel.find(marker)
-                    if i >= 0:
-                        rel = rel[i + len(marker):]
-                    f.write("\t{}\t{}\n".format(rel, r['hash']))
+        for cname, g in order:
+            _write_block(f, 'ПАКЕТ', cname,
+                         len({x['hash'] for x in g['rows']}), g['detail'],
+                         len(g['rows']))
+            for r in g['rows']:
+                rel = r['path']
+                marker = '/' + cname + '/'
+                i = rel.find(marker)
+                if i >= 0:
+                    rel = rel[i + len(marker):]
+                f.write("\t{}\t{}\n".format(rel, r['hash']))
 
-        if plain:
-            if order:
-                f.write("\n")
-                f.write("=" * 74 + "\n")
-                f.write("ОСТАЛЬНЫЕ ЗАПИСИ ({})\n".format(len(plain)))
-                f.write("=" * 74 + "\n")
-            f.write("# Format: path<TAB>hash<TAB>pass4_category<TAB>operation"
-                    "<TAB>origin_detail\n")
-            f.write("#\n")
-            for r in plain:
-                f.write("\t".join((r['path'], r['hash'], r['cat'],
-                                   r['op'], r['detail'])) + "\n")
+        for (kind, title, d), lst in order_other:
+            _write_block(f, kind, title, len({h for _l, h in lst}), d,
+                         len(lst))
+            for line, h in lst:
+                f.write("\t{}\t{}\n".format(line, h))
 
     print(_ts() + "   Written {} entries ({} уникальных{}) -> {}".format(
         len(rows), uniq_hashes,
