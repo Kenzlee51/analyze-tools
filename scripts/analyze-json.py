@@ -1423,9 +1423,9 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys,
     остаётся используемым, если он
       - был входом компилятора в цепочке к дистрибутиву (как раньше), ИЛИ
       - сам лежит в дистрибутиве (bin_hashes), ИЛИ
-      - был входом ЛЮБОЙ команды, ведущей в дистрибутив
-        (good_any_input_hashes) — то же оправдание, что Проход 3 даёт
-        интерпретируемым файлам.
+      - был входом команды, которая САМА выдала файл дистрибутива
+        (good_any_input_hashes; один шаг, без транзитивной достижимости —
+        через команды-концентраторы она доходит почти до всего).
     На RTPG.15003-01 все 8 записей compiled_not_copied лежали в дистрибутиве
     как есть (tcploop.c из документации haproxy, cffi/_cffi_include.h)."""
     direct_out = []
@@ -5975,19 +5975,27 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
                     if path: good_compiler_input_keys.add(os.path.normpath(path))
 
         print(_ts() + "   Good compiler input keys: {}".format(len(good_compiler_input_keys)))
-        # Входы ЛЮБЫХ команд, ведущих в дистрибутив (не только компиляторов) —
-        # последний рубеж перед compiled_not_copied.
-        good_any_input_hashes = set()
-        for idx in all_good_cmds:
-            for _p, _h in _iter_cmd_pairs(raw_cmds[idx].get('dependencies', {})):
-                if _h:
-                    good_any_input_hashes.add(_h)
+        # Входы команд, которые САМИ выдали файл дистрибутива (один шаг, без
+        # транзитивности) — последний рубеж перед compiled_not_copied.
+        #
+        # Транзитивная достижимость (all_good_cmds) для этого не годится:
+        # через команды-концентраторы (python3, conan, cmake, b2 читают тысячи
+        # файлов) она доходит почти до всего. На ACIE.01145-01 8516 файлов
+        # читали только такие команды — с транзитивным критерием все они
+        # молча ушли бы в "используемые".
+        direct_bin_input_hashes = set()
+        for _c in raw_cmds:
+            if any(_h in bin_hashes_set
+                   for _p, _h in _iter_cmd_pairs(_c.get('output', {}))):
+                for _p, _h in _iter_cmd_pairs(_c.get('dependencies', {})):
+                    if _h:
+                        direct_bin_input_hashes.add(_h)
         direct, parent, redundant, not_compiled = analyze_pass2(
             direct, parent, redundant, good_compiler_input_keys,
             bin_hashes=bin_hashes_set,
-            good_any_input_hashes=good_any_input_hashes
+            good_any_input_hashes=direct_bin_input_hashes
         )
-        del good_any_input_hashes
+        del direct_bin_input_hashes
         del good_compiler_input_keys
         gc.collect()
         print(_ts() + "   Pass 2 done. Memory freed: good_compiler_input_keys")
