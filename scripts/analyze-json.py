@@ -4586,7 +4586,19 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
         for ph in (e.get('parents') or []):
             cpath = (bin_hash_to_path or {}).get(ph, '')
             if cpath.lower().endswith(_CONTAINER_PKG_EXTS):
-                return ph, cpath.rsplit('/', 1)[-1]
+                # Имя берём из СОБСТВЕННОГО пути файла: таблица хеш -> путь
+                # хранит одну копию, а одинаковый пакет может лежать в
+                # дистрибутиве под разными именами (RTPG.34376-01:
+                # pi_po_gfi-0.0.25-Linux.deb и PI_PO_GF.DEB в образе 8.3).
+                # Иначе файл попадал в группу чужого имени и в отчёте
+                # печатался полным путём.
+                name = cpath.rsplit('/', 1)[-1]
+                parts = (e.get('path') or '').split('/')
+                for comp in reversed(parts[:-1]):
+                    if comp.lower().endswith(_CONTAINER_PKG_EXTS):
+                        name = comp
+                        break
+                return ph, name
         return None
 
     if bin_hash_to_path:
@@ -4594,6 +4606,8 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             got = _nearest_pkg(e)
             if got:
                 e['origin_container'] = got[1]
+                # По хешу отчёт склеивает копии одного пакета в одну группу
+                e['origin_container_hash'] = got[0]
 
     if bin_hash_to_path:
         # Резерв запускается и для "загрузки": загрузка — самое слабое из
@@ -5555,6 +5569,7 @@ def write_origin_txt(output_path, category_label, entries):
             'hash':      h,
             'detail':    (entry.get('origin_detail') or '').replace('\t', ' '),
             'container': entry.get('origin_container', ''),
+            'chash':     entry.get('origin_container_hash', ''),
         })
     rows.sort(key=lambda r: r['path'])
 
@@ -5568,13 +5583,27 @@ def write_origin_txt(output_path, category_label, entries):
     # Группы: пакеты отдельно (для них считается общий префикс), архивы и
     # каталоги — с полными путями. Причина входит в ключ группы, чтобы
     # блок не приписывал одну причину файлам с разными.
-    grouped = {}      # имя пакета -> {'detail', 'rows'}
+    # Ключ группы пакета — ХЕШ пакета, а не имя: одна и та же копия пакета
+    # может лежать в дистрибутиве под разными именами (RTPG.34376-01:
+    # pi_po_gfi-0.0.25-Linux.deb в DISTR.TAR и PI_PO_GF.DEB в образе 8.3).
+    # Проблема при этом одна, и блок должен быть один.
+    grouped = {}      # хеш (или имя) пакета -> {'detail', 'rows', 'names'}
     other   = {}      # (вид, имя, причина) -> [(строка, хеш)]
     for r in rows:
         c = r['container']
         if c:
-            g = grouped.setdefault(c, {'detail': r['detail'], 'rows': []})
+            marker = '/' + c + '/'
+            i = r['path'].find(marker)
+            if i >= 0:
+                r['head']  = r['path'][:i]
+                r['inner'] = r['path'][i + len(marker):]
+            else:
+                r['head'], r['inner'] = '', r['path']
+            g = grouped.setdefault(r['chash'] or c,
+                                   {'detail': r['detail'], 'rows': [],
+                                    'names': {}})
             g['rows'].append(r)
+            g['names'][c] = g['names'].get(c, 0) + 1
             continue
         arc = _nearest_archive(r['path'])
         if arc:
@@ -5587,19 +5616,29 @@ def write_origin_txt(output_path, category_label, entries):
             line = b
         other.setdefault(key, []).append((line, r['hash']))
     # Крупные группы первыми
+    for g in grouped.values():
+        # Заголовок — самое частое имя (при равенстве — длинное: полное имя
+        # с версией понятнее усечённого 8.3), остальные имена — в скобках
+        nm = sorted(g['names'].items(),
+                    key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+        g['title'] = nm[0][0]
+        g['alt']   = [n for n, _c in nm[1:]]
+        g['copies'] = sorted({(x['head'], x['container']) for x in g['rows']})
     order = sorted(grouped.items(),
                    key=lambda kv: (-len({x['hash'] for x in kv[1]['rows']}),
-                                   kv[0]))
+                                   kv[1]['title']))
     order_other = sorted(other.items(),
                          key=lambda kv: (-len({h for _l, h in kv[1]}), kv[0]))
 
     style = _ORIGIN_REPORT_STYLE.get(category_label, _ORIGIN_STYLE_DEFAULT)
     W = 22   # ширина метки, одинаковая во всех отчётах
 
-    def _write_block(f, kind, title, n_files, d, n_rows=None):
+    def _write_block(f, kind, title, n_files, d, n_rows=None, extra=None):
         f.write("\n")
         f.write("=" * 74 + "\n")
         f.write("{}: {}\n".format(kind, title))
+        for k, v in (extra or []):
+            f.write("  {} : {}\n".format(k.ljust(W), v))
         # Одинаковый файл в нескольких местах дистрибутива — одна строка на
         # место, но файл один: показываем оба числа, чтобы "файлов : 1"
         # над двумя строками не выглядело ошибкой.
@@ -5670,12 +5709,10 @@ def write_origin_txt(output_path, category_label, entries):
         if order:
             # Префикс считаем по части пути ДО имени пакета
             heads = []
-            for cname, g in order:
+            for _k, g in order:
                 for r in g['rows']:
-                    marker = '/' + cname + '/'
-                    i = r['path'].find(marker)
                     # без завершающего слэша: его добавит _common_dir_prefix
-                    heads.append(r['path'][:i] if i >= 0 else r['path'])
+                    heads.append(r['head'] or r['path'])
             prefix = _common_dir_prefix(heads)
             if prefix:
                 f.write("#\n")
@@ -5687,17 +5724,35 @@ def write_origin_txt(output_path, category_label, entries):
             f.write("# Формат строки данных: <TAB>путь-внутри-группы"
                     "<TAB>хеш\n")
 
-        for cname, g in order:
-            _write_block(f, 'ПАКЕТ', cname,
+        def _rel(p):
+            if prefix and (p + '/') == prefix:
+                return ''
+            return p[len(prefix):] if prefix and p.startswith(prefix) else p
+
+        for _k, g in order:
+            title = g['title']
+            if g['alt']:
+                title += '  (та же копия: {})'.format(', '.join(g['alt']))
+            extra = []
+            multi = len(g['copies']) > 1
+            if multi:
+                extra.append(('копий пакета', str(len(g['copies']))))
+            _write_block(f, 'ПАКЕТ', title,
                          len({x['hash'] for x in g['rows']}), g['detail'],
-                         len(g['rows']))
-            for r in g['rows']:
-                rel = r['path']
-                marker = '/' + cname + '/'
-                i = rel.find(marker)
-                if i >= 0:
-                    rel = rel[i + len(marker):]
-                f.write("\t{}\t{}\n".format(rel, r['hash']))
+                         len(g['rows']), extra)
+            # Одна копия пакета — строка = путь внутри пакета, как раньше.
+            # Несколько копий — строка = путь до пакета -> путь внутри,
+            # чтобы было видно, в какой копии лежит файл.
+            rws = sorted(g['rows'], key=lambda x: (x['inner'], x['head'],
+                                                    x['container']))
+            for r in rws:
+                if multi and r['head']:
+                    loc = '/'.join(x for x in (_rel(r['head']),
+                                               r['container']) if x)
+                    line = '{} \u2192 {}'.format(loc, r['inner'])
+                else:
+                    line = r['inner']
+                f.write("\t{}\t{}\n".format(line, r['hash']))
 
         for (kind, title, d), lst in order_other:
             _write_block(f, kind, title, len({h for _l, h in lst}), d,
