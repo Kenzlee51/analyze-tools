@@ -4366,7 +4366,11 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     #   - прежний подтвердил, и в графе есть специфичная опора ТОГО ЖЕ вида
     #     (носитель / исходники изделия / загрузка)        -> вердикт прежний,
     #     для носителя уточняется основание;
-    #   - опоры того же вида в графе нет                   -> подтверждение
+    #   - опоры того же вида в графе нет, но проверка нашла свою
+    #                                                    -> вердиктом
+    #     становится найденное проверкой (флаг origin_check_corrected, что
+    #     засчитал прежний обход — в origin_check_previous);
+    #   - проверка не нашла ничего                         -> подтверждение
     #     не прошло проверку: запись уходит в unresolved, причина называет
     #     и прежний вердикт, и то, что нашла проверка.
     #
@@ -4379,6 +4383,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     # Отдельного отчёта у этого шага нет: неподтверждённое — это
     # origin_unresolved, как и всё прочее неподтверждённое.
     check_note = {}
+    corrected  = {}   # hash -> что засчитал прежний обход (вердикт исправлен)
     if _ORIGIN_DEEP:
         _kind = {ORIGIN_APPROVED: 'tr', ORIGIN_PRODUCT_SRC: 'src',
                  ORIGIN_DOWNLOAD: 'dl'}
@@ -4386,7 +4391,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                  ORIGIN_APPROVED: 'согласованный носитель',
                  ORIGIN_PRODUCT_SRC: 'исходные тексты изделия',
                  ORIGIN_DOWNLOAD: 'загрузка'}
-        n_add = n_lab = n_chk = 0
+        n_add = n_lab = n_chk = n_cor = 0
         for h, new in d_verdict.items():
             old = verdict.get(h, (ORIGIN_UNRESOLVED, ''))
             if old[0] == ORIGIN_UNRESOLVED:
@@ -4403,6 +4408,20 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     verdict[h] = (old[0], d_tr_label[h])
                     n_lab += 1
                 continue
+            if new[0] != ORIGIN_UNRESOLVED:
+                # Прежнее подтверждение проверку не прошло, но проверка нашла
+                # своё, проверенное (специфичная опора). Вердиктом становится
+                # оно. Случай RTPG.15003-01: прежний обход засчитал для
+                # libbastion.so первый попавшийся вход из СВВП (файл из
+                # тарбола bleach, прочитанный компилятором), а проверка нашла
+                # заголовок bastion-reader из src.json.
+                verdict[h] = new
+                if h in d_chain:
+                    chains[h] = list(d_chain[h])
+                corrected[h] = ('прежний обход засчитал: {} ({})'.format(
+                    _name.get(old[0], old[0]), old[1][:160]))
+                n_cor += 1
+                continue
             why = ('прежний обход засчитал: {} ({}); проверка до конца по '
                    'хешу опоры этого вида не нашла — {}: {}'.format(
                        _name.get(old[0], old[0]), old[1][:120],
@@ -4416,8 +4435,9 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 verdict[h] = (old[0], lab)
                 n_lab += 1
         print(_ts() + "   Origin: обход до конца — добавлено подтверждений {}, "
-                      "уточнено оснований {}, не прошло проверку {}".format(
-                          n_add, n_lab, n_chk))
+                      "уточнено оснований {}, исправлено вердиктов {}, "
+                      "не прошло проверку {}".format(
+                          n_add, n_lab, n_cor, n_chk))
 
     # --- Резерв: наследование происхождения от ближайшего пакета ------------
     #
@@ -4743,6 +4763,9 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 e_origin = origin
             if h in check_note:
                 e['origin_check_failed'] = True
+            if h in corrected and inh is None:
+                e['origin_check_corrected'] = True
+                e['origin_check_previous'] = corrected[h]
             if h in via_source and inh is None:
                 e['origin_via_source'] = True
             out[e_origin].append(e)
