@@ -2680,6 +2680,40 @@ _OP_OTHER     = 'other'
 DERIVING_OPERATIONS = frozenset((_OP_REPACKED, _OP_SIGNED, _OP_EXTRACTED,
                                  _OP_COPIED, _OP_TRANSFORMED))
 
+# Причины origin_unresolved. Пишутся для человека, который будет задавать
+# вопрос разработчику: что нашли, чего не хватает, что требуется. Внутренние
+# термины анализатора ("опора", "прежний обход", "неотфильтрованные входы")
+# сюда не попадают. Формулировки согласованы 2026-10-14.
+_WHY_NO_PRODUCER = ('Файла нет в трассе \u2014 ни одна команда сборки его не '
+                    'создавала (нет в output). Необходим комментарий о '
+                    'происхождении.')
+_WHY_DERIVING = {
+    _OP_COPIED:      ('копирование',  'откуда он скопирован'),
+    _OP_EXTRACTED:   ('распаковка',   'из какого архива распакован'),
+    _OP_SIGNED:      ('подпись',      'какой файл был подписан'),
+    _OP_TRANSFORMED: ('правка',       'какой файл был изменён'),
+    _OP_REPACKED:    ('переупаковка', 'из каких файлов упакован'),
+}
+_WHY_NO_INPUTS = ('Команда, создавшая файл ({op}), не читала ничего, кроме '
+                  'системных файлов, поэтому не видно, какие исходные тексты '
+                  'в него попадают.')
+_WHY_NO_SOURCE = ('Сборка прослежена полностью, но ни один исходный файл не '
+                  'найден ни в src.json изделия, ни на доверенном носителе.')
+_WHY_TYPICAL = ('На носителе нашлись только служебные файлы, которые '
+                'встречаются во многих разных пакетах (лицензии, файлы '
+                'сборки и т. п.), \u2014 по ним нельзя установить источник. '
+                'Необходимо подтвердить происхождение.')
+_WHY_LIMIT = ('ВНИМАНИЕ \u2014 Проверка не завершена: превышен лимит ({n} '
+              'узлов / {m} раундов). Необходимо поднять лимит и повторить '
+              'проверку.')
+
+
+def _why_deriving(op):
+    """Причина для операции, которая только переносит содержимое."""
+    name, what = _WHY_DERIVING.get(op, (op, 'какой файл был её входом'))
+    return ('Файл получен операцией \u00ab{}\u00bb, но в трассе не записано, '
+            '{}. Необходим комментарий о происхождении.'.format(name, what))
+
 _OP_TRANSFORM_TOOLS = frozenset((
     'strip', 'objcopy', 'patchelf', 'chrpath', 'genchecksum',
     'llvm-strip', 'llvm-objcopy', 'ranlib', 'llvm-ranlib',
@@ -3832,8 +3866,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     node_state[h] = 'noprod'
                     for r in unresolved_roots:
                         if r == h:
-                            vd[r] = (ORIGIN_UNRESOLVED,
-                                     'производящая команда в трассе не найдена')
+                            vd[r] = (ORIGIN_UNRESOLVED, _WHY_NO_PRODUCER)
                     continue
 
                 # Шаг цепочки подписываем главным производителем — тем, чьё имя
@@ -4016,6 +4049,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
         g_step  = {}   # узел -> подпись шага
         g_dl    = {}   # узел -> подробность загрузки
         g_dead  = {}   # узел -> почему у него нет входов
+        g_cc    = set()  # узлы, которые читал компилятор (исходные тексты)
         g_seen  = set(d_roots)
         g_front = set(d_roots)
         g_trunc = False
@@ -4032,7 +4066,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
             for h in g_front:
                 plist = producers.get(h)
                 if not plist:
-                    g_dead[h] = 'производящая команда в трассе не найдена'
+                    g_dead[h] = _WHY_NO_PRODUCER
                     continue
                 main = _pick_main_producer(plist, h_to_path.get(h, ''))
                 g_step[h] = '{}({})'.format(main['operation'],
@@ -4046,20 +4080,21 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 for pr in plist:
                     if pr['operation'] in (_OP_COPIED, _OP_DOWNLOADED):
                         continue
+                    is_cc = pr['operation'] == _OP_COMPILED
                     for dp, dh in _deps_of(pr):
-                        if dh and dh != h and dh not in kids:
-                            kids[dh] = dp
+                        if dh and dh != h:
+                            if is_cc:
+                                g_cc.add(dh)
+                            if dh not in kids:
+                                kids[dh] = dp
                 if not kids and h in g_dl:
                     continue
                 if not kids:
                     if main['operation'] in DERIVING_OPERATIONS:
-                        g_dead[h] = ('операция {} только переносит '
-                                     'содержимое, но её вход в трассе '
-                                     'отсутствует'.format(main['operation']))
+                        g_dead[h] = _why_deriving(main['operation'])
                     else:
-                        g_dead[h] = ('у производящей команды ({}) нет '
-                                     'неотфильтрованных входов'.format(
-                                         main['operation']))
+                        g_dead[h] = _WHY_NO_INPUTS.format(
+                            op=main['detail'] or main['operation'])
                     continue
                 g_edges[h] = tuple(kids)
                 for dh, dp in kids.items():
@@ -4098,6 +4133,23 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
         def _specific(x):
             d = pkgs_of.get(x)
             return bool(d) and len(d) == 1
+
+        def _usable(x):
+            """
+            Годится ли файл носителя в опору.
+
+            Правило "один пакет" отсеивает служебные файлы (LICENSE, Makefile,
+            пустые), которые лежат на носителе в сотнях пакетов и ничего не
+            доказывают. Но исходный текст, который ЧИТАЛ КОМПИЛЯТОР, —
+            содержательный вход, и то, что он лежит в нескольких пакетах,
+            его не обесценивает. NPUR.29008-01, libargon2.so.1: все 13
+            совпавших файлов — argon2.c, core.c, blake2b.c и заголовки,
+            прочитанные cc1; на носителе каждый лежит в двух пакетах,
+            argon2 и argon2cffi (обёртка включает исходники argon2).
+            Дополнение к правилу, а не замена: для остальных файлов
+            "один пакет" остаётся.
+            """
+            return _specific(x) or (x in g_cc and bool(pkgs_of.get(x)))
 
         def _root_want(h):
             """(имя, версия) пакета-контейнера записи, если он известен."""
@@ -4164,7 +4216,7 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
         g_reach = {}
         g_near_tr = {}
         for kind_, seeds in (
-                ('tr',  [x for x in g_seen if x in trusted and _specific(x)]),
+                ('tr',  [x for x in g_seen if x in trusted and _usable(x)]),
                 ('src', [x for x in g_seen
                          if x in src_hashes and x not in trusted]),
                 ('dl',  list(g_dl))):
@@ -4211,8 +4263,14 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     if x in g_dl and first_dl is None:
                         first_dl = x
                     in_t = x in trusted
-                    if in_t and _specific(x):
-                        pname = next(iter(pkgs_of[x]))
+                    if in_t and _usable(x):
+                        d_ = pkgs_of[x]
+                        # пакет записи, если он среди пакетов файла, иначе
+                        # пакет с наибольшим числом архивов
+                        pname = next((n for n in sorted(d_)
+                                      if want and _pkg_match(want[0], n)),
+                                     None) or sorted(
+                            d_, key=lambda n: (-len(d_[n]), n))[0]
                         terms.append((x, 'tr', pname))
                         if want and own is None and _pkg_match(want[0], pname):
                             own = x
@@ -4256,20 +4314,17 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
 
             if pick is None:
                 if saw_typical:
-                    why = ('достижимы только типовые файлы, встречающиеся '
-                           'на носителе в разных пакетах')
+                    why = _WHY_TYPICAL
                     stats['только типовые'] += 1
                 elif r in g_dead:
                     why = g_dead[r]
                     stats['нет опоры'] += 1
                 elif g_limited:
-                    why = ('обход остановлен предохранителем (граф больше '
-                           '{} узлов или {} раундов)'.format(
-                               _ORIGIN_DEEP_MAX_NODES, max_rounds))
+                    why = _WHY_LIMIT.format(n=_ORIGIN_DEEP_MAX_NODES,
+                                            m=max_rounds)
                     stats['нет опоры'] += 1
                 else:
-                    why = ('цепочка прослежена до конца, '
-                           'опознанный источник не найден')
+                    why = _WHY_NO_SOURCE
                     stats['нет опоры'] += 1
                 _dset(r, ORIGIN_UNRESOLVED, why)
                 continue
@@ -4321,11 +4376,9 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
     # противоположные утверждения: в первом случае проверка отработала
     # полностью и источник не нашла, во втором ей не дали доработать.
     if frontier:
-        why_rest = ('обход прерван по глубине (израсходован лимит '
-                    '{} раундов)'.format(max_rounds))
+        why_rest = _WHY_LIMIT.format(n=_ORIGIN_DEEP_MAX_NODES, m=max_rounds)
     else:
-        why_rest = ('цепочка прослежена до конца, '
-                    'опознанный источник не найден')
+        why_rest = _WHY_NO_SOURCE
     n_rest = 0
     for h in by_hash:
         if h not in verdict:
@@ -4525,12 +4578,22 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                     _name.get(old[0], old[0]), old[1][:160]))
                 n_cor += 1
                 continue
-            why = ('прежний обход засчитал: {} ({}); проверка до конца по '
-                   'хешу опоры этого вида не нашла — {}: {}'.format(
-                       _name.get(old[0], old[0]), old[1][:120],
-                       _name.get(new[0], new[0]), new[1][:160]))
-            verdict[h] = (ORIGIN_UNRESOLVED, why)
-            check_note[h] = why
+            # В отчёте три строки: причина (что нашла проверка), первое
+            # совпадение (что засчитывал прежний обход) и почему оно не
+            # засчитано. Раньше всё шло одной фразой, и её нельзя было
+            # прочитать без знания устройства анализатора.
+            if new[1] == _WHY_TYPICAL:
+                why_not = ('сборка читала файлы, которые есть в этом '
+                           'архиве, но те же файлы лежат и в других пакетах '
+                           'носителя и не являются исходными текстами, '
+                           'которые читал компилятор, \u2014 по ним нельзя '
+                           'сказать, откуда взяты исходники')
+            else:
+                why_not = ('при полной проверке цепочки сборки по хешам '
+                           'этот файл не нашёлся среди входов сборки')
+            verdict[h] = (ORIGIN_UNRESOLVED, new[1])
+            check_note[h] = ('{} \u2014 {}'.format(_name.get(old[0], old[0]),
+                                                   old[1][:200]), why_not)
             n_chk += 1
         for h, lab in d_label.items():
             old = verdict.get(h)
@@ -4898,8 +4961,10 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 if ch:
                     e['origin_chain'] = ' <- '.join(ch[:6])
                 e_origin = origin
-            if h in check_note:
-                e['origin_check_failed'] = True
+            if h in check_note and e_origin == ORIGIN_UNRESOLVED:
+                e['origin_check_failed']   = True
+                e['origin_check_previous'] = check_note[h][0]
+                e['origin_check_why']      = check_note[h][1]
             if h in corrected and inh is None:
                 e['origin_check_corrected'] = True
                 e['origin_check_previous'] = corrected[h]
@@ -5570,6 +5635,11 @@ def write_origin_txt(output_path, category_label, entries):
             'detail':    (entry.get('origin_detail') or '').replace('\t', ' '),
             'container': entry.get('origin_container', ''),
             'chash':     entry.get('origin_container_hash', ''),
+            # проверка не прошла: что засчитывал прежний обход и почему нет
+            'prev':      (entry.get('origin_check_previous') or '')
+                         if entry.get('origin_check_failed') else '',
+            'why_not':   (entry.get('origin_check_why') or '')
+                         if entry.get('origin_check_failed') else '',
         })
     rows.sort(key=lambda r: r['path'])
 
@@ -5601,18 +5671,20 @@ def write_origin_txt(output_path, category_label, entries):
                 r['head'], r['inner'] = '', r['path']
             g = grouped.setdefault(r['chash'] or c,
                                    {'detail': r['detail'], 'rows': [],
-                                    'names': {}})
+                                    'names': {}, 'prev': r['prev'],
+                                    'why_not': r['why_not']})
             g['rows'].append(r)
             g['names'][c] = g['names'].get(c, 0) + 1
             continue
         arc = _nearest_archive(r['path'])
         if arc:
             a_path, inner = arc
-            key = ('АРХИВ', a_path.rsplit('/', 1)[-1], r['detail'])
+            key = ('АРХИВ', a_path.rsplit('/', 1)[-1], r['detail'],
+                   r['prev'], r['why_not'])
             line = '{} \u2192 {}'.format(a_path, inner)
         else:
             d, b = os.path.split(r['path'])
-            key = ('КАТАЛОГ', d, r['detail'])
+            key = ('КАТАЛОГ', d, r['detail'], r['prev'], r['why_not'])
             line = b
         other.setdefault(key, []).append((line, r['hash']))
     # Крупные группы первыми
@@ -5633,7 +5705,27 @@ def write_origin_txt(output_path, category_label, entries):
     style = _ORIGIN_REPORT_STYLE.get(category_label, _ORIGIN_STYLE_DEFAULT)
     W = 22   # ширина метки, одинаковая во всех отчётах
 
-    def _write_block(f, kind, title, n_files, d, n_rows=None, extra=None):
+    def _write_field(f, label, value):
+        # Длинное значение переносим с отступом под значение, иначе строка
+        # уходит за 100 символов. Продолжение — без повторного двоеточия,
+        # иначе читается как ещё одно поле.
+        chunks, line = [], ''
+        for w in value.split():
+            if line and len(line) + 1 + len(w) > 48:
+                chunks.append(line)
+                line = w
+            else:
+                line = (line + ' ' + w) if line else w
+        if line:
+            chunks.append(line)
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                f.write("  {} : {}\n".format(label.ljust(W), chunk))
+            else:
+                f.write("  {}   {}\n".format(' ' * W, chunk))
+
+    def _write_block(f, kind, title, n_files, d, n_rows=None, extra=None,
+                     prev='', why_not=''):
         f.write("\n")
         f.write("=" * 74 + "\n")
         f.write("{}: {}\n".format(kind, title))
@@ -5673,6 +5765,10 @@ def write_origin_txt(output_path, category_label, entries):
                     # продолжение — без повторного двоеточия,
                     # иначе читается как ещё одно поле
                     f.write("  {}   {}\n".format(' ' * W, chunk))
+        if prev:
+            _write_field(f, 'найдено', prev)
+        if why_not:
+            _write_field(f, 'почему не засчитано', why_not)
         f.write("-" * 74 + "\n")
 
     with open(versioned_path, 'w', encoding='utf-8') as f:
@@ -5739,7 +5835,7 @@ def write_origin_txt(output_path, category_label, entries):
                 extra.append(('копий пакета', str(len(g['copies']))))
             _write_block(f, 'ПАКЕТ', title,
                          len({x['hash'] for x in g['rows']}), g['detail'],
-                         len(g['rows']), extra)
+                         len(g['rows']), extra, g['prev'], g['why_not'])
             # Одна копия пакета — строка = путь внутри пакета, как раньше.
             # Несколько копий — строка = путь до пакета -> путь внутри,
             # чтобы было видно, в какой копии лежит файл.
@@ -5754,9 +5850,9 @@ def write_origin_txt(output_path, category_label, entries):
                     line = r['inner']
                 f.write("\t{}\t{}\n".format(line, r['hash']))
 
-        for (kind, title, d), lst in order_other:
+        for (kind, title, d, prev, why_not), lst in order_other:
             _write_block(f, kind, title, len({h for _l, h in lst}), d,
-                         len(lst))
+                         len(lst), None, prev, why_not)
             for line, h in lst:
                 f.write("\t{}\t{}\n".format(line, h))
 
@@ -6808,9 +6904,14 @@ def process_project(project_name, compiler_basenames, linker_basenames, interpre
             "Файлы дистрибутива, для которых обратный обход по трассе сборки не привёл\n"
             "  ни к исходным текстам изделия, ни к согласованным носителям, ни к\n"
             "  сетевой загрузке.\n"
-            "  Причина указана в поле origin_detail: цепочка прослежена до конца и\n"
-            "  опознанный источник не найден; у производящей команды нет\n"
-            "  прослеживаемых входов; обход упёрся в предел глубины.\n"
+            "  Причина указана в поле origin_detail: файла нет в трассе; файл\n"
+            "  получен копированием/распаковкой/подписью, но вход операции не\n"
+            "  записан; команда не читала ничего, кроме системных файлов; сборка\n"
+            "  прослежена полностью, но источник не найден; исходные файлы есть\n"
+            "  на носителе в нескольких разных пакетах; проверка не завершена\n"
+            "  (превышен лимит). Если совпадение с носителем было найдено, но\n"
+            "  проверку не прошло, в отчёте добавлены строки «первое совпадение»\n"
+            "  и «почему не засчитано».\n"
             "  В поле origin_chain — последовательность операций от файла назад,\n"
             "  например: signed(bsign) <- compiled(ld) <- compiled(as).\n"
             "  Проверка выполняется для ВСЕХ бинарей дистрибутива. Файлы, чьё\n"
