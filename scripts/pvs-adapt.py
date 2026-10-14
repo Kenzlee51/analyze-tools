@@ -28,7 +28,7 @@ LOGS_DIR = ROOT_DIR / "logs"
 WORK_TMP = LIB_ADAPT_PVS / "work-tmp"
 
 PVS_LIC = LIB_ADAPT_PVS / "pvs.lic"
-DEFAULT_FORMAT = "html"
+DEFAULT_FORMAT = "csv"
 
 def save_paths_to_script(pvs_analyzer_path, plog_converter_path):
     script_path = Path(__file__).resolve()
@@ -140,10 +140,14 @@ def find_projects(unpacked_dir):
             projects.append(item.name)
     return projects
 
-def prepare_workdir(project_src_path):
-    if WORK_TMP.exists():
-        shutil.rmtree(str(WORK_TMP))
-    WORK_TMP.mkdir(parents=True, exist_ok=True)
+def project_workdir(proj_name):
+    """Своя рабочая папка на каждый проект: work-tmp/<project>."""
+    return WORK_TMP / proj_name
+
+def prepare_workdir(project_src_path, proj_name):
+    work_dir = project_workdir(proj_name)
+    cleanup_workdir(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     adapt_src = LIB_ADAPT_PVS / "adapt.py"
     configs_src = LIB_ADAPT_PVS / "configs"
@@ -152,15 +156,23 @@ def prepare_workdir(project_src_path):
     if not configs_src.exists():
         raise FileNotFoundError("Не найден {}".format(configs_src))
 
-    (WORK_TMP / "adapt.py").symlink_to(adapt_src)
-    (WORK_TMP / "configs").symlink_to(configs_src)
-    (WORK_TMP / "src").symlink_to(project_src_path)
+    (work_dir / "adapt.py").symlink_to(adapt_src)
+    (work_dir / "configs").symlink_to(configs_src)
+    (work_dir / "src").symlink_to(project_src_path)
 
-    return WORK_TMP
+    return work_dir
 
-def cleanup_workdir():
-    if WORK_TMP.exists():
-        shutil.rmtree(str(WORK_TMP))
+def cleanup_workdir(work_dir):
+    if work_dir.is_symlink() or work_dir.is_file():
+        work_dir.unlink()
+    elif work_dir.is_dir():
+        shutil.rmtree(str(work_dir))
+
+def finish_workdir(work_dir, no_clean):
+    if no_clean:
+        print("[INFO] Временная папка оставлена: {} (ключ --no-clean)".format(work_dir))
+    else:
+        cleanup_workdir(work_dir)
 
 def main():
     parser = argparse.ArgumentParser(description="Обёртка для анализа проектов с помощью PVS-Studio.")
@@ -170,7 +182,8 @@ def main():
                         help="Дополнительные аргументы для plog-converter (например, '-a GA:1,2')")
     parser.add_argument("--only", nargs="+", help="Анализировать только указанные проекты (имена папок)")
     parser.add_argument("--no-clean", action="store_true",
-                        help="Не удалять временную папку после завершения (для отладки)")
+                        help="Не удалять временные папки проектов work-tmp/<project> "
+                             "(для отладки; сохраняются и успешные, и упавшие проекты)")
     args = parser.parse_args()
 
     if not PVS_LIC.exists():
@@ -213,8 +226,9 @@ def main():
 
         log_file = log_dir / "{}.log".format(proj_name)
 
+        work_dir = project_workdir(proj_name)
         try:
-            work_dir = prepare_workdir(proj_src)
+            work_dir = prepare_workdir(proj_src, proj_name)
         except Exception as e:
             print("[ERROR] Не удалось подготовить рабочую директорию: {}".format(e))
             failed.append(proj_name)
@@ -227,7 +241,7 @@ def main():
         if ret[0] != 0:
             print("[ERROR] adapt.py завершился с ошибкой (код {}) для {}".format(ret[0], proj_name))
             failed.append(proj_name)
-            cleanup_workdir()
+            finish_workdir(work_dir, args.no_clean)
             continue
 
         # pvs-studio-analyzer
@@ -244,7 +258,7 @@ def main():
         if ret[0] != 0:
             print("[ERROR] pvs-studio-analyzer завершился с ошибкой (код {}) для {}".format(ret[0], proj_name))
             failed.append(proj_name)
-            cleanup_workdir()
+            finish_workdir(work_dir, args.no_clean)
             continue
 
         # plog-converter
@@ -268,16 +282,13 @@ def main():
         if ret[0] != 0:
             print("[ERROR] plog-converter завершился с ошибкой (код {}) для {}".format(ret[0], proj_name))
             failed.append(proj_name)
-            cleanup_workdir()
+            finish_workdir(work_dir, args.no_clean)
             continue
 
         print("[SUCCESS] Проект {} обработан успешно. Отчёт сохранён в {}".format(proj_name, report_path))
         success.append(proj_name)
 
-        if not args.no_clean:
-            cleanup_workdir()
-        else:
-            print("[INFO] Временная папка оставлена: {} (ключ --no-clean)".format(WORK_TMP))
+        finish_workdir(work_dir, args.no_clean)
 
     print("\n" + "="*60)
     print("СВОДКА:")
