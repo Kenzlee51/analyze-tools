@@ -1032,6 +1032,69 @@ ask_repack() {
     [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
 }
 
+# Копирует дерево в цель так, чтобы результатом ВСЕГДА было содержимое
+# src непосредственно в dst.
+#
+# ВАЖНО: `cp -a SRC DST` ведёт себя по-разному в зависимости от того,
+# существует ли DST. Если не существует — создаётся DST как копия SRC
+# (то, что нужно). Если существует — SRC кладётся ВНУТРЬ него, и получается
+# DST/<basename SRC>/..., то есть unpacked/PROJ/bin/bin/*.
+#
+# Полагаться на то, что DST не существует, нельзя: каталог мог остаться
+# от прерванного или предыдущего запуска ПУСТЫМ. Пустой каталог не ловится
+# проверкой count_files_in_dir (она вернёт 0), поэтому вопрос о
+# перераспаковке не задаётся и rm -rf не выполняется — а cp при этом уже
+# видит существующую цель. Именно так и появлялся лишний уровень bin/bin.
+#
+# Решение — не угадывать состояние цели, а задать инвариант явно:
+# перед каждым cp цели гарантированно не существует. Это даёт одинаковое
+# поведение при любом состоянии unpacked/ и не зависит от наличия `cp -T`
+# (GNU-расширение, отсутствует в BSD/macOS coreutils).
+copy_tree() {
+    local src="$1"
+    local dst="$2"
+    rm -rf "$dst"
+    mkdir -p "$(dirname "$dst")"
+    cp -a "$src" "$dst"
+}
+
+# Решает, нужно ли (пере)распаковывать подкаталог unpacked/PROJ/<sub>.
+# 0 — распаковывать, 1 — пропустить.
+#
+# Пустой каталог намеренно считается поводом распаковать, а не пропустить:
+# пустышка — это след прерванного запуска, спрашивать о ней нечего,
+# copy_tree её затрёт.
+should_unpack_subdir() {
+    local dir="$1"
+    local label="$2"
+    local log_path="$3"
+    local count
+    count=$(count_files_in_dir "$dir")
+
+    if (( count == 0 )); then
+        if [[ -d "$dir" ]]; then
+            log_to_file "$log_path" "[INFO] $label существует, но пуст — распаковываем заново"
+        fi
+        return 0
+    fi
+
+    if ask_repack "$label" "$count"; then
+        log_to_file "$log_path" "[INFO] Перераспаковываем $label"
+        return 0
+    fi
+
+    if [[ -t 0 ]]; then
+        log_to_file "$log_path" "[INFO] Пропускаем $label (уже распакован)"
+    else
+        # Неинтерактивный запуск (nohup, пайп, cron): ask_repack отвечает
+        # "n", не задавая вопроса. Логируем это отдельной формулировкой,
+        # иначе в логе не отличить осознанный отказ пользователя от
+        # молчаливого пропуска, которого никто не видел.
+        log_to_file "$log_path" "[INFO] Пропускаем $label: уже распакован, stdin не терминал (вопрос не задавался)"
+    fi
+    return 1
+}
+
 # =============================================================================
 # ОСНОВНАЯ ФУНКЦИЯ ОБРАБОТКИ ПРОЕКТА
 # =============================================================================
@@ -1057,29 +1120,8 @@ process_project() {
     local src_unpacked="$unpack_dir/src"
     local bin_unpacked="$unpack_dir/bin"
 
-    local src_count bin_count
-    src_count=$(count_files_in_dir "$src_unpacked")
-    bin_count=$(count_files_in_dir "$bin_unpacked")
-
-    if (( src_count > 0 )); then
-        if ask_repack "unpacked/$project_name/src" "$src_count"; then
-            log_to_file "$log_path" "[INFO] Перераспаковываем src/"
-            rm -rf "$src_unpacked"
-        else
-            log_to_file "$log_path" "[INFO] Пропускаем src/ (уже распакован)"
-            do_src=false
-        fi
-    fi
-
-    if (( bin_count > 0 )); then
-        if ask_repack "unpacked/$project_name/bin" "$bin_count"; then
-            log_to_file "$log_path" "[INFO] Перераспаковываем bin/"
-            rm -rf "$bin_unpacked"
-        else
-            log_to_file "$log_path" "[INFO] Пропускаем bin/ (уже распакован)"
-            do_bin=false
-        fi
-    fi
+    should_unpack_subdir "$src_unpacked" "unpacked/$project_name/src" "$log_path" || do_src=false
+    should_unpack_subdir "$bin_unpacked" "unpacked/$project_name/bin" "$log_path" || do_bin=false
 
     if [[ "$do_src" == false && "$do_bin" == false ]]; then
         log_to_file "$log_path" "[INFO] Ничего не распаковывается — оба каталога уже есть."
@@ -1092,16 +1134,15 @@ process_project() {
     mkdir -p "$unpack_dir"
     if [[ "$do_src" == true && -d "$project/src" ]]; then
         log_to_file "$log_path" "[INFO] Copying $project/src -> $src_unpacked"
-        cp -a "$project/src" "$src_unpacked"
+        copy_tree "$project/src" "$src_unpacked"
     fi
     if [[ "$do_bin" == true && -d "$project/bin" ]]; then
         log_to_file "$log_path" "[INFO] Copying $project/bin -> $bin_unpacked"
-        cp -a "$project/bin" "$bin_unpacked"
+        copy_tree "$project/bin" "$bin_unpacked"
     fi
     if [[ ! -d "$project/src" && ! -d "$project/bin" ]]; then
         log_to_file "$log_path" "[INFO] Copying $project -> $unpack_dir (no src/bin split)"
-        rm -rf "$unpack_dir"
-        cp -a "$project" "$unpack_dir"
+        copy_tree "$project" "$unpack_dir"
     fi
 
     log_to_file "$log_path" "[TIME] cp -a: $(format_duration $(( $(now_ns) - t0 )))"
