@@ -3951,11 +3951,10 @@ def resolve_origins(entries, src_hashes, trusted, buildography_files,
                 if not all_deps:
                     node_state[h] = 'dead'
                     if main['operation'] in DERIVING_OPERATIONS:
-                        why = ('операция {} только переносит содержимое, но её '
-                               'вход в трассе отсутствует'.format(main['operation']))
+                        why = _why_deriving(main['operation'])
                     else:
-                        why = ('у производящей команды ({}) нет неотфильтрованных '
-                               'входов'.format(main['operation']))
+                        why = _WHY_NO_INPUTS.format(
+                            op=main['detail'] or main['operation'])
                     for r in unresolved_roots:
                         vd[r] = (ORIGIN_UNRESOLVED, why)
                     continue
@@ -5681,12 +5680,12 @@ def write_origin_txt(output_path, category_label, entries):
             a_path, inner = arc
             key = ('АРХИВ', a_path.rsplit('/', 1)[-1], r['detail'],
                    r['prev'], r['why_not'])
-            line = '{} \u2192 {}'.format(a_path, inner)
         else:
             d, b = os.path.split(r['path'])
             key = ('КАТАЛОГ', d, r['detail'], r['prev'], r['why_not'])
-            line = b
-        other.setdefault(key, []).append((line, r['hash']))
+        # В строке — всегда полный путь (решение 2026-10-15: относительные
+        # пути, вынесенный в шапку префикс и стрелки путали читателя).
+        other.setdefault(key, []).append((r['path'], r['hash']))
     # Крупные группы первыми
     for g in grouped.values():
         # Заголовок — самое частое имя (при равенстве — длинное: полное имя
@@ -5802,28 +5801,14 @@ def write_origin_txt(output_path, category_label, entries):
                 f.write("# Файлы вне пакетов сгруппированы по архиву или "
                         "каталогу, в котором находятся.\n")
 
-        if order:
-            # Префикс считаем по части пути ДО имени пакета
-            heads = []
-            for _k, g in order:
-                for r in g['rows']:
-                    # без завершающего слэша: его добавит _common_dir_prefix
-                    heads.append(r['head'] or r['path'])
-            prefix = _common_dir_prefix(heads)
-            if prefix:
-                f.write("#\n")
-                f.write("# Пути пакетов ниже — относительно\n" if other else
-                        "# Все пути ниже — относительно\n")
-                f.write("#   {}\n".format(prefix))
         if rows:
             f.write("#\n")
-            f.write("# Формат строки данных: <TAB>путь-внутри-группы"
-                    "<TAB>хеш\n")
-
-        def _rel(p):
-            if prefix and (p + '/') == prefix:
-                return ''
-            return p[len(prefix):] if prefix and p.startswith(prefix) else p
+            # Архив или пакет в пути — как каталог: .../x.tgz/usr/bin/f.
+            # Раньше между путём до архива и путём внутри стояла стрелка,
+            # она ничего не добавляла и только отличала вид от bin.json.
+            f.write("# Формат строки данных: <TAB>полный путь<TAB>хеш\n")
+            f.write("# Архив или пакет в пути записан как каталог: "
+                    ".../архив.tgz/путь/внутри\n")
 
         for _k, g in order:
             title = g['title']
@@ -5836,19 +5821,12 @@ def write_origin_txt(output_path, category_label, entries):
             _write_block(f, 'ПАКЕТ', title,
                          len({x['hash'] for x in g['rows']}), g['detail'],
                          len(g['rows']), extra, g['prev'], g['why_not'])
-            # Одна копия пакета — строка = путь внутри пакета, как раньше.
-            # Несколько копий — строка = путь до пакета -> путь внутри,
-            # чтобы было видно, в какой копии лежит файл.
+            # Полный путь в каждой строке. Копии одного файла в разных
+            # копиях пакета стоят рядом (сортировка по пути внутри пакета).
             rws = sorted(g['rows'], key=lambda x: (x['inner'], x['head'],
                                                     x['container']))
             for r in rws:
-                if multi and r['head']:
-                    loc = '/'.join(x for x in (_rel(r['head']),
-                                               r['container']) if x)
-                    line = '{} \u2192 {}'.format(loc, r['inner'])
-                else:
-                    line = r['inner']
-                f.write("\t{}\t{}\n".format(line, r['hash']))
+                f.write("\t{}\t{}\n".format(r['path'], r['hash']))
 
         for (kind, title, d, prev, why_not), lst in order_other:
             _write_block(f, kind, title, len({h for _l, h in lst}), d,
