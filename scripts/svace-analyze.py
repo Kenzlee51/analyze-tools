@@ -30,8 +30,17 @@ svace-analyze.py — Анализ проектов через Svace
         identifier [src]: No project at path .../dirs/src
 
     Шаблон идентификатора задаётся REMOTE_PATH_TEMPLATE и поддерживает
-    подстановки {project} и {mode} (например, '{project}' или
-    '{project}_{mode}').
+    подстановки {project} (RTPG.34369-01), {project_us} (RTPG_34369-01),
+    {mode} (OB), {mode_lc} (ob) и {rand} (случайный хвост, свой на каждый
+    прогон каждого режима). По умолчанию "{project_us}_{mode_lc}_{rand}",
+    то есть RTPG_34369-01_ob_4f1c8a.
+
+    Случайный хвост гарантирует, что прогон не попадёт в уже существующий
+    каталог: после аварийного завершения анализа каталог на сервере может
+    остаться. Отсутствующий каталог сервер создаёт сам, поэтому готовить
+    его заранее не нужно. Фактический каталог печатается перед запуском и
+    пишется в лог проекта. Чтобы переиспользовать один каталог, уберите
+    {rand} из шаблона (например, --remote-path "{project_us}_{mode_lc}").
 
     -n NAME — имя, с которым связываются файлы результатов (<NAME>.svres и
     прочие). По умолчанию svace берёт имя папки, содержащей .svace-dir, то
@@ -72,8 +81,11 @@ svace-analyze.py — Анализ проектов через Svace
     --remote-login NAME   Логин удалённого анализа    ($SVACE_REMOTE_LOGIN)
     --remote-password PW  Пароль удалённого анализа   ($SVACE_REMOTE_PASSWORD)
     --remote-path ID      Каталог проекта на сервере анализа: готовый
-                          идентификатор либо шаблон с {project} и {mode}
-                          ($SVACE_REMOTE_PATH, по умолчанию "{project}")
+                          идентификатор либо шаблон с подстановками
+                          {project}, {project_us}, {mode}, {mode_lc}, {rand}
+                          ($SVACE_REMOTE_PATH, по умолчанию
+                          "{project_us}_{mode_lc}_{rand}"
+                          -> RTPG_34369-01_ob_4f1c8a)
     --svace-bin PATH      Путь/имя исполняемого файла svace
                           (по умолчанию: переменная окружения SVACE_BIN,
                           иначе системный "svace" из PATH)
@@ -89,7 +101,7 @@ svace-analyze.py — Анализ проектов через Svace
     python3 svace-analyze.py --only-js --svace-bin /opt/svace/bin/svace
     python3 svace-analyze.py --local
     python3 svace-analyze.py --remote-host 192.168.25.183 --remote-port 55135
-    python3 svace-analyze.py --remote-path '{project}_{mode}'
+    python3 svace-analyze.py --remote-path '{project_us}_{mode_lc}'
     python3 svace-analyze.py --project RTPG.34369-01 --remote-path RTPG.34369-01
 
 ОЖИДАЕМАЯ СТРУКТУРА (скрипт лежит в scripts/):
@@ -120,6 +132,7 @@ svace-analyze.py — Анализ проектов через Svace
 
 import os
 import sys
+import uuid
 import shutil
 import argparse
 import subprocess
@@ -146,7 +159,16 @@ REMOTE_PASSWORD = os.environ.get("SVACE_REMOTE_PASSWORD", "12345678")
 
 # Каталог проекта на сервере анализа (svace remote --path).
 # Поддерживает подстановки {project} и {mode}; можно указать и абсолютный путь.
-REMOTE_PATH_TEMPLATE = os.environ.get("SVACE_REMOTE_PATH", "{project}")
+# Подстановки: {project} — имя изделия как есть (RTPG.34369-01),
+#              {project_us} — точки заменены на подчёркивания (RTPG_34369-01),
+#              {mode} — OB/PY/JS, {mode_lc} — ob/py/js,
+#              {rand} — случайный хвост (RAND_SUFFIX_LEN hex-символов), свой
+#                       на каждый прогон каждого режима.
+# Каталог, которого на сервере ещё нет, создаётся сервером автоматически.
+# Случайный хвост нужен, чтобы прогон никогда не попал в чужой каталог:
+# после аварийного завершения анализа каталог на сервере может остаться.
+REMOTE_PATH_TEMPLATE = os.environ.get("SVACE_REMOTE_PATH", "{project_us}_{mode_lc}_{rand}")
+RAND_SUFFIX_LEN = 6
 
 # Расширения файлов для автоопределения языка проекта
 PYTHON_EXTENSIONS = ('.py', '.pyw')
@@ -311,25 +333,37 @@ def skip_reason(mode):
 # =============================================================================
 # КОМАНДА АНАЛИЗА (локальная или удалённая)
 # =============================================================================
-def remote_project_path(template, project_name, mode):
+def random_suffix(length=None):
+    """Случайный hex-хвост для имени каталога на сервере анализа."""
+    n = RAND_SUFFIX_LEN if length is None else length
+    return uuid.uuid4().hex[:max(1, n)]
+
+
+def remote_project_path(template, project_name, mode, rand=None):
     """Идентификатор каталога проекта на сервере анализа (svace remote --path)."""
     try:
-        return template.format(project=project_name, mode=mode)
+        return template.format(project=project_name,
+                               project_us=project_name.replace('.', '_'),
+                               mode=mode, mode_lc=mode.lower(),
+                               rand=rand if rand is not None else random_suffix())
     except (KeyError, IndexError) as e:
-        raise ValueError("недопустимый шаблон --remote-path {!r}: {} "
-                         "(допустимы только {{project}} и {{mode}})".format(template, e))
+        raise ValueError("недопустимый шаблон --remote-path {!r}: {} (допустимы "
+                         "{{project}}, {{project_us}}, {{mode}}, {{mode_lc}}, "
+                         "{{rand}})".format(template, e))
 
 
-def build_analyze_cmd(svace_bin, svace_dir, remote, project_name, mode):
+def build_analyze_cmd(svace_bin, svace_dir, remote, project_name, mode, remote_path=None):
     """remote = None -> локальный анализ, иначе dict с параметрами сервера."""
     if remote is None:
         return [svace_bin, 'analyze', '--svace-dir', svace_dir]
+    if remote_path is None:
+        remote_path = remote_project_path(remote['path'], project_name, mode)
     return [svace_bin, 'remote',
             '--host', str(remote['host']),
             '--port', str(remote['port']),
             '--login', str(remote['login']),
             '--password', str(remote['password']),
-            '--path', remote_project_path(remote['path'], project_name, mode),
+            '--path', remote_path,
             'analyze', '--svace-dir', svace_dir,
             '-n', project_name]
 
@@ -399,22 +433,26 @@ def process_project(project_name, mode, svace_bin, available_languages, remote):
     # 3. svace analyze (локально или удалённо)
     step_name = "svace analyze" if remote is None else "svace remote analyze"
     secrets = () if remote is None else (remote['password'],)
+    remote_path = None
     try:
-        analyze_cmd = build_analyze_cmd(svace_bin, svace_dir, remote, project_name, mode)
+        if remote is not None:
+            remote_path = remote_project_path(remote['path'], project_name, mode)
+        analyze_cmd = build_analyze_cmd(svace_bin, svace_dir, remote, project_name, mode, remote_path)
     except ValueError as e:
         log.error("{}: {}".format(step_name, e))
         log.end_run("FAILED ({})".format(step_name))
         return "failed"
-    if remote is not None:
-        log.info("Каталог проекта на сервере анализа: {}".format(
-            remote_project_path(remote['path'], project_name, mode)))
+    if remote_path is not None:
+        log.info("Каталог проекта на сервере анализа: {}".format(remote_path))
     ok, out = run_cmd(analyze_cmd, src_dir, log, step_name, secrets)
     if not ok:
         if 'No project at path' in out or 'given identifier' in out:
-            hint = ("На сервере анализа нет каталога проекта. Создайте его на {} "
-                    "(каталог проектов сервера, см. путь в сообщении выше) или укажите "
-                    "существующий через --remote-path / SVACE_REMOTE_PATH."
-                    .format(remote['host'] if remote else '?'))
+            hint = ("Сервер анализа {} не смог открыть каталог проекта {!r}. "
+                    "Обычно отсутствующий каталог создаётся сервером автоматически; "
+                    "проверьте шаблон --remote-path / SVACE_REMOTE_PATH и права "
+                    "пользователя {!r}.".format(remote['host'] if remote else '?',
+                                                remote_path,
+                                                remote['login'] if remote else '?'))
             log.error(hint)
         log.end_run("FAILED ({})".format(step_name))
         return "failed"
@@ -476,9 +514,9 @@ def main():
     parser.add_argument('--remote-password', metavar='PW', default=REMOTE_PASSWORD,
                         help='Пароль удалённого анализа')
     parser.add_argument('--remote-path', metavar='ID', default=REMOTE_PATH_TEMPLATE,
-                        help='Каталог проекта на сервере анализа: идентификатор или '
-                             'шаблон с {{project}} и {{mode}} (по умолчанию: {})'.format(
-                                 REMOTE_PATH_TEMPLATE))
+                        help='Каталог проекта на сервере анализа: идентификатор или шаблон '
+                             'с {{project}}, {{project_us}}, {{mode}}, {{mode_lc}}, {{rand}} '
+                             '(по умолчанию: {})'.format(REMOTE_PATH_TEMPLATE))
 
     parser.add_argument('--svace-bin', metavar='PATH', default=DEFAULT_SVACE_BIN,
                         help='Путь/имя исполняемого файла svace '
