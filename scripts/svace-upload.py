@@ -33,14 +33,18 @@ svace-upload.py — Выгрузка результатов Svace (OB) в Svacer
         src_py_gost12_256, src_py_md5, src_js_gost12_256, src_js_md5, dedup_mode
     Хэш дерева: строки "<хэш файла>  <отн. путь>\\n", отсортированные по байтам
     пути, хэшированные тем же алгоритмом.
+    Пути срабатываний приводятся к относительным: префикс для снапшота с
+    сервера выбирается из каталога исходников (projectSrcDir локального .svres,
+    unpacked/PROJ/src) и поля "Current directory" — тот из них, который реально
+    является префиксом путей. Поле "Current directory" само по себе не годится:
+    при удалённом анализе (svace remote) в нём стоит каталог сервера анализа.
+
     Если у ob_vN хэшей нет (выгружен ранее), исходники проверяются по .snap
     (svacer server export): множество md5 файлов снапшота против файлов src.
     Если проверить нельзя — сравнение только по срабатываниям с [WARN].
 
-    Разметку разработчика в новый PROJ_ob_v(N+1) переносит ресивер, строго
-    последовательно: сначала PROJ_ob_vN_rc (приоритет), затем
-    PROJ_<Этап>_ob_vN_rc всех этапов по имени. Скрипт выводит этот порядок
-    в лог, чтобы его можно было сверить с логом ресивера.
+    Разметка из PROJ_<Этап>_ob_vN_rc ресивером в PROJ_ob_v(N+1) не переносится
+    (ресивер ищет PROJ_ob_vN_rc) — в этом случае выводится [WARN].
 
     При старте выполняется самопроверка алгоритмов на эталонном файле
     test/ensure-natural-number-value.js. ГОСТ считается через rhash
@@ -486,6 +490,25 @@ def load_svres(path):
     return keys, src
 
 
+def pick_path_prefix(candidates, paths, sample=300):
+    """
+    Выбирает из candidates тот каталог, который действительно является префиксом
+    путей срабатываний. Нужен потому, что поле "Current directory" в
+    analysis-info указывает на каталог анализатора: при удалённом анализе
+    (svace remote) это каталог сервера анализа, а не исходники проекта.
+    Если ни один кандидат не подходит, префикс не отрезается.
+    """
+    best, best_hits = '', 0
+    for cand in candidates:
+        if not cand:
+            continue
+        prefix = cand.rstrip('/') + '/'
+        hits = sum(1 for p in paths[:sample] if p and p.startswith(prefix))
+        if hits > best_hits:
+            best, best_hits = cand, hits
+    return best
+
+
 def markers_to_keys(markers, src):
     keys = Counter()
     for m in markers:
@@ -615,17 +638,6 @@ def is_counted(snap):
 
 def snapshot_name(product, n):
     return "{}_{}_v{}".format(product, TRACK, n)
-
-
-def receiver_sources(snaps, n):
-    """
-    Снапшоты, из которых ресивер перенесёт разметку в PROJ_ob_vN, в порядке
-    применения: PROJ_ob_v(N-1)_rc, затем PROJ_<Этап>_ob_v(N-1)_rc по имени.
-    """
-    rc = [s for s in snaps if s['rc'] and s['n'] == n - 1]
-    own = [s['name'] for s in rc if s['stage'] is None]
-    stages = sorted(s['name'] for s in rc if s['stage'] is not None)
-    return own + stages
 
 
 def cf_value(details, name):
@@ -816,8 +828,12 @@ def process_product(product, args, api, hasher, log):
             else:
                 reasons.append("хэши исходников совпадают")
             markers = api.fullmarkers(project_id, branch_id, snap['id'])
-            srv_keys = markers_to_keys(markers, srv_info.get('Current directory') or lm.src_in_svres)
-            loc_keys = lm.keys()
+            loc_keys = lm.keys()          # заполняет lm.src_in_svres
+            srv_prefix = pick_path_prefix(
+                [lm.src_in_svres, os.path.join(UNPACKED_DIR, product, 'src'),
+                 srv_info.get('Current directory')],
+                [m.get('file') or '' for m in markers])
+            srv_keys = markers_to_keys(markers, srv_prefix)
             if loc_keys != srv_keys:
                 reasons.append("срабатывания отличаются: локально {}, на сервере {}, "
                                "только локально {}, только на сервере {}".format(
@@ -833,10 +849,11 @@ def process_product(product, args, api, hasher, log):
             return finish('FAILED', "ошибка сравнения: {}".format(e))
 
         n = plan['iteration']
-        sources = receiver_sources(snaps, n)
-        if plan['action'] == 'upload' and sources:
-            plan['notes'].append("ресивер перенесёт разметку в {} по порядку: {}".format(
-                snapshot_name(product, n), ' -> '.join(sources)))
+        stage_rc = [s['name'] for s in snaps if s['rc'] and s['stage'] is not None and s['n'] == n - 1]
+        if plan['action'] == 'upload' and stage_rc:
+            warnings.append("разметка из [{}] не будет перенесена ресивером в {} "
+                            "(ресивер ищет {})".format(', '.join(stage_rc), snapshot_name(product, n),
+                                                       snapshot_name(product, n - 1) + "_rc"))
         for w in warnings:
             log.warn(w)
         for note in plan['notes']:
