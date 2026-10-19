@@ -10,7 +10,8 @@ svace-analyze.py — Анализ проектов через Svace
 
         svace init  <svace_dir>
         svace build --svace-dir <svace_dir> [--python SRC] [--javascript SRC]
-        svace remote --host H --port P --login L --password P analyze --svace-dir <svace_dir>
+        svace remote --host H --port P --login L --password P --path ID \
+              analyze --svace-dir <svace_dir> -n NAME
 
     По умолчанию этап анализа выполняется УДАЛЁННО на сервере Svace
     (параметры REMOTE_* в начале скрипта). С флагом --local анализ
@@ -19,6 +20,23 @@ svace-analyze.py — Анализ проектов через Svace
         svace analyze --svace-dir <svace_dir>
 
     Этапы init и build всегда локальные.
+
+    --path ID — каталог проекта на сервере анализа. Относительное значение
+    сервер разворачивает в свой каталог проектов (например, ID 'PROJ' ->
+    /home/user/svace-server/dirs/PROJ). Если --path не передать, svace берёт
+    имя текущей папки (у нас это 'src') и анализ падает с кодом 2:
+
+        Remote server error: Cannot connect to the project with given
+        identifier [src]: No project at path .../dirs/src
+
+    Шаблон идентификатора задаётся REMOTE_PATH_TEMPLATE и поддерживает
+    подстановки {project} и {mode} (например, '{project}' или
+    '{project}_{mode}').
+
+    -n NAME — имя, с которым связываются файлы результатов (<NAME>.svres и
+    прочие). По умолчанию svace берёт имя папки, содержащей .svace-dir, то
+    есть 'OB'/'PY'/'JS'; скрипт передаёт имя изделия, чтобы результаты
+    назывались как раньше.
 
     Каждый режим анализа кладёт результат в свою подпапку:
 
@@ -53,6 +71,9 @@ svace-analyze.py — Анализ проектов через Svace
     --remote-port PORT    Порт удалённого анализа     ($SVACE_REMOTE_PORT)
     --remote-login NAME   Логин удалённого анализа    ($SVACE_REMOTE_LOGIN)
     --remote-password PW  Пароль удалённого анализа   ($SVACE_REMOTE_PASSWORD)
+    --remote-path ID      Каталог проекта на сервере анализа: готовый
+                          идентификатор либо шаблон с {project} и {mode}
+                          ($SVACE_REMOTE_PATH, по умолчанию "{project}")
     --svace-bin PATH      Путь/имя исполняемого файла svace
                           (по умолчанию: переменная окружения SVACE_BIN,
                           иначе системный "svace" из PATH)
@@ -68,6 +89,8 @@ svace-analyze.py — Анализ проектов через Svace
     python3 svace-analyze.py --only-js --svace-bin /opt/svace/bin/svace
     python3 svace-analyze.py --local
     python3 svace-analyze.py --remote-host 192.168.25.183 --remote-port 55135
+    python3 svace-analyze.py --remote-path '{project}_{mode}'
+    python3 svace-analyze.py --project RTPG.34369-01 --remote-path RTPG.34369-01
 
 ОЖИДАЕМАЯ СТРУКТУРА (скрипт лежит в scripts/):
     analyze-tools/
@@ -120,6 +143,10 @@ REMOTE_HOST     = os.environ.get("SVACE_REMOTE_HOST",     "192.168.25.183")
 REMOTE_PORT     = os.environ.get("SVACE_REMOTE_PORT",     "55135")
 REMOTE_LOGIN    = os.environ.get("SVACE_REMOTE_LOGIN",    "main")
 REMOTE_PASSWORD = os.environ.get("SVACE_REMOTE_PASSWORD", "12345678")
+
+# Каталог проекта на сервере анализа (svace remote --path).
+# Поддерживает подстановки {project} и {mode}; можно указать и абсолютный путь.
+REMOTE_PATH_TEMPLATE = os.environ.get("SVACE_REMOTE_PATH", "{project}")
 
 # Расширения файлов для автоопределения языка проекта
 PYTHON_EXTENSIONS = ('.py', '.pyw')
@@ -218,10 +245,10 @@ def run_cmd(cmd, cwd, log, step_name, secrets=()):
     except FileNotFoundError:
         log.error("{}: бинарь не найден: {}".format(step_name, cmd[0]))
         log.raw("Проверьте --svace-bin / переменную окружения SVACE_BIN")
-        return False
+        return False, ""
     except Exception as e:
         log.error("{}: непредвиденная ошибка запуска: {}".format(step_name, e))
-        return False
+        return False, ""
 
     stdout = result.stdout.decode('utf-8', errors='replace')
     stderr = result.stderr.decode('utf-8', errors='replace')
@@ -234,12 +261,13 @@ def run_cmd(cmd, cwd, log, step_name, secrets=()):
         log.raw(mask_secrets(stderr.rstrip(), secrets))
     log.raw("--- код возврата: {} ---".format(result.returncode))
 
+    output = stdout + stderr
     if result.returncode == 0:
         log.info("{}: OK".format(step_name))
-        return True
+        return True, output
     else:
         log.error("{}: завершился с кодом {}".format(step_name, result.returncode))
-        return False
+        return False, output
 
 
 def check_svace_available(svace_bin, log_print=print):
@@ -283,8 +311,17 @@ def skip_reason(mode):
 # =============================================================================
 # КОМАНДА АНАЛИЗА (локальная или удалённая)
 # =============================================================================
-def build_analyze_cmd(svace_bin, svace_dir, remote):
-    """remote = None -> локальный анализ, иначе dict с host/port/login/password."""
+def remote_project_path(template, project_name, mode):
+    """Идентификатор каталога проекта на сервере анализа (svace remote --path)."""
+    try:
+        return template.format(project=project_name, mode=mode)
+    except (KeyError, IndexError) as e:
+        raise ValueError("недопустимый шаблон --remote-path {!r}: {} "
+                         "(допустимы только {{project}} и {{mode}})".format(template, e))
+
+
+def build_analyze_cmd(svace_bin, svace_dir, remote, project_name, mode):
+    """remote = None -> локальный анализ, иначе dict с параметрами сервера."""
     if remote is None:
         return [svace_bin, 'analyze', '--svace-dir', svace_dir]
     return [svace_bin, 'remote',
@@ -292,7 +329,9 @@ def build_analyze_cmd(svace_bin, svace_dir, remote):
             '--port', str(remote['port']),
             '--login', str(remote['login']),
             '--password', str(remote['password']),
-            'analyze', '--svace-dir', svace_dir]
+            '--path', remote_project_path(remote['path'], project_name, mode),
+            'analyze', '--svace-dir', svace_dir,
+            '-n', project_name]
 
 
 # =============================================================================
@@ -340,7 +379,8 @@ def process_project(project_name, mode, svace_bin, available_languages, remote):
         return "failed"
 
     # 1. svace init
-    if not run_cmd([svace_bin, 'init', svace_dir], src_dir, log, "svace init"):
+    ok, _ = run_cmd([svace_bin, 'init', svace_dir], src_dir, log, "svace init")
+    if not ok:
         log.end_run("FAILED (init)")
         return "failed"
 
@@ -351,15 +391,31 @@ def process_project(project_name, mode, svace_bin, available_languages, remote):
     if 'javascript' in languages:
         build_cmd += ['--javascript', src_dir]
 
-    if not run_cmd(build_cmd, src_dir, log, "svace build"):
+    ok, _ = run_cmd(build_cmd, src_dir, log, "svace build")
+    if not ok:
         log.end_run("FAILED (build)")
         return "failed"
 
     # 3. svace analyze (локально или удалённо)
-    analyze_cmd = build_analyze_cmd(svace_bin, svace_dir, remote)
     step_name = "svace analyze" if remote is None else "svace remote analyze"
     secrets = () if remote is None else (remote['password'],)
-    if not run_cmd(analyze_cmd, src_dir, log, step_name, secrets):
+    try:
+        analyze_cmd = build_analyze_cmd(svace_bin, svace_dir, remote, project_name, mode)
+    except ValueError as e:
+        log.error("{}: {}".format(step_name, e))
+        log.end_run("FAILED ({})".format(step_name))
+        return "failed"
+    if remote is not None:
+        log.info("Каталог проекта на сервере анализа: {}".format(
+            remote_project_path(remote['path'], project_name, mode)))
+    ok, out = run_cmd(analyze_cmd, src_dir, log, step_name, secrets)
+    if not ok:
+        if 'No project at path' in out or 'given identifier' in out:
+            hint = ("На сервере анализа нет каталога проекта. Создайте его на {} "
+                    "(каталог проектов сервера, см. путь в сообщении выше) или укажите "
+                    "существующий через --remote-path / SVACE_REMOTE_PATH."
+                    .format(remote['host'] if remote else '?'))
+            log.error(hint)
         log.end_run("FAILED ({})".format(step_name))
         return "failed"
 
@@ -419,6 +475,10 @@ def main():
                         help='Логин удалённого анализа (по умолчанию: {})'.format(REMOTE_LOGIN))
     parser.add_argument('--remote-password', metavar='PW', default=REMOTE_PASSWORD,
                         help='Пароль удалённого анализа')
+    parser.add_argument('--remote-path', metavar='ID', default=REMOTE_PATH_TEMPLATE,
+                        help='Каталог проекта на сервере анализа: идентификатор или '
+                             'шаблон с {{project}} и {{mode}} (по умолчанию: {})'.format(
+                                 REMOTE_PATH_TEMPLATE))
 
     parser.add_argument('--svace-bin', metavar='PATH', default=DEFAULT_SVACE_BIN,
                         help='Путь/имя исполняемого файла svace '
@@ -431,8 +491,10 @@ def main():
         remote = None
     else:
         remote = {'host': args.remote_host, 'port': args.remote_port,
-                  'login': args.remote_login, 'password': args.remote_password}
-        missing = [name for name in ('host', 'port', 'login', 'password') if not remote[name]]
+                  'login': args.remote_login, 'password': args.remote_password,
+                  'path': args.remote_path}
+        missing = [name for name in ('host', 'port', 'login', 'password', 'path')
+                   if not remote[name]]
         if missing:
             print("\u274c Не заданы параметры удалённого анализа: {}".format(', '.join(missing)))
             print("   Укажите --remote-{} или переменные окружения SVACE_REMOTE_*, "
@@ -445,8 +507,8 @@ def main():
     if remote is None:
         print("Анализ   : локальный (svace analyze)")
     else:
-        print("Анализ   : удалённый {}:{} (login {})".format(
-            remote['host'], remote['port'], remote['login']))
+        print("Анализ   : удалённый {}:{} (login {}, path {})".format(
+            remote['host'], remote['port'], remote['login'], remote['path']))
 
     if not check_svace_available(args.svace_bin):
         sys.exit(1)
