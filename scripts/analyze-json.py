@@ -573,6 +573,85 @@ def is_compiled_extension(path):
     return ext in COMPILED_EXTENSIONS
 
 
+# -----------------------------------------------------------------------------
+# Файлы зависимостей сборки (.d от gcc/clang: -MD, -MMD, -MF)
+#
+# Расширение `.d` стоит в SOURCE_EXTENSIONS и COMPILED_EXTENSIONS ради языка D.
+# В C/C++-сборках так же называется файл зависимостей, который пишет компилятор
+# и читает make: «цель.o: исходник.c заголовок.h \». Компилятор такой файл не
+# читает, поэтому он всегда оказывался в compiled_not_copied_to_distr.
+#
+# Различаем по СОДЕРЖИМОМУ (расширение остаётся: исходники на D работают как
+# раньше). Файл ищется в unpacked/<проект>/<subdir>/..., путь из src.json
+# виртуальный: `_dir/` в нём означает каталог распакованного архива. Нет файла
+# на диске, нечитаемый, пустой, формат не make — решение не меняется.
+# -----------------------------------------------------------------------------
+UNPACKED_DIR = os.path.join(BASE_DIR, "unpacked")
+_DEPFILE_HEAD_BYTES = 4096
+# цель(и): зависимости — каждый токен цели с точкой или слэшем (foo.o, obj/foo.o);
+# `import std.stdio : writeln;` и подобное D-код отсекается словом без точки.
+_DEPFILE_FIRST_LINE_RX = re.compile(
+    r'^\s*((?:[^\s:#;{}()"\'\\]+[ \t]+)*[^\s:#;{}()"\'\\]+)[ \t]*:(?!:)[ \t]*(.*)$')
+_depfile_cache = {}
+
+
+def _resolve_unpacked(vpath):
+    """Виртуальный путь из src.json -> реальный файл в unpacked/ или None."""
+    parts = [p for p in str(vpath).replace('\\', '/').split('/') if p]
+    if not parts:
+        return None
+    cur = UNPACKED_DIR
+    last = len(parts) - 1
+    for i, seg in enumerate(parts):
+        nxt = os.path.join(cur, seg)
+        if i == last:
+            return nxt if os.path.isfile(nxt) else None
+        if os.path.isdir(nxt):
+            cur = nxt
+        elif os.path.isdir(nxt + '_dir'):
+            cur = nxt + '_dir'
+        else:
+            return None
+    return None
+
+
+def _looks_like_make_depfile(text):
+    """Первая непустая строка — «цель(и): зависимости» в формате make."""
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = _DEPFILE_FIRST_LINE_RX.match(line)
+        if not m:
+            return False
+        targets = m.group(1).split()
+        if not all(('.' in t) or ('/' in t) for t in targets):
+            return False
+        rest = m.group(2).strip()
+        # зависимости: пусто (-MP-цель), продолжение строки или пути файлов
+        return (rest == '' or rest.endswith('\\') or '.' in rest or '/' in rest)
+    return False
+
+
+def _is_build_depfile(path):
+    """True, если `.d` по содержимому — файл зависимостей make (не исходник D)."""
+    if os.path.splitext(path)[1].lower() != '.d':
+        return False
+    if path in _depfile_cache:
+        return _depfile_cache[path]
+    res = False
+    real = _resolve_unpacked(path)
+    if real:
+        try:
+            with open(real, 'rb') as f:
+                head = f.read(_DEPFILE_HEAD_BYTES)
+            if head and b'\0' not in head:
+                res = _looks_like_make_depfile(head.decode('utf-8', 'replace'))
+        except OSError:
+            res = False
+    _depfile_cache[path] = res
+    return res
+
+
 def is_interpreted_extension(path):
     ext = os.path.splitext(path)[1].lower()
     return ext in INTERPRETED_EXTENSIONS
@@ -1453,8 +1532,21 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys,
             return True
         return False
 
+    depfiles = [0]
+
+    def needs_compiler(entry):
+        # .d с содержимым «цель: зависимости» — файл зависимостей make, а не
+        # исходник D: компилятор его не читает, требовать от него вход нельзя.
+        p = entry.get('path', '')
+        if not is_compiled_extension(p):
+            return False
+        if _is_build_depfile(p):
+            depfiles[0] += 1
+            return False
+        return True
+
     for entry in direct:
-        if is_compiled_extension(entry.get('path', '')):
+        if needs_compiler(entry):
             if not was_compiled(entry):
                 # Файл БЫЛ в buildography (он direct), компилировался,
                 # но результат не попал в дистрибутив → not_compiled.
@@ -1470,7 +1562,7 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys,
         direct_out.append(entry)
 
     for entry in parent:
-        if is_compiled_extension(entry.get('path', '')):
+        if needs_compiler(entry):
             if not was_compiled(entry):
                 # Файл БЫЛ в buildography (он parent), компилировался,
                 # но результат не попал в дистрибутив → not_compiled.
@@ -1488,6 +1580,9 @@ def analyze_pass2(direct, parent, redundant, good_compiler_input_keys,
     print(_ts() + "   Pass 2 done: moved to not_compiled={} (оправдано не "
                   "компиляцией, а дистрибутивом/входом команды: {})".format(
                       moved_count, kept_other[0]))
+    if depfiles[0]:
+        print(_ts() + "   Pass 2: .d распознано как файлы зависимостей make "
+                      "(не исходники, компилятор не требуется): {}".format(depfiles[0]))
     return direct_out, parent_out, redundant, not_compiled
 
 
