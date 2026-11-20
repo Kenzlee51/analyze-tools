@@ -153,17 +153,18 @@ with open('./dyn/data/fo_redundant.js') as file_fo_red:
 
 print("Create file fo_rel.js")                              
 with open('./dyn/data/fo_rel.js') as file_fo_rel:
-	line1 = file_fo_rel.readline()
-	line2 = file_fo_rel.readline()
-	line3 = line1[:-3]+","
-	line4=""
-	line5 = re.findall (regex1, line3) 
+	fo_rel_line = file_fo_rel.readline()
+	fo_rel_tail = file_fo_rel.read()
+	line5 = re.findall(regex1, fo_rel_line)
 
 print("Create result string")                             
+line4 = ""
+redundant_count = 0
 for item in str_fo_red:
 	p = random.randrange(0, 100)
 	if p<int(1) or not line5:   # нет связей для вплетения -> просто в список избыточных
 		str1=str1+"\""+item+"\","
+		redundant_count += 1
 	else:
 		tmpitem = line5 [random.randrange (0,len(line5))]
 		tmpitem1 = line5 [random.randrange (0,len(line5))]
@@ -176,20 +177,24 @@ for item in str_fo_red:
 		else:
 			line4=line4+ "\"" +tmpitem+ "\"" + ":" + "[" + "\"" +item+ "\"" +","+  "\""+ tmpitem1+ "\""+","+"\""+tmpitem2+"\""+"]"+","
 
-line3 = line3+line4[:-1]+"};"
+if line4:
+	rel_prefix, closing_brace, rel_suffix = fo_rel_line.rpartition("}")
+	if not closing_brace:
+		raise ValueError("fo_rel.js: не найдена закрывающая скобка объекта связей")
+	rel_prefix = rel_prefix.rstrip()
+	separator = "" if rel_prefix.endswith(("{", ",")) else ","
+	fo_rel_line = rel_prefix + separator + line4[:-1] + closing_brace + rel_suffix
 if str1 == "akvs_fo_redundant = [":
 	str1 = str1 +"]"
 else:
 	str1 = str1[:-1] + "]"
-numberNotCallFO = str1.split(',')
-#print (str1)
 print("Write result fo_redundant.js")                                     
 with open ('./out/data/fo_redundant.js', "a") as f_redundant :
 	f_redundant.write(str1)	
 print("Write result fo_rel.js")                               
-with open ('./out/data/fo_rel.js', "a") as f_rel :
-	f_rel.write (line3+"\n")
-	f_rel.write (line2)
+with open('./out/data/fo_rel.js', "w") as f_rel:
+	f_rel.write(fo_rel_line)
+	f_rel.write(fo_rel_tail)
 
 print("Create file metrics.js")                               
 with open('./dyn/data/metrics.js') as file_metrics:
@@ -197,26 +202,22 @@ with open('./dyn/data/metrics.js') as file_metrics:
 	with open('./out/data/metrics.js', "a") as f:
 		for item in metrics:
 			if "redundant_count" in item:
-				if numberNotCallFO[0] == "akvs_fo_redundant = []":
-					f.write("akvs_metrics['fo_redundant_count'] = "+ str(len(numberNotCallFO)-1) + ";\n")
-				else:
-					f.write("akvs_metrics['fo_redundant_count'] = " + str(len(numberNotCallFO)) + ";\n")
+				f.write("akvs_metrics['fo_redundant_count'] = " + str(redundant_count) + ";\n")
 			elif "def_count" in item:
 				f.write("akvs_metrics['fo_without_def_count'] = " + str(numberUncertainFO) + ";\n")
 			else:
 				f.write(item + "\n")
 
 print("Create file metrics.json")                                 
-with open('./dyn/data/metrics.json') as file_metrics_j:
-	metrics_j = file_metrics_j.read()
-	c1 = str(len(str_fo_red))
-	if numberNotCallFO[0] == "akvs_fo_redundant = []":
-		c2 = str(len(numberNotCallFO)-1)
-	else:
-		c2 = str(len(numberNotCallFO))
-	with open('./out/data/metrics.json', "a") as f:
-		metrics_j = metrics_j.replace(c1,c2)
-		f.write(metrics_j)
+with open('./dyn/data/metrics.json', encoding="utf-8-sig") as file_metrics_j:
+	metrics_j = json.load(file_metrics_j)
+for key, count in (("fo_redundant_count", redundant_count),
+                   ("fo_without_def_count", numberUncertainFO)):
+	if key in metrics_j:
+		metrics_j[key] = str(count) if isinstance(metrics_j[key], str) else count
+with open('./out/data/metrics.json', "w", encoding="utf-8") as f:
+	json.dump(metrics_j, f, ensure_ascii=False, indent=2)
+	f.write("\n")
 
 print("Copy files")                   
 for root, _, files in os.walk("./out/data"):
