@@ -211,8 +211,10 @@ with open('./dyn/data/metrics.js') as file_metrics:
 print("Create file metrics.json")                                 
 with open('./dyn/data/metrics.json', encoding="utf-8-sig") as file_metrics_j:
 	metrics_j = json.load(file_metrics_j)
+# В JSON АК-ВС встречается foWithoutDefCount (camelCase); зануляем его вместе с JS-отчётом.
 for key, count in (("fo_redundant_count", redundant_count),
-                   ("fo_without_def_count", numberUncertainFO)):
+                   ("fo_without_def_count", numberUncertainFO),
+                   ("foWithoutDefCount", numberUncertainFO)):
 	if key in metrics_j:
 		metrics_j[key] = str(count) if isinstance(metrics_j[key], str) else count
 with open('./out/data/metrics.json', "w", encoding="utf-8") as f:
