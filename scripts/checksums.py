@@ -27,9 +27,9 @@ RESULTS_DIR = os.path.join(BASE_DIR, "results")
 
 PRESET_TOOLS = [
     ("md5sum",   "md5sum"),
-    ("gostsum",  "gostsum"),
+    ("gostsum",  "gostsum 12 256"),
     ("cksum",    "cksum"),
-    ("rhash -G", "rhash -G (ГОСТ)"),
+    ("rhash -G", "rhash -G (ГОСТ-12 256)"),
     ("sha256sum", "sha256sum"),
 ]
 
