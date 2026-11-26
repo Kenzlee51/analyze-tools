@@ -7,7 +7,7 @@ forso-upload.py — Выгрузка комплекта Приложений 1�
 Выгружаются шесть папок Приложений со всем их содержимым.
 
 Приёмник на сетевом диске:
-  <папка изделия>/Отчетность/НДП/Приложения АДЛБ.ХХХ ПНДВ/
+  <папка изделия>/Отчетность/НДВ/Приложения АДЛБ.ХХХ ПНДВ/
 ХХХ всегда берётся из обязательного --adlb. Папка изделия ищется по этому
 номеру на верхнем уровне шары; --dir позволяет выбрать её явно.
 
@@ -47,7 +47,7 @@ PASS       = "komusfanvil"           # пароль                    (--passwo
 MOUNTPOINT = "/mnt/sertifikaciya"    # точка монтирования        (--mountpoint)
 SMB_VERS   = "3.0"                   # версия протокола SMB      (--vers)
 
-REPORT_SUBPATH = ["Отчетность", "НДП"]   # путь внутри папки проекта
+REPORT_SUBPATH = ["Отчетность", "НДВ"]   # путь внутри папки проекта
 HASH_FILE      = "hash.txt"               # карта хэшей внутри папки Приложений
 
 # =============================================================================
@@ -416,7 +416,7 @@ def do_upload(cfg, args):
 
     project_path = os.path.join(mp, project_dir_name)
 
-    # --- 2. Отчетность/НДП/Приложения АДЛБ.ХХХ ПНДВ ---
+    # --- 2. Отчетность/НДВ/Приложения АДЛБ.ХХХ ПНДВ ---
     ndv_path = project_path
     for part in REPORT_SUBPATH:
         ndv_path = os.path.join(ndv_path, part)
@@ -517,7 +517,7 @@ def do_upload(cfg, args):
 def main():
     parser = argparse.ArgumentParser(
         description="Выгрузка комплекта из results/summary/package/PROJ_NAME "
-                    "в Отчетность/НДП/Приложения АДЛБ.ХХХ ПНДВ",
+                    "в Отчетность/НДВ/Приложения АДЛБ.ХХХ ПНДВ",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Подробности см. в шапке файла.",
     )
