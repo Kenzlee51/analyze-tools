@@ -3,8 +3,9 @@
 collect-package.py — Сборка комплекта Приложений 1-6 по каждому проекту.
 
 Источники:
-  Приложение 1 — results/<PROJ>/checksums/<PROJ>_bin_*.txt
-  Приложение 2 — results/<PROJ>/checksums/<PROJ>_src_*.txt
+  Приложение 1 — results/<PROJ>/checksums/bin/<PROJ>_<алгоритм>.txt
+  Приложение 2 — results/<PROJ>/checksums/src/<PROJ>_<алгоритм>.txt
+  (поддерживаются старые файлы checksums/<PROJ>_{bin,src}_*.txt)
   Приложение 3 — results/<PROJ>/akvs/ (или results/summary/akvs/<PROJ>/)
   Приложение 4 — results/<PROJ>/vks/Приложение_4_*.html
   Приложение 5 — results/<PROJ>/vks/Приложение_5_*.html
@@ -54,9 +55,34 @@ def latest_match(pattern):
     return matches[0]
 
 
-def copy_file_to_dir(src_file, dst_dir):
+def copy_file_to_dir(src_file, dst_dir, output_name=None):
     os.makedirs(dst_dir, exist_ok=True)
-    shutil.copy2(src_file, os.path.join(dst_dir, os.path.basename(src_file)))
+    shutil.copy2(src_file, os.path.join(dst_dir, output_name or os.path.basename(src_file)))
+
+
+def find_checksum_report(proj_res, project, kind):
+    """Сначала ищем новый формат, затем старый плоский."""
+    root = os.path.join(proj_res, "checksums")
+    found = latest_match(os.path.join(root, kind, "{}_*.txt".format(project)))
+    if found:
+        return found
+    return latest_match(os.path.join(root, "{}_{}_*.txt".format(project, kind)))
+
+
+def checksum_output_name(project, kind, source_path):
+    """В комплекте имя без bin/src, rhash_G называется gostsum."""
+    name = os.path.basename(source_path)
+    old_prefix = "{}_{}_".format(project, kind)
+    new_prefix = "{}_".format(project)
+    if name.startswith(old_prefix) and name.endswith(".txt"):
+        algorithm = name[len(old_prefix):-4]
+    elif name.startswith(new_prefix) and name.endswith(".txt"):
+        algorithm = name[len(new_prefix):-4]
+    else:
+        raise ValueError("Неожиданное имя отчёта: {}".format(name))
+    if algorithm == "rhash_G" or algorithm == "gostsum" or algorithm.startswith("gostsum_"):
+        algorithm = "gostsum"
+    return "{}_{}.txt".format(project, algorithm)
 
 
 def copy_tree_fresh(src_dir, dst_dir):
@@ -84,16 +110,18 @@ def collect_project(project, make_zip=False):
     missing = []
 
     # Приложение 1: КС дистрибутива (bin)
-    app1 = latest_match(os.path.join(proj_res, "checksums", "{}_bin_*.txt".format(project)))
+    app1 = find_checksum_report(proj_res, project, "bin")
     if app1:
-        copy_file_to_dir(app1, os.path.join(pkg_dir, APPENDIX_DIRS[1]))
+        copy_file_to_dir(app1, os.path.join(pkg_dir, APPENDIX_DIRS[1]),
+                         checksum_output_name(project, "bin", app1))
     else:
         missing.append(APPENDIX_DIRS[1])
 
     # Приложение 2: КС исходных текстов (src)
-    app2 = latest_match(os.path.join(proj_res, "checksums", "{}_src_*.txt".format(project)))
+    app2 = find_checksum_report(proj_res, project, "src")
     if app2:
-        copy_file_to_dir(app2, os.path.join(pkg_dir, APPENDIX_DIRS[2]))
+        copy_file_to_dir(app2, os.path.join(pkg_dir, APPENDIX_DIRS[2]),
+                         checksum_output_name(project, "src", app2))
     else:
         missing.append(APPENDIX_DIRS[2])
 

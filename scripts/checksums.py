@@ -3,7 +3,8 @@
 checksums.py — Пофайловый расчёт контрольных сумм по unpacked/<PROJ>/{bin,src}.
 
 Особенности:
-  - 1 текстовый файл на bin проекта и 1 текстовый файл на src проекта.
+  - Отдельные файлы для bin и src в checksums/bin/ и checksums/src/.
+  - Для rhash -G и gostsum имя файла содержит gostsum.
   - Выбор системной утилиты параметром (--tool) или в интерактивном диалоге.
   - Пропуск архивов, которые были распакованы (рядом есть <file>_dir / <file>_unpack).
   - Суффиксы _unpack и _dir удаляются из путей в отчёте.
@@ -118,6 +119,17 @@ def safe_tool_tag(tool_cmd):
     return "_".join(shlex.split(tool_cmd)).replace("-", "").replace("/", "_")
 
 
+def report_tool_tag(tool_cmd):
+    """Название алгоритма для файла отчёта (rhash -G -> gostsum)."""
+    parts = shlex.split(tool_cmd)
+    exe = os.path.basename(parts[0]).lower()
+    if exe == "gostsum":
+        return "gostsum"
+    if exe == "rhash" and ("-G" in parts[1:] or "--gost12-256" in parts[1:]):
+        return "gostsum"
+    return safe_tool_tag(tool_cmd)
+
+
 def process_subdir(project, subdir_name, cmd_parts, tool_tag):
     target_dir = os.path.join(UNPACKED_DIR, project, subdir_name)
     if not os.path.isdir(target_dir):
@@ -125,9 +137,10 @@ def process_subdir(project, subdir_name, cmd_parts, tool_tag):
         return None
 
     files = collect_files(target_dir)
-    out_dir = os.path.join(RESULTS_DIR, project, "checksums")
+    # Отчёты bin и src имеют одинаковое имя, но разные каталоги.
+    out_dir = os.path.join(RESULTS_DIR, project, "checksums", subdir_name)
     os.makedirs(out_dir, exist_ok=True)
-    out_file = os.path.join(out_dir, "{}_{}_{}.txt".format(project, subdir_name, tool_tag))
+    out_file = os.path.join(out_dir, "{}_{}.txt".format(project, tool_tag))
 
     lines = []
     errors = 0
@@ -173,7 +186,7 @@ def main():
         print("[ERROR] Утилита '{}' не найдена в PATH.".format(cmd_parts[0]))
         sys.exit(1)
 
-    tool_tag = safe_tool_tag(tool_cmd)
+    tool_tag = report_tool_tag(tool_cmd)
     projects = args.project or sorted(
         d for d in os.listdir(UNPACKED_DIR)
         if os.path.isdir(os.path.join(UNPACKED_DIR, d))
@@ -188,7 +201,7 @@ def main():
         process_subdir(proj, "bin", cmd_parts, tool_tag)
         process_subdir(proj, "src", cmd_parts, tool_tag)
 
-    print("\nГотово. Результаты в {}/<PROJ>/checksums/".format(RESULTS_DIR))
+    print("\nГотово. Результаты в {}/<PROJ>/checksums/bin/ и src/".format(RESULTS_DIR))
 
 
 if __name__ == "__main__":
