@@ -5,9 +5,8 @@
 # =============================================================================
 #
 # ОПИСАНИЕ:
-#   Рекурсивно распаковывает src/PROJ в unpacked/PROJ.
-#   origin_bin копирует с оригинальными датами и содержимым, без распаковки,
-#   нормализации имён и фильтрации.
+#   Рекурсивно распаковывает все архивы в директории src/PROJ
+#   в директорию unpacked/PROJ. Поддерживает вложенные архивы любой глубины.
 #   Каждый архив распаковывается в директорию АРХИВ_dir рядом с ним.
 #
 # ИСПОЛЬЗОВАНИЕ:
@@ -676,12 +675,11 @@ apply_filters() {
             rm -f "$file"
             (( removed_files++ )) || true
         fi
-    done < <(find "$unpack_dir" -path "$unpack_dir/origin_bin" -prune -o -mindepth 1 -type f -print0 2>/dev/null || true)
+    done < <(find "$unpack_dir" -mindepth 1 -type f -print0 2>/dev/null || true)
 
     # Удаляем директории, опустевшие после фильтрации (снизу вверх,
     # -depth гарантирует что дети обрабатываются раньше родителей)
-    find "$unpack_dir" -mindepth 1 -depth -type d -empty \
-        ! -path "$unpack_dir/origin_bin" ! -path "$unpack_dir/origin_bin/*" -delete 2>/dev/null || true
+    find "$unpack_dir" -mindepth 1 -depth -type d -empty -delete 2>/dev/null || true
 
     log_to_file "$log_path" "[FILTER] Total: $total_files files, Kept: $kept_files, Removed: $removed_files"
     echo "[FILTER] [$project_name] Kept: $kept_files, Removed: $removed_files"
@@ -1115,7 +1113,7 @@ process_project() {
 
     local unpack_dir="$UNPACKED_DIR/${project_name}"
 
-    # Проверяем src/ и bin/ подпапки в unpacked/PROJ/
+    # Проверяем src/, bin/ и origin_bin/ подпапки в unpacked/PROJ/
     local do_src=true
     local do_bin=true
     local do_origin=false
@@ -1126,21 +1124,13 @@ process_project() {
 
     should_unpack_subdir "$src_unpacked" "unpacked/$project_name/src" "$log_path" || do_src=false
     should_unpack_subdir "$bin_unpacked" "unpacked/$project_name/bin" "$log_path" || do_bin=false
-    if [[ -d "$project/origin_bin" && ! -L "$project/origin_bin" ]]; then
+    if [[ -d "$project/origin_bin" ]]; then
         do_origin=true
         should_unpack_subdir "$origin_unpacked" "unpacked/$project_name/origin_bin" "$log_path" || do_origin=false
     fi
 
     if [[ "$do_src" == false && "$do_bin" == false && "$do_origin" == false ]]; then
         log_to_file "$log_path" "[INFO] Ничего не распаковывается — все каталоги уже есть."
-        return 0
-    fi
-
-    # Когда нужно обновить лишь origin_bin, не сканируем повторно src/bin.
-    if [[ "$do_src" == false && "$do_bin" == false && "$do_origin" == true ]]; then
-        log_to_file "$log_path" "[INFO] Copying original $project/origin_bin -> $origin_unpacked (cp -a)"
-        copy_tree "$project/origin_bin" "$origin_unpacked"
-        log_to_file "$log_path" "[INFO] origin_bin скопирован без распаковки/фильтрации"
         return 0
     fi
 
@@ -1156,8 +1146,12 @@ process_project() {
         log_to_file "$log_path" "[INFO] Copying $project/bin -> $bin_unpacked"
         copy_tree "$project/bin" "$bin_unpacked"
     fi
+    if [[ "$do_origin" == true && -d "$project/origin_bin" ]]; then
+        log_to_file "$log_path" "[INFO] Copying $project/origin_bin -> $origin_unpacked"
+        copy_tree "$project/origin_bin" "$origin_unpacked"
+    fi
     if [[ ! -d "$project/src" && ! -d "$project/bin" && ! -d "$project/origin_bin" ]]; then
-        log_to_file "$log_path" "[INFO] Copying $project -> $unpack_dir (no src/bin split)"
+        log_to_file "$log_path" "[INFO] Copying $project -> $unpack_dir (no src/bin/origin_bin split)"
         copy_tree "$project" "$unpack_dir"
     fi
 
@@ -1177,7 +1171,7 @@ process_project() {
         # то есть на попытке залогировать путь к тому самому файлу,
         # который normalize.py должен был почистить. surrogateescape для
         # stdout позволяет напечатать такие «битые» суррогаты вместо краха.
-        PYTHONIOENCODING=utf-8:surrogateescape python3 "$NORMALIZE_PY" --content-dir "$unpack_dir" --exclude-dir origin_bin 2>&1 | log_to_file "$log_path"
+        PYTHONIOENCODING=utf-8:surrogateescape python3 "$NORMALIZE_PY" --content-dir "$unpack_dir" 2>&1 | log_to_file "$log_path"
         log_to_file "$log_path" "[TIME] normalize: $(format_duration $(( $(now_ns) - t0 )))"
     else
         log_to_file "$log_path" "[WARN] normalize.py не найден: $NORMALIZE_PY"
@@ -1201,7 +1195,7 @@ process_project() {
         while IFS= read -r -d '' skipped_file; do
             log_to_file "$log_path" "[SKIP-PATH] $skipped_file"
         done < <(
-            find "$unpack_dir" -path "$origin_unpacked" -prune -o -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0 \
+            find "$unpack_dir" -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0 \
                 | grep -zZE "$SKIP_PATH_PATTERN" 2>/dev/null || true
         )
     fi
@@ -1209,10 +1203,10 @@ process_project() {
         queue+=("$f")
     done < <(
         if [[ -n "$SKIP_PATH_PATTERN" ]]; then
-            find "$unpack_dir" -path "$origin_unpacked" -prune -o -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0 \
+            find "$unpack_dir" -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0 \
                 | grep -zZvE "$SKIP_PATH_PATTERN" 2>/dev/null || true
         else
-            find "$unpack_dir" -path "$origin_unpacked" -prune -o -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0
+            find "$unpack_dir" -type f \( "${_FIND_NAME_ARGS[@]}" \) -print0
         fi
     )
     local total_files=${#queue[@]}
@@ -1333,7 +1327,7 @@ process_project() {
     # не резолвится — валидные симлинки, указывающие на существующие файлы,
     # не трогаем; -type l удалял бы вообще ВСЕ симлинки, включая рабочие)
     t0=$(now_ns)
-    find "$unpack_dir" -xtype l ! -path "$origin_unpacked" ! -path "$origin_unpacked/*" -delete 2>/dev/null || true
+    find "$unpack_dir" -xtype l -delete 2>/dev/null || true
     log_to_file "$log_path" "[TIME] symlink cleanup: $(format_duration $(( $(now_ns) - t0 )))"
 
     # Применяем фильтры, если они указаны
@@ -1342,25 +1336,16 @@ process_project() {
     if [[ -n "$FILTER_LANGS" || -n "$FILTER_BIN_LANGS" ]]; then
         # Перед фильтрацией подсчитываем количество файлов
         local before_count
-        before_count=$(find "$unpack_dir" -path "$origin_unpacked" -prune -o -type f -print | wc -l)
+        before_count=$(find "$unpack_dir" -type f | wc -l)
         log_to_file "$log_path" "[FILTER] Files before filtering: $before_count"
         
         apply_filters "$unpack_dir" "$log_path" "$project_name"
         
         local after_count
-        after_count=$(find "$unpack_dir" -path "$origin_unpacked" -prune -o -type f -print | wc -l)
+        after_count=$(find "$unpack_dir" -type f | wc -l)
         removed_count=$(( before_count - after_count ))
         kept_count=$after_count
         log_to_file "$log_path" "[FILTER] Files after filtering: $after_count"
-    fi
-
-    # Сохраняем origin_bin точной копией без изменения байтов и mtime.
-    # Копирование последним этапом не позволяет рекурсивной обработке
-    # и фильтрам затронуть оригинальный дистрибутив.
-    if [[ "$do_origin" == true && -d "$project/origin_bin" ]]; then
-        log_to_file "$log_path" "[INFO] Copying original $project/origin_bin -> $origin_unpacked (cp -a)"
-        copy_tree "$project/origin_bin" "$origin_unpacked"
-        log_to_file "$log_path" "[INFO] origin_bin готов: исходные имена, байты и даты сохранены"
     fi
 
     local proj_total=$(( $(now_ns) - proj_start_ts ))
@@ -1407,7 +1392,7 @@ normalize_projects_dir() {
     # как есть, регистр и расширения не трогает.
     echo "[INFO] Предварительная нормализация имён: $PROJECTS_DIR"
     PYTHONIOENCODING=utf-8:surrogateescape python3 "$NORMALIZE_PY" \
-        --content-dir "$PROJECTS_DIR" --exclude-dir origin_bin 2>&1 | tee "$pre_log" || rc=$?
+        --content-dir "$PROJECTS_DIR" 2>&1 | tee "$pre_log" || rc=$?
 
     if (( rc != 0 )); then
         echo "[WARN] normalize.py завершился с кодом $rc — продолжаем без полной нормализации."
