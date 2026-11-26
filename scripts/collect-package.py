@@ -12,7 +12,7 @@ collect-package.py — Сборка комплекта Приложений 1-6 
 
 Итог:
   results/summary/package/<PROJ>/
-    ├── Приложение 1. КС исполняемых файлов/
+    ├── Приложение 1. КС дистрибутива/
     ├── Приложение 2. КС исходных текстов/
     ├── Приложение 3. Отчет АК-ВС/
     ├── Приложение 4. Фиксация переданного дистрибутива/
@@ -37,7 +37,7 @@ UNPACKED_DIR = os.path.join(BASE_DIR, "unpacked")
 PACKAGE_ROOT = os.path.join(RESULTS_DIR, "summary", "package")
 
 APPENDIX_DIRS = {
-    1: "Приложение 1. КС исполняемых файлов",
+    1: "Приложение 1. КС дистрибутива",
     2: "Приложение 2. КС исходных текстов",
     3: "Приложение 3. Отчет АК-ВС",
     4: "Приложение 4. Фиксация переданного дистрибутива",
@@ -83,7 +83,7 @@ def collect_project(project, make_zip=False):
 
     missing = []
 
-    # Приложение 1: КС исполняемых файлов (bin)
+    # Приложение 1: КС дистрибутива (bin)
     app1 = latest_match(os.path.join(proj_res, "checksums", "{}_bin_*.txt".format(project)))
     if app1:
         copy_file_to_dir(app1, os.path.join(pkg_dir, APPENDIX_DIRS[1]))
