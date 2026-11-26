@@ -1,66 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-=============================================================================
-forso-upload.py — Выгрузка результатов на сетевой диск (CIFS/SMB)
-=============================================================================
+forso-upload.py — Выгрузка комплекта Приложений 1–6 на Форсонас (CIFS/SMB).
 
-ОПИСАНИЕ:
-    Монтирует сетевой диск //SERVER/SHARE, находит на его ВЕРХНЕМ уровне
-    папку проекта по номеру АДЛБ.ХХХ (или по полному имени, флаг --dir),
-    создаёт при необходимости <проект>/Отчетность/НДВ/Приложение АКВС и
-    копирует туда содержимое results/summary/akvs.
+Источник — results/summary/package/PROJ_NAME/, который формирует collect-package.py.
+Выгружаются шесть папок Приложений со всем их содержимым.
 
-    Копирование инкрементальное, по хэшам:
-        - для каждой подпапки (и файла верхнего уровня) из summary/akvs
-          считается sha256 всего содержимого;
-        - на шаре в <проект>/Отчетность/НДВ/hash.txt хранится карта
-          «имя -> хэш» с прошлой выгрузки;
-        - совпал хэш и папка на месте -> ПРОПУСК;
-        - хэш другой / записи нет / папки нет -> папка на шаре удаляется
-          и заливается заново целиком;
-        - hash.txt перезаписывается после копирования (дозапись/обновление
-          только изменившихся записей, остальные сохраняются).
+Приёмник на сетевом диске:
+  <папка изделия>/Отчетность/НДП/Приложения АДЛБ.ХХХ ПНДВ/
+ХХХ всегда берётся из обязательного --adlb. Папка изделия ищется по этому
+номеру на верхнем уровне шары; --dir позволяет выбрать её явно.
 
-    Остановка с размонтированием диска происходит, если:
-        - папка проекта по номеру ХХХ не найдена;
-        - найдено НЕСКОЛЬКО подходящих папок (все выводятся списком —
-          нужную укажите флагом --dir "полное имя").
+Инкрементальное копирование по SHA-256 с сохранением карты хэшей в
+Приложения АДЛБ.ХХХ ПНДВ/hash.txt. Ранее выгруженные отчёты в иных
+папках не затрагиваются. При изменении приложение заменяется целиком.
 
-    Если диск уже был смонтирован в точку монтирования до запуска —
-    скрипт с ним работает, но НЕ размонтирует его в конце.
+По умолчанию неполные комплекты (нет хотя бы одного приложения) не
+загружаются. Для осознанной отправки неполного набора — --allow-incomplete.
 
-ИСПОЛЬЗОВАНИЕ:
-    python3 scripts/forso-upload.py --adlb 123
-    python3 scripts/forso-upload.py --dir "АДЛБ.123 Изделие Х"
-    python3 scripts/forso-upload.py --adlb 123 --dry-run
-    python3 scripts/forso-upload.py --adlb 123 --force
-    sudo -v && python3 scripts/forso-upload.py --adlb 123   # чтобы sudo не спрашивал пароль в процессе
+Примеры:
+  ./scripts/forso-upload.py --project PROJ_NAME --adlb 123 --dry-run
+  ./scripts/forso-upload.py --project PROJ_NAME --adlb 123
+  ./scripts/forso-upload.py --project PROJ_NAME --adlb 123 --dir "АДЛБ.123 Изделие"
+  ./scripts/forso-upload.py --project PROJ_NAME --adlb 123 --allow-incomplete
 
-ОПЦИИ:
-    --adlb XXX          Номер проекта: РОВНО 3 цифры (по умолчанию так).
-                        Больше/меньше цифр — только через --adlb-any.
-    --adlb-any          Разрешить номер произвольной длины (например 01342).
-    --dir NAME          Полное имя папки проекта на шаре (в обход поиска
-                        по номеру). Взаимоисключающе с --adlb.
-    --server VALUE      Адрес сервера           [см. SERVER]
-    --share VALUE       Имя шары                [см. SHARE]
-    --user VALUE        Логин                   [см. LOGIN]
-    --password VALUE    Пароль                  [см. PASS]
-    --ask-password      Спросить пароль интерактивно (не светится в ps)
-    --mountpoint PATH   Точка монтирования      [см. MOUNTPOINT]
-    --vers VALUE        Версия SMB (default: 3.0, при ошибке пробуем без неё)
-    --source PATH       Что заливать (default: results/summary/akvs)
-    --appdir NAME       Имя папки-приёмника     [см. APP_SUBDIR]
-    --force             Заливать всё заново, игнорируя hash.txt
-    --dry-run           Ничего не менять на шаре, только показать план
-    --keep-mounted      Не размонтировать диск в конце
-    -h, --help          Показать справку
-
-ЗАВИСИМОСТИ:
-    Python 3.5+, cifs-utils (sudo apt install cifs-utils), право на sudo
-    для mount/umount.
-=============================================================================
+Зависимости: Python 3.5+, cifs-utils, sudo для mount/umount.
 """
 
 import os
@@ -83,14 +47,22 @@ PASS       = "komusfanvil"           # пароль                    (--passwo
 MOUNTPOINT = "/mnt/sertifikaciya"    # точка монтирования        (--mountpoint)
 SMB_VERS   = "3.0"                   # версия протокола SMB      (--vers)
 
-REPORT_SUBPATH = ["Отчетность", "НДВ"]   # путь внутри папки проекта
-APP_SUBDIR     = "Приложение АКВС"       # папка-приёмник внутри НДВ (--appdir)
-HASH_FILE      = "hash.txt"              # карта хэшей, лежит в .../НДВ/
+REPORT_SUBPATH = ["Отчетность", "НДП"]   # путь внутри папки проекта
+HASH_FILE      = "hash.txt"               # карта хэшей внутри папки Приложений
 
 # =============================================================================
 
 BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_SRC = os.path.join(BASE_DIR, "results", "summary", "akvs")
+DEFAULT_SRC = os.path.join(BASE_DIR, "results", "summary", "package")
+
+APPENDIX_DIRS = [
+    "Приложение 1. КС дистрибутива",
+    "Приложение 2. КС исходных текстов",
+    "Приложение 3. Отчет АК-ВС",
+    "Приложение 4. Фиксация переданного дистрибутива",
+    "Приложение 5. Фиксация собранного дистрибутива",
+    "Приложение 6. Контроль повторяемости сборки",
+]
 
 
 # =============================================================================
@@ -303,8 +275,8 @@ def read_hash_file(path):
 def write_hash_file(path, table):
     """Пишет hash.txt (сначала во временный файл рядом, затем подменяет)."""
     tmp = path + ".tmp"
-    lines = ["# forso-upload.py — хэши выгруженных отчётов АК-ВС",
-             "# обновлено: {}".format(datetime.now().isoformat(timespec='seconds')),
+    lines = ["# forso-upload.py — хэши выгруженных комплектов ПНДВ",
+             "# обновлено: {}".format(datetime.now().strftime('%Y-%m-%dT%H:%M:%S')),
              "# формат: <sha256> <имя папки/файла>"]
     for name in sorted(table):
         lines.append("{} {}".format(table[name], name))
@@ -349,11 +321,72 @@ def ensure_dir(path, dry_run):
 
 
 # =============================================================================
+# ВЫБОР И ПРОВЕРКА КОМПЛЕКТА — до монтирования и изменения сетевой папки
+# =============================================================================
+def resolve_package_source(source_base, project, allow_incomplete):
+    if not os.path.isdir(source_base):
+        err("каталог комплектов не найден: {}".format(source_base))
+        print("       Сначала запустите: ./collect-package.py")
+        return None
+
+    if project is None:
+        projects = sorted(name for name in os.listdir(source_base)
+                          if not name.startswith(".")
+                          and os.path.isdir(os.path.join(source_base, name))
+                          and not os.path.islink(os.path.join(source_base, name)))
+        if len(projects) != 1:
+            err("укажите --project PROJ_NAME; в {} найдено проектов: {}".format(
+                source_base, len(projects)))
+            for name in projects:
+                print("  - {}".format(name))
+            return None
+        project = projects[0]
+        info("Автоматически выбран комплект: {}".format(project))
+
+    if project in ("", ".", "..") or os.path.basename(project) != project or (
+            "/" in project or "\\" in project):
+        err("некорректное имя проекта: {!r}".format(project))
+        return None
+
+    package_path = os.path.join(source_base, project)
+    if not os.path.isdir(package_path) or os.path.islink(package_path):
+        err("комплект проекта отсутствует: {}".format(package_path))
+        print("       Сначала выполните: ./collect-package.py --project {}".format(project))
+        return None
+
+    items = []
+    missing = []
+    for name in APPENDIX_DIRS:
+        full = os.path.join(package_path, name)
+        if os.path.isdir(full) and not os.path.islink(full) and os.listdir(full):
+            items.append(name)
+        else:
+            missing.append(name)
+
+    if missing:
+        warn("в комплекте {} отсутствуют или пусты {} приложений".format(
+            project, len(missing)))
+        for name in missing:
+            print("  - {}".format(name))
+        if not allow_incomplete:
+            err("неполный комплект: выгрузка отменена. "
+                "Используйте --allow-incomplete только если это намеренно")
+            return None
+
+    if not items:
+        err("нечего выгружать: {}".format(package_path))
+        return None
+
+    return project, package_path, items
+
+
+# =============================================================================
 # ОСНОВНАЯ РАБОТА (после монтирования)
 # =============================================================================
 def do_upload(cfg, args):
     mp = cfg['mountpoint']
     src_root = cfg['source']
+    items = cfg['items']
 
     # --- 1. Папка проекта на шаре ---
     if args.dir:
@@ -383,25 +416,20 @@ def do_upload(cfg, args):
 
     project_path = os.path.join(mp, project_dir_name)
 
-    # --- 2. Отчетность/НДВ/Приложение АКВС ---
+    # --- 2. Отчетность/НДП/Приложения АДЛБ.ХХХ ПНДВ ---
     ndv_path = project_path
     for part in REPORT_SUBPATH:
         ndv_path = os.path.join(ndv_path, part)
         if not ensure_dir(ndv_path, args.dry_run):
             return 1
-    app_path = os.path.join(ndv_path, cfg['appdir'])
+    app_path = os.path.join(ndv_path, "Приложения АДЛБ.{} ПНДВ".format(args.adlb))
     if not ensure_dir(app_path, args.dry_run):
         return 1
     info("Приёмник      : {}".format(app_path))
 
-    # --- 3. Что заливаем ---
-    items = sorted(os.listdir(src_root))
-    items = [i for i in items if not i.startswith('.')]
-    if not items:
-        err("нечего заливать: {} пуста".format(src_root))
-        return 1
+    # --- 3. Отправляем только проверенные Приложения 1–6 ---
 
-    hash_path_remote = os.path.join(ndv_path, HASH_FILE)
+    hash_path_remote = os.path.join(app_path, HASH_FILE)
     remote_hashes = {} if args.force else read_hash_file(hash_path_remote)
     if args.force:
         info("--force: hash.txt игнорируется, заливаю всё заново")
@@ -472,8 +500,7 @@ def do_upload(cfg, args):
     print("\n{}".format("=" * 60))
     print("Выгрузка завершена{}".format(" (dry-run)" if args.dry_run else "!"))
     print("Проект на шаре : {}".format(project_dir_name))
-    print("Приёмник       : {}".format(
-        os.path.join(project_dir_name, *(REPORT_SUBPATH + [cfg['appdir']]))))
+    print("Приёмник       : {}".format(os.path.relpath(app_path, mp)))
     print("Залито         : {}".format(len(copied)))
     print("Пропущено      : {}".format(len(skipped)))
     print("Ошибок         : {}".format(len(failed)))
@@ -489,11 +516,13 @@ def do_upload(cfg, args):
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Выгрузка отчётов АК-ВС (results/summary/akvs) на сетевой "
-                    "диск в <проект>/Отчетность/НДВ/Приложение АКВС",
+        description="Выгрузка комплекта из results/summary/package/PROJ_NAME "
+                    "в Отчетность/НДП/Приложения АДЛБ.ХХХ ПНДВ",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Подробности см. в шапке файла.",
     )
+    parser.add_argument('--project', metavar='PROJ_NAME',
+                        help='Имя локального комплекта в results/summary/package/')
     parser.add_argument('--adlb', metavar='XXX',
                         help='Номер проекта АДЛБ.ХХХ (ровно 3 цифры)')
     parser.add_argument('--adlb-any', action='store_true',
@@ -507,31 +536,37 @@ def main():
     parser.add_argument('--ask-password', action='store_true', help='Спросить пароль интерактивно')
     parser.add_argument('--mountpoint', default=MOUNTPOINT, help='Точка монтирования (default: {})'.format(MOUNTPOINT))
     parser.add_argument('--vers',       default=SMB_VERS,   help='Версия SMB (default: {})'.format(SMB_VERS))
-    parser.add_argument('--source',     default=DEFAULT_SRC, help='Источник (default: results/summary/akvs)')
-    parser.add_argument('--appdir',     default=APP_SUBDIR, help='Папка-приёмник (default: {})'.format(APP_SUBDIR))
+    parser.add_argument('--source',     default=DEFAULT_SRC,
+                        help='Корень комплектов (default: results/summary/package)')
+    parser.add_argument('--allow-incomplete', action='store_true',
+                        help='Разрешить выгрузку комплекта без всех шести приложений')
     parser.add_argument('--force',        action='store_true', help='Залить всё заново, игнорируя hash.txt')
     parser.add_argument('--dry-run',      action='store_true', help='Ничего не менять, только показать план')
     parser.add_argument('--keep-mounted', action='store_true', help='Не размонтировать диск в конце')
     args = parser.parse_args()
 
-    # --- Валидация выбора проекта ---
-    if bool(args.adlb) == bool(args.dir):
-        err("укажите РОВНО одно: --adlb XXX или --dir \"полное имя папки\"")
+    # --- --adlb обязателен: из него формируется имя папки ПНДВ ---
+    if not args.adlb:
+        err("укажите --adlb XXX (используется для папки 'Приложения АДЛБ.ХХХ ПНДВ')")
         sys.exit(1)
-    if args.adlb:
-        if not args.adlb.isdigit():
-            err("--adlb должен состоять только из цифр (получено: {!r})".format(args.adlb))
-            sys.exit(1)
-        if len(args.adlb) != 3 and not args.adlb_any:
-            err("--adlb ожидает ровно 3 цифры (получено {} — {!r}). "
-                "Для другой длины добавьте --adlb-any".format(len(args.adlb), args.adlb))
-            sys.exit(1)
+    if not args.adlb.isdigit():
+        err("--adlb должен состоять только из цифр (получено: {!r})".format(args.adlb))
+        sys.exit(1)
+    if len(args.adlb) != 3 and not args.adlb_any:
+        err("--adlb ожидает ровно 3 цифры (получено {} — {!r}). "
+            "Для другой длины добавьте --adlb-any".format(len(args.adlb), args.adlb))
+        sys.exit(1)
+    if args.dir and (args.dir in (".", "..") or
+                     os.path.basename(args.dir) != args.dir or
+                     "/" in args.dir or "\\" in args.dir):
+        err("--dir должен быть названием папки верхнего уровня шары")
+        sys.exit(1)
 
-    src_root = os.path.abspath(args.source)
-    if not os.path.isdir(src_root):
-        err("источник не найден: {}".format(src_root))
-        print("       Сначала выполните прогон: python3 scripts/akvs-analyze.py")
+    source_base = os.path.abspath(args.source)
+    selected = resolve_package_source(source_base, args.project, args.allow_incomplete)
+    if selected is None:
         sys.exit(1)
+    project, src_root, items = selected
 
     password = args.password
     if args.ask_password:
@@ -541,14 +576,15 @@ def main():
         'server': args.server, 'share': args.share,
         'user': args.user, 'password': password,
         'mountpoint': os.path.abspath(args.mountpoint),
-        'vers': args.vers, 'source': src_root, 'appdir': args.appdir,
+        'vers': args.vers, 'source': src_root, 'items': items,
     }
 
-    print("AK-VS upload")
+    print("FORSONAS package upload")
+    print("Комплект   : {}".format(project))
     print("Источник   : {}".format(cfg['source']))
     print("Шара       : //{}/{}".format(cfg['server'], cfg['share']))
     print("Монтирую в : {}".format(cfg['mountpoint']))
-    print("Проект     : {}".format(
+    print("Изделие    : {}".format(
         args.dir if args.dir else "по номеру АДЛБ.{}".format(args.adlb)))
     if args.dry_run:
         print("Режим      : dry-run (на шаре ничего не меняется)")
