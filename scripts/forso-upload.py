@@ -33,6 +33,7 @@ import sys
 import shutil
 import getpass
 import hashlib
+import uuid
 import argparse
 import subprocess
 from datetime import datetime
@@ -274,35 +275,80 @@ def read_hash_file(path):
 
 def write_hash_file(path, table):
     """Пишет hash.txt (сначала во временный файл рядом, затем подменяет)."""
-    tmp = path + ".tmp"
+    tmp = path + ".tmp." + uuid.uuid4().hex
     lines = ["# forso-upload.py — хэши выгруженных комплектов ПНДВ",
              "# обновлено: {}".format(datetime.now().strftime('%Y-%m-%dT%H:%M:%S')),
              "# формат: <sha256> <имя папки/файла>"]
     for name in sorted(table):
         lines.append("{} {}".format(table[name], name))
-    with open(tmp, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    if os.path.exists(path):
-        os.remove(path)
-    os.rename(tmp, path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        os.replace(tmp, path)  # исходный hash.txt сохраняется при ошибке замены
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 # =============================================================================
 # КОПИРОВАНИЕ
 # =============================================================================
 def copy_item(src, dst):
-    """Полная замена: приёмник сносится и заливается заново."""
-    if os.path.isdir(dst):
-        shutil.rmtree(dst)
-    elif os.path.exists(dst):
-        os.remove(dst)
+    """Безопасно заменяет папку приложения на SMB после проверки новой копии.
+
+    Сначала создаём временную копию на той же шаре, проверяем её SHA-256,
+    затем переименовываем старую папку в резервную и ставим новую на её место.
+    При ошибке переименования возвращаем прежнюю папку.
+    """
+    if not os.path.isdir(src) or os.path.islink(src):
+        raise ValueError("Ожидалась папка приложения: {}".format(src))
+    if os.path.lexists(dst) and (not os.path.isdir(dst) or os.path.islink(dst)):
+        raise ValueError("Приёмник не является обычной папкой: {}".format(dst))
+
     parent = os.path.dirname(dst)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
-    if os.path.isdir(src):
-        shutil.copytree(src, dst)
-    else:
-        shutil.copy2(src, dst)
+    token = uuid.uuid4().hex
+    stage = os.path.join(parent, ".forso-stage-" + token)
+    backup = os.path.join(parent, ".forso-backup-" + token)
+    old_moved = False
+    committed = False
+    try:
+        shutil.copytree(src, stage)
+        if hash_path(stage) != hash_path(src):
+            raise IOError("Копия на шаре отличается от источника: {}".format(src))
+
+        if os.path.lexists(dst):
+            os.rename(dst, backup)
+            old_moved = True
+
+        try:
+            os.rename(stage, dst)
+            committed = True
+        except Exception:
+            if old_moved:
+                try:
+                    os.rename(backup, dst)
+                    old_moved = False
+                except Exception as rollback_error:
+                    warn("Не удалось восстановить прежнюю папку {}. "
+                         "Резервная копия: {}. Ошибка: {}".format(
+                             dst, backup, rollback_error))
+            raise
+
+        if old_moved:
+            try:
+                shutil.rmtree(backup)
+            except OSError as cleanup_error:
+                warn("Новая папка установлена, но резервную копию {} "
+                     "не удалось удалить: {}".format(backup, cleanup_error))
+    finally:
+        if not committed and os.path.lexists(stage):
+            try:
+                shutil.rmtree(stage)
+            except OSError as cleanup_error:
+                warn("Не удалось очистить временную папку {}: {}".format(
+                    stage, cleanup_error))
 
 
 def ensure_dir(path, dry_run):
@@ -479,6 +525,9 @@ def do_upload(cfg, args):
             new_table[name] = local_hashes[name]
     for name in skipped:
         new_table[name] = local_hashes[name]
+    # После ошибки копирования не доверяем старому хэшу, даже если папка есть.
+    for name in failed:
+        new_table.pop(name, None)
     # чистим записи о том, чего на шаре уже нет
     if not args.dry_run:
         for name in list(new_table):
