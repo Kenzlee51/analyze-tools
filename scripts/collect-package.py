@@ -115,4 +115,53 @@ def collect_project(project, make_zip=False):
     for pat, num in vks_map:
         f = latest_match(os.path.join(proj_res, "vks", pat))
         if f:
-            copy_file_
+            copy_file_to_dir(f, os.path.join(pkg_dir, APPENDIX_DIRS[num]))
+        else:
+            missing.append(APPENDIX_DIRS[num])
+
+    if make_zip:
+        zpath = os.path.join(PACKAGE_ROOT, "{}_appendices_1-6.zip".format(project))
+        zip_dir(pkg_dir, zpath)
+
+    status = "OK (полный комплект)" if not missing else "НЕПОЛНЫЙ (нет: {})".format(", ".join(missing))
+    print("  [{:<20}] {}".format(project, status))
+    return len(missing) == 0
+
+
+def discover_projects():
+    names = set()
+    if os.path.isdir(UNPACKED_DIR):
+        for d in os.listdir(UNPACKED_DIR):
+            if os.path.isdir(os.path.join(UNPACKED_DIR, d)):
+                names.add(d)
+    if os.path.isdir(RESULTS_DIR):
+        for d in os.listdir(RESULTS_DIR):
+            if d != "summary" and os.path.isdir(os.path.join(RESULTS_DIR, d)):
+                names.add(d)
+    return sorted(names)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Сборка комплекта Приложений 1-6")
+    parser.add_argument("--project", action="append", default=None,
+                        help="Имя проекта (можно несколько раз; по умолчанию все)")
+    parser.add_argument("--zip", action="store_true",
+                        help="Дополнительно упаковать комплект каждого проекта в .zip")
+    args = parser.parse_args()
+
+    projects = args.project or discover_projects()
+    if not projects:
+        print("[INFO] Проекты не найдены.")
+        sys.exit(1)
+
+    print("Сборка комплектов Приложений 1-6 -> {}\n".format(PACKAGE_ROOT))
+    full_ok = 0
+    for proj in projects:
+        if collect_project(proj, make_zip=args.zip):
+            full_ok += 1
+
+    print("\nГотово. Полных комплектов: {}/{}".format(full_ok, len(projects)))
+
+
+if __name__ == "__main__":
+    main()
