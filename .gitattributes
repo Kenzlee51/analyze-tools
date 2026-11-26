@@ -1,0 +1,3 @@
+/scripts/*.py text eol=lf
+/scripts/*.sh text eol=lf
+/collect-package.py text eol=lf
