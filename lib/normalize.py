@@ -78,7 +78,7 @@ def get_unique_name(directory, desired_name):
         counter += 1
 
 
-def repair_tree(content_dir):
+def repair_tree(content_dir, exclude_dir=None):
     """Рекурсивно чинит битые имена файлов и папок в content_dir.
 
     Вариант A: чиним ТОЛЬКО кодировку (битые имена -> валидный UTF-8,
@@ -92,9 +92,16 @@ def repair_tree(content_dir):
         print("Ошибка: директория {!r} не существует.".format(content_dir))
         return 0
 
-    # Собираем все пути (файлы и папки), сортируем по глубине по убыванию.
+    # Не изменяем имена в исходном дистрибутиве origin_bin.
+    if exclude_dir and os.path.basename(os.path.normpath(content_dir)) == exclude_dir:
+        print("  [SKIP] Каталог исключён: {}".format(content_dir))
+        return 0
+
+    # Обход снизу вверх, но защищённый каталог полностью пропускаем.
     entries = []
     for root, dirs, files in os.walk(content_dir):
+        if exclude_dir:
+            dirs[:] = [d for d in dirs if d != exclude_dir]
         for name in files:
             entries.append(os.path.join(root, name))
         for name in dirs:
@@ -135,6 +142,7 @@ def main():
     # --content-dir DIR — директория для обработки. Если не указана,
     # берём src/ рядом с корнем проекта (обратная совместимость).
     content_dir = None
+    exclude_dir = None
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -145,6 +153,13 @@ def main():
                 continue
             print("Ошибка: --content-dir требует путь.")
             sys.exit(1)
+        elif args[i] == '--exclude-dir':
+            if i + 1 < len(args):
+                exclude_dir = args[i + 1]
+                i += 2
+                continue
+            print("Ошибка: --exclude-dir требует имя каталога.")
+            sys.exit(1)
         else:
             # позиционный аргумент тоже принимаем как каталог
             content_dir = args[i]
@@ -154,7 +169,7 @@ def main():
         content_dir = os.path.join(base_dir, 'src')
 
     print("Чиню имена (только битые) в: {}".format(content_dir))
-    repair_tree(content_dir)
+    repair_tree(content_dir, exclude_dir=exclude_dir)
 
 
 if __name__ == "__main__":

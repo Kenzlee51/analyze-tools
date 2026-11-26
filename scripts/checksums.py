@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-checksums.py — Пофайловый расчёт контрольных сумм по unpacked/<PROJ>/{bin,src}.
+checksums.py — КС дистрибутива по origin_bin и исходных текстов по src.
 
 Особенности:
   - Отдельные файлы для bin и src в checksums/bin/ и checksums/src/.
@@ -131,7 +131,10 @@ def report_tool_tag(tool_cmd):
 
 
 def process_subdir(project, subdir_name, cmd_parts, tool_tag):
-    target_dir = os.path.join(UNPACKED_DIR, project, subdir_name)
+    # Приложение 1 — origin_bin, Приложение 2 — src.
+    # Имя выходного каталога Приложения 1 остаётся checksums/bin.
+    source_subdir = "origin_bin" if subdir_name == "bin" else subdir_name
+    target_dir = os.path.join(UNPACKED_DIR, project, source_subdir)
     if not os.path.isdir(target_dir):
         print("  [SKIP] Нет каталога: {}".format(target_dir))
         return None
@@ -162,7 +165,7 @@ def process_subdir(project, subdir_name, cmd_parts, tool_tag):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Пофайловый расчёт КС по unpacked/<PROJ>/{bin,src}"
+        description="Расчёт КС дистрибутива (origin_bin) и исходных текстов (src)"
     )
     parser.add_argument("--project", action="append", default=None,
                         help="Имя проекта (можно несколько раз; по умолчанию все из unpacked/)")

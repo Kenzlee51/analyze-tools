@@ -5,7 +5,7 @@ vks-fix.py — Расчёт ВКС и генерация Приложений 4-
 Ожидаемая структура (лежит в scripts/, рядом с unpack.sh и akvs-analyze.py):
     BASE_DIR/
     ├── scripts/vks-fix.py
-    ├── unpacked/<PROJ>/{src,bin}
+    ├── unpacked/<PROJ>/origin_bin/  (исходный дистрибутив)
     └── results/<PROJ>/vks/
         ├── baseline_vks.json
         ├── Приложение_4_фиксация_исходного.html
@@ -16,12 +16,15 @@ vks-fix.py — Расчёт ВКС и генерация Приложений 4-
     python3 scripts/vks-fix.py
     python3 scripts/vks-fix.py --project PROJ1 --project PROJ2
     python3 scripts/vks-fix.py --mode init --project PROJ1
-    python3 scripts/vks-fix.py --mode control --project PROJ1
+    python3 scripts/vks-fix.py --mode control --project PROJ1\n\nРежим all: Приложение 4 из origin_bin, Приложение 5 из временной копии\nс новыми временными метками, Приложение 6 — сравнение исходного и копии.\nРежим init фиксирует OLD, control сравнивает OLD с новой временной копией.
 """
 
 import argparse
 import json
 import os
+import shutil
+import tempfile
+import time
 import struct
 import sys
 from collections import defaultdict
@@ -113,7 +116,7 @@ def clean_rel_path(rel_path):
     return "/".join(cleaned)
 
 
-def scan_directory(root_dir):
+def scan_directory(root_dir, include_archives=False):
     """Возвращает словарь {clean_rel_path: {h, s, m}} для всех файлов в root_dir."""
     objects = {}
     for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -124,7 +127,7 @@ def scan_directory(root_dir):
             full = os.path.join(dirpath, name)
             if os.path.islink(full) or not os.path.isfile(full):
                 continue
-            if is_unpacked_archive(full):
+            if not include_archives and is_unpacked_archive(full):
                 continue
             rel = os.path.relpath(full, root_dir)
             key = clean_rel_path(rel)
@@ -358,17 +361,20 @@ def compute_diff(baseline_objs, current_objs):
     for path, b in baseline_objs.items():
         if path in current_objs:
             c = current_objs[path]
-            status = "OK" if b["h"] == c["h"] else "MODIFIED"
+            # Помимо байтов проверяем дату фиксации: копия должна иметь новые mtime.
+            status = "OK" if (b["h"] == c["h"] and b.get("m") == c.get("m")) else "MODIFIED"
             entries.append({
                 "path": path, "status": status,
                 "exp_h": b["h"], "act_h": c["h"],
                 "exp_s": b["s"], "act_s": c["s"],
+                "exp_m": b.get("m"), "act_m": c.get("m"),
             })
         else:
             entries.append({
                 "path": path, "status": "DELETED",
                 "exp_h": b["h"], "act_h": None,
                 "exp_s": b["s"], "act_s": None,
+                "exp_m": b.get("m"), "act_m": None,
             })
     for path, c in current_objs.items():
         if path not in baseline_objs:
@@ -376,6 +382,7 @@ def compute_diff(baseline_objs, current_objs):
                 "path": path, "status": "NEW",
                 "exp_h": None, "act_h": c["h"],
                 "exp_s": None, "act_s": c["s"],
+                "exp_m": None, "act_m": c.get("m"),
             })
     return entries
 
@@ -469,6 +476,10 @@ def write_fix202_control_html(out_path, diff_entries, base_label):
         ])
         for i, e in enumerate(items, 1):
             name = os.path.basename(e["path"])
+            if (kind == "modified" and e.get("exp_m") != e.get("act_m")):
+                old_date = datetime.fromtimestamp(e["exp_m"]).strftime("%d.%m.%Y %H:%M:%S") if e.get("exp_m") else "-"
+                new_date = datetime.fromtimestamp(e["act_m"]).strftime("%d.%m.%Y %H:%M:%S") if e.get("act_m") else "-"
+                name += " (дата: {} -> {})".format(old_date, new_date)
             rdir = os.path.dirname(e["path"]).replace("\\", "/").strip("/")
             size = e["act_s"] if e["act_s"] is not None else (e["exp_s"] or 0)
             h1 = (e["exp_h"] or "-").lower()[:8] if kind in ("modified", "deleted") else "-"
@@ -589,62 +600,106 @@ def write_fix202_control_html(out_path, diff_entries, base_label):
 # =============================================================================
 # ОСНОВНОЙ ЦИКЛ
 # =============================================================================
+def scan_fresh_copy(original_path):
+    """Создаёт временную копию и назначает всем файлам время запуска.
+
+    Не используем shutil.copy2/copytree по умолчанию: copy2 сохраняет
+    исходные временные метки. После копирования явно ставим единый mtime
+    каждому файлу и каталогу. Исходный origin_bin никогда не меняется.
+    """
+    with tempfile.TemporaryDirectory(prefix="vks-new-") as tmp:
+        dst = os.path.join(tmp, "origin_bin")
+        shutil.copytree(original_path, dst, copy_function=shutil.copy,
+                        symlinks=True)
+        timestamp = int(time.time())
+        for folder, dirs, files in os.walk(dst, topdown=False, followlinks=False):
+            for filename in files:
+                path = os.path.join(folder, filename)
+                if not os.path.islink(path):
+                    os.utime(path, (timestamp, timestamp))
+            for dirname in dirs:
+                path = os.path.join(folder, dirname)
+                if not os.path.islink(path):
+                    os.utime(path, (timestamp, timestamp))
+        os.utime(dst, (timestamp, timestamp))
+        return scan_directory(dst, include_archives=True)
+
+
+def save_baseline(path, project, objects):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"project": project, "target": "origin_bin",
+                   "source": "unpacked/origin_bin", "objects": objects},
+                  f, ensure_ascii=False, indent=2)
+
+
+def read_origin_baseline(path, project):
+    """Не допускаем использования старого эталона по unpacked/bin."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if (data.get("project") != project or
+            data.get("target") != "origin_bin" or
+            data.get("source") != "unpacked/origin_bin"):
+        raise ValueError("Эталон создан для другого источника/проекта. "
+                         "Сначала запустите --mode init")
+    return data["objects"]
+
+
 def process_project(project, mode, target):
-    proj_root = os.path.join(UNPACKED_DIR, project)
-    scan_root = proj_root if target == "all" else os.path.join(proj_root, target)
-    if not os.path.isdir(scan_root):
-        print("  [SKIP] Не найден каталог: {}".format(scan_root))
+    # --target bin сохранён как совместимый с прежними командами псевдоним.
+    if target not in ("bin", "origin_bin"):
+        print("  [ERROR] Для приложений 4-6 поддерживается только origin_bin")
+        return False
+
+    scan_root = os.path.join(UNPACKED_DIR, project, "origin_bin")
+    if not os.path.isdir(scan_root) or os.path.islink(scan_root):
+        print("  [ERROR] Не найден исходный дистрибутив: {}".format(scan_root))
         return False
 
     out_dir = os.path.join(RESULTS_DIR, project, "vks")
     os.makedirs(out_dir, exist_ok=True)
-
     baseline_json = os.path.join(out_dir, "baseline_vks.json")
     app4_path = os.path.join(out_dir, "Приложение_4_фиксация_исходного.html")
     app5_path = os.path.join(out_dir, "Приложение_5_фиксация_конечного.html")
     app6_path = os.path.join(out_dir, "Приложение_6_сравнение.html")
+    base_label = os.path.join(project, "origin_bin")
 
-    base_label = project if target == "all" else os.path.join(project, target)
-    print("\n[Проект: {}] Сканирование {} ...".format(project, scan_root))
-    current_objs = scan_directory(scan_root)
-    print("  Файлов обработано (ВКС): {}".format(len(current_objs)))
-
-    if mode == "init":
-        with open(baseline_json, "w", encoding="utf-8") as f:
-            json.dump({"project": project, "target": target, "objects": current_objs}, f, ensure_ascii=False, indent=2)
-        write_fix202_state_html(app4_path, current_objs, base_label, "о фиксации исходного состояния")
-        print("  [OK] Приложение 4: {}".format(app4_path))
-        return True
+    print("\n[Проект: {}] Исходный дистрибутив: {}".format(project, scan_root))
 
     if mode == "control":
         if not os.path.isfile(baseline_json):
-            print("  [ERROR] Нет эталона {}. Сначала запустите --mode init".format(baseline_json))
+            print("  [ERROR] Нет эталона {}. Сначала запустите --mode init".format(
+                baseline_json))
             return False
-        with open(baseline_json, "r", encoding="utf-8") as f:
-            baseline_objs = json.load(f).get("objects", {})
-        write_fix202_state_html(app5_path, current_objs, base_label, "о фиксации конечного состояния")
-        diff_entries = compute_diff(baseline_objs, current_objs)
-        write_fix202_control_html(app6_path, diff_entries, base_label)
-        print("  [OK] Приложение 5: {}".format(app5_path))
-        print("  [OK] Приложение 6: {}".format(app6_path))
-        return True
-
-    # mode == "all"
-    if os.path.isfile(baseline_json):
-        with open(baseline_json, "r", encoding="utf-8") as f:
-            baseline_objs = json.load(f).get("objects", {})
-        if not os.path.isfile(app4_path):
-            write_fix202_state_html(app4_path, baseline_objs, base_label, "о фиксации исходного состояния")
+        try:
+            baseline_objs = read_origin_baseline(baseline_json, project)
+        except (ValueError, KeyError, OSError) as e:
+            print("  [ERROR] Неподходящий эталон: {}".format(e))
+            return False
     else:
-        baseline_objs = current_objs
-        with open(baseline_json, "w", encoding="utf-8") as f:
-            json.dump({"project": project, "target": target, "objects": baseline_objs}, f, ensure_ascii=False, indent=2)
-        write_fix202_state_html(app4_path, baseline_objs, base_label, "о фиксации исходного состояния")
+        baseline_objs = scan_directory(scan_root, include_archives=True)
+        print("  Файлов OLD: {}".format(len(baseline_objs)))
+        if not baseline_objs:
+            print("  [ERROR] Каталог исходного дистрибутива пуст")
+            return False
+        save_baseline(baseline_json, project, baseline_objs)
+        write_fix202_state_html(
+            app4_path, baseline_objs, base_label, "о фиксации исходного состояния")
+        print("  [OK] Приложение 4: {}".format(app4_path))
+        if mode == "init":
+            return True
 
-    write_fix202_state_html(app5_path, current_objs, base_label, "о фиксации конечного состояния")
+    # Генерация NEW только по временной копии: новые даты, исходные байты.
+    print("  Подготавливаю временную копию без исходных дат...")
+    current_objs = scan_fresh_copy(scan_root)
+    print("  Файлов NEW: {}".format(len(current_objs)))
+    write_fix202_state_html(
+        app5_path, current_objs, base_label, "о фиксации конечного состояния")
     diff_entries = compute_diff(baseline_objs, current_objs)
     write_fix202_control_html(app6_path, diff_entries, base_label)
-    print("  [OK] Приложение 4: {}".format(app4_path))
+    changed_dates = sum(
+        1 for name, original in baseline_objs.items()
+        if name in current_objs and original.get("m") != current_objs[name].get("m"))
+    print("  [INFO] Файлов с изменившейся датой: {}".format(changed_dates))
     print("  [OK] Приложение 5: {}".format(app5_path))
     print("  [OK] Приложение 6: {}".format(app6_path))
     return True
@@ -652,19 +707,21 @@ def process_project(project, mode, target):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ВКС (ФИКС 2.0.2) — Приложения 4-6 по unpacked/<PROJ>/bin (по умолчанию)"
+        description="ВКС (ФИКС 2.0.2) — OLD из origin_bin, NEW из временной копии с новыми датами"
     )
     parser.add_argument("--project", action="append", default=None,
                         help="Имя проекта (можно указать несколько раз; по умолчанию все из unpacked/)")
     parser.add_argument("--mode", choices=["all", "init", "control"], default="all",
                         help="all: 4+5+6; init: только 4 + baseline; control: 5+6 по baseline")
-    parser.add_argument("--target", choices=["bin", "src"], default="bin",
-                        help="Подкаталог внутри unpacked/<PROJ>/ (по умолчанию: bin)")
+    parser.add_argument("--target", choices=["origin_bin", "bin"], default="origin_bin",
+                        help="Источник: origin_bin (bin — старый псевдоним)")
     parser.add_argument("--all", dest="scan_all", action="store_true",
-                        help="Фиксировать весь unpacked/<PROJ>/ целиком вместо только bin")
+                        help="Устаревший флаг, более не поддерживается")
     args = parser.parse_args()
 
-    target = "all" if args.scan_all else args.target
+    if args.scan_all:
+        parser.error("--all больше не поддерживается: для фиксации нужен только origin_bin")
+    target = "origin_bin" if args.target == "bin" else args.target
 
     if not os.path.isdir(UNPACKED_DIR):
         print("[ERROR] Не найдена директория: {}".format(UNPACKED_DIR))
