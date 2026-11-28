@@ -103,6 +103,11 @@ def calc_checksum(cmd_parts, file_path, root_dir):
 
     line = res.stdout.decode("utf-8", errors="replace").strip().splitlines()[0]
     rel_clean = clean_rel_path(os.path.relpath(file_path, root_dir))
+    # Linux может хранить имена с байтами, не являющимися UTF-8.
+    # В отчёте представляем такие байты как \\xNN; путь для расчёта КС
+    # остаётся исходным, корректные UTF-8 имена не изменяются.
+    rel_clean = rel_clean.encode("utf-8", errors="surrogateescape").decode(
+        "utf-8", errors="backslashreplace")
 
     # cksum выводит: "<crc> <bytes> <path>"
     exe_name = os.path.basename(cmd_parts[0]).lower()
