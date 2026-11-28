@@ -25,6 +25,7 @@ import os
 import shutil
 import tempfile
 import time
+import re
 import struct
 import sys
 from collections import defaultdict
@@ -144,8 +145,11 @@ def scan_directory(root_dir, include_archives=False):
 # ГЕНЕРАЦИЯ HTML В ФОРМАТЕ ФИКС 2.0.2 (WINDOWS-1251)
 # =============================================================================
 def escape_html(text):
+    # Некорректные UTF-8 байты имён отображаем как \\xNN.
+    text = str(text).encode("utf-8", errors="surrogateescape").decode(
+        "utf-8", errors="backslashreplace")
     return (
-        str(text)
+        text
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
@@ -600,7 +604,7 @@ def write_fix202_control_html(out_path, diff_entries, base_label):
 # =============================================================================
 # ОСНОВНОЙ ЦИКЛ
 # =============================================================================
-def scan_fresh_copy(original_path):
+def scan_fresh_copy(original_path, timestamp=None):
     """Создаёт временную копию и назначает всем файлам время запуска.
 
     Не используем shutil.copy2/copytree по умолчанию: copy2 сохраняет
@@ -611,7 +615,8 @@ def scan_fresh_copy(original_path):
         dst = os.path.join(tmp, "origin_bin")
         shutil.copytree(original_path, dst, copy_function=shutil.copy,
                         symlinks=True)
-        timestamp = int(time.time())
+        if timestamp is None:
+            timestamp = int(time.time())
         for folder, dirs, files in os.walk(dst, topdown=False, followlinks=False):
             for filename in files:
                 path = os.path.join(folder, filename)
@@ -626,10 +631,11 @@ def scan_fresh_copy(original_path):
 
 
 def save_baseline(path, project, objects):
+    # JSON-экранирование сохраняет имена с surrogateescape без потери байтов.
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"project": project, "target": "origin_bin",
                    "source": "unpacked/origin_bin", "objects": objects},
-                  f, ensure_ascii=False, indent=2)
+                  f, ensure_ascii=True, indent=2)
 
 
 def read_origin_baseline(path, project):
@@ -644,7 +650,7 @@ def read_origin_baseline(path, project):
     return data["objects"]
 
 
-def process_project(project, mode, target):
+def process_project(project, mode, target, timestamp=None):
     # --target bin сохранён как совместимый с прежними командами псевдоним.
     if target not in ("bin", "origin_bin"):
         print("  [ERROR] Для приложений 4-6 поддерживается только origin_bin")
@@ -690,7 +696,9 @@ def process_project(project, mode, target):
 
     # Генерация NEW только по временной копии: новые даты, исходные байты.
     print("  Подготавливаю временную копию без исходных дат...")
-    current_objs = scan_fresh_copy(scan_root)
+    if timestamp is not None:
+        print("  Дата NEW: {}".format(datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M:%S")))
+    current_objs = scan_fresh_copy(scan_root, timestamp=timestamp)
     print("  Файлов NEW: {}".format(len(current_objs)))
     write_fix202_state_html(
         app5_path, current_objs, base_label, "о фиксации конечного состояния")
@@ -705,6 +713,16 @@ def process_project(project, mode, target):
     return True
 
 
+def parse_report_date(value):
+    """Строгая дата ДД.ММ.ГГГГ для временных меток NEW."""
+    if not re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", value):
+        raise argparse.ArgumentTypeError("Дата должна иметь формат ДД.ММ.ГГГГ")
+    try:
+        return datetime.strptime(value, "%d.%m.%Y").date()
+    except ValueError:
+        raise argparse.ArgumentTypeError("Некорректная календарная дата: {}".format(value))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="ВКС (ФИКС 2.0.2) — OLD из origin_bin, NEW из временной копии с новыми датами"
@@ -717,7 +735,13 @@ def main():
                         help="Источник: origin_bin (bin — старый псевдоним)")
     parser.add_argument("--all", dest="scan_all", action="store_true",
                         help="Устаревший флаг, более не поддерживается")
+    parser.add_argument("--data", type=parse_report_date, metavar="ДД.ММ.ГГГГ",
+                        help="Дата файлов NEW (время суток текущее; OLD не изменяется)")
     args = parser.parse_args()
+
+    timestamp = None
+    if args.data is not None:
+        timestamp = int(datetime.combine(args.data, datetime.now().time()).timestamp())
 
     if args.scan_all:
         parser.error("--all больше не поддерживается: для фиксации нужен только origin_bin")
@@ -737,7 +761,7 @@ def main():
 
     ok_cnt = 0
     for proj in projects:
-        if process_project(proj, args.mode, target):
+        if process_project(proj, args.mode, target, timestamp=timestamp):
             ok_cnt += 1
 
     print("\nГотово. Успешно проектов: {}/{}".format(ok_cnt, len(projects)))
